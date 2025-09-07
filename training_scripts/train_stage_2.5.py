@@ -319,26 +319,28 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
     if local_rank == 0:
         # 1. Create a new dictionary to hold only the weights we trained.
         router_weights = {}
-        
-        # 2. Iterate through all the parameters of the model.
-        for name, param in llm.named_parameters():
-            # 3. If a parameter has requires_grad=True, it means we trained it.
+    
+        # 2. Iterate through the CLEAN names in the full state dictionary.
+        for name, weight in full_state_dict.items():
+            # 3. Check if the corresponding parameter in the FSDP model requires grad.
+            # We use .get_parameter() to access the actual parameter object.
+            param = llm.get_parameter(name)
             if param.requires_grad:
-                # 4. Add this parameter's weights from the full state dict to our new dict.
-                router_weights[name] = full_state_dict[name]
+                # 4. If it was trained, add it to our new dictionary.
+                router_weights[name] = weight
 
         # 5. Save the new, small dictionary of router weights.
         os.makedirs(STAGE2_5_CHECKPOINT_DIR, exist_ok=True)
         save_path = os.path.join(STAGE2_5_CHECKPOINT_DIR, f"llm_stage2_5_epoch_{epoch+1}.pth")
         torch.save(router_weights, save_path)
         print(f"✅ Saved small router-only checkpoint to {save_path}")
-        
+    
         # 6. Remove the previous small checkpoint to save space.
         previous_checkpoint_path = os.path.join(STAGE2_5_CHECKPOINT_DIR, f"llm_stage2_5_epoch_{epoch}.pth")
         if os.path.exists(previous_checkpoint_path):
             os.remove(previous_checkpoint_path)
             print(f"Removed previous router checkpoint: {previous_checkpoint_path}")
-
+  
     # Use a barrier to make sure all processes wait until rank 0 is done saving.
     dist.barrier()
 
