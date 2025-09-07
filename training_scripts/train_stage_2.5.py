@@ -37,6 +37,8 @@ from models.custom_mistral import (
     MistralMoEDecoderLayer,
 )
 
+from transformers.models.mistral.modeling_mistral import MistralMLP
+
 # --- 1. Register Custom Architecture ---
 AutoConfig.register("mistral_moe", MistralMoEConfig)
 AutoModelForCausalLM.register(MistralMoEConfig, MistralMoEForCausalLM)
@@ -142,8 +144,8 @@ if latest_stage2_epoch > 0:
     
     load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
     with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
-        # Access the model_state_dict key within the loaded dictionary
-        llm.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        llm.load_state_dict(state_dict, strict=False)
     
     del checkpoint
     gc.collect()
@@ -193,17 +195,10 @@ if latest_epoch > 0:
     if local_rank == 0:
         print(f"💾 Resuming Stage 2.5 training from epoch {latest_epoch+1} using {checkpoint_path}")
     
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    
+    state_dict = torch.load(checkpoint_path, map_location="cpu")
     load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
     with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
-        llm.load_state_dict(checkpoint['model_state_dict'])
-    
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    scaler.load_state_dict(checkpoint['scaler_state_dict'])
-    # FIX 2: Load the scheduler state
-    if 'scheduler_state_dict' in checkpoint:
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        llm.load_state_dict(state_dict)
     
     del checkpoint
     gc.collect()
@@ -322,20 +317,11 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
     with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, save_policy):
         cpu_state_dict = llm.state_dict()
 
-    if local_rank == 0:
-        checkpoint = {
-            'model_state_dict': cpu_state_dict,
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scaler_state_dict': scaler.state_dict(),
-            # FIX 2: Save the scheduler state
-            'scheduler_state_dict': scheduler.state_dict(),
-            'epoch': epoch + 1
-        }
-        
+    if local_rank == 0:        
         os.makedirs(STAGE2_5_CHECKPOINT_DIR, exist_ok=True)
         file_path = os.path.join(STAGE2_5_CHECKPOINT_DIR, f"llm_stage2_5_epoch_{epoch+1}.pth")
         
-        torch.save(checkpoint, file_path)
+        torch.save(cpu_state_dict, file_path)
         print(f"Router checkpoint saved to {file_path}")
         
         previous_checkpoint_path = os.path.join(STAGE2_5_CHECKPOINT_DIR, f"llm_stage2_5_epoch_{epoch}.pth")
