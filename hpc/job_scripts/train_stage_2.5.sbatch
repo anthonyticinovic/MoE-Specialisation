@@ -27,6 +27,6 @@ cd $HOME/MoE-Specialisation
 export PYTHONPATH="${PWD}:${PYTHONPATH}"
 
 echo "Starting Stage 2.5 Router Training script..."
-srun torchrun --nproc_per_node=4 training_scripts/train_stage_2_5.py
+srun torchrun --nproc_per_node=4 training_scripts/train_stage_2.5.py
 
 echo "Job finished."

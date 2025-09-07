@@ -76,7 +76,6 @@ vision_encoder = CLIPVisionModel.from_pretrained(paths["clip_local_path"]).to(DE
 clip_processor = AutoProcessor.from_pretrained(paths["clip_local_path"])
 tokenizer = AutoTokenizer.from_pretrained(paths["mistral_local_path"])
 tokenizer.pad_token = tokenizer.eos_token
-
 moe_model_path = "/data/gpfs/projects/COMP90055/aticinovic/models/Mistral-7B-MoE"
 llm = AutoModelForCausalLM.from_pretrained(
     moe_model_path,
@@ -138,19 +137,16 @@ if latest_stage2_epoch > 0:
     checkpoint_path = os.path.join(STAGE2_CHECKPOINT_DIR, f"llm_stage2_epoch_{latest_stage2_epoch}.pth")
     if local_rank == 0:
         print(f"💾 Loading Stage 2 expert weights from: {checkpoint_path}")
-    
-    # FIX 1: Load the full dictionary from the Stage 2 checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    
+        
+    state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True) # Also add weights_only=True here
     load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
     with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
-        state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-        llm.load_state_dict(state_dict, strict=False)
+        llm.load_state_dict(state_dict)
     
-    del checkpoint
+    del state_dict # Corrected variable name
     gc.collect()
     if local_rank == 0:
-        print("✅ Stage 2 expert weights loaded successfully.")
+        print("✅ Stage 2.5 training state resumed successfully.")
 else:
     if local_rank == 0:
         print("🚨 WARNING: No Stage 2 checkpoint found. Routers will be trained on unspecialized experts.")

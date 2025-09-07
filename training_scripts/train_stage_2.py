@@ -182,7 +182,7 @@ if latest_epoch > 0:
     if local_rank == 0:
         print(f"💾 Found existing checkpoint. Resuming training from epoch {latest_epoch+1} using {checkpoint_path}")
 
-    load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
     with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
         state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         llm.load_state_dict(state_dict)
