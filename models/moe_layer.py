@@ -74,7 +74,7 @@ class MoELayer(nn.Module):
         self.load_balancing_loss = self.num_experts * torch.sum(router_load * router_prob_per_expert) / (hidden_states_reshaped.shape[0]**2)
 
         # --- Top-1 Gating ---
-        routing_weights, selected_experts = torch.topk(F.softmax(router_logits, dim=1, dtype=torch.float), 1, dim=-1)
+        routing_weights, selected_experts = torch.topk(F.softmax(router_logits, dim=1), 1, dim=-1)
         selected_experts = selected_experts.squeeze(-1)
 
         # --- Route tokens to their selected expert ---
@@ -88,6 +88,8 @@ class MoELayer(nn.Module):
                 
                 expert_output = self.experts[expert_idx](tokens_for_expert)
                 weighted_output = expert_output * weights_for_expert
+                weighted_output = weighted_output.to(final_hidden_states.dtype)
+
                 
                 final_hidden_states.index_add_(0, token_indices, weighted_output)
                 

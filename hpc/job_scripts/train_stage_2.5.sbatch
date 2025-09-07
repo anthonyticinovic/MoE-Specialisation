@@ -5,7 +5,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=180G
+#SBATCH --mem=256G
 #SBATCH --time=10:00:00      # Reduced from 16 to 10 hours, which is a safe buffer
 #SBATCH --output=../out_slurm/train_stage_2_5/train_stage_2_5_%j.out
 #SBATCH --error=../err_slurm/train_stage_2_5/train_stage_2_5_%j.err

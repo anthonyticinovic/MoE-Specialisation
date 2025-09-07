@@ -62,7 +62,7 @@ LOAD_BALANCING_COEFF = train_params.get("load_balancing_coeff", 0.01)
 dist.init_process_group("nccl")
 local_rank = int(os.environ["LOCAL_RANK"])
 torch.cuda.set_device(local_rank)
-DEVICE = local_rank
+DEVICE = f"cuda:{local_rank}"
 
 if local_rank == 0:
     print("--- Initializing Stage 2.5 Training (Training the Router) ---")
