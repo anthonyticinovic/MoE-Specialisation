@@ -83,6 +83,7 @@ llm = AutoModelForCausalLM.from_pretrained(
     local_files_only=True,
     torch_dtype=torch.bfloat16,
     attn_implementation="flash_attention_2",
+    low_cpu_mem_usage=True,
 )
 
 # ====================================================================================
@@ -141,12 +142,12 @@ if latest_stage2_epoch > 0:
     state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True) # Also add weights_only=True here
     load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
     with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
-        llm.load_state_dict(state_dict)
+        llm.load_state_dict(state_dict, strict=False)
     
     del state_dict # Corrected variable name
     gc.collect()
     if local_rank == 0:
-        print("✅ Stage 2.5 training state resumed successfully.")
+        print("✅ Stage 2 training state resumed successfully.")
 else:
     if local_rank == 0:
         print("🚨 WARNING: No Stage 2 checkpoint found. Routers will be trained on unspecialized experts.")
@@ -191,12 +192,12 @@ if latest_epoch > 0:
     if local_rank == 0:
         print(f"💾 Resuming Stage 2.5 training from epoch {latest_epoch+1} using {checkpoint_path}")
     
-    state_dict = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
     with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
-        llm.load_state_dict(state_dict)
+        llm.load_state_dict(state_dict, strict=False)
     
-    del checkpoint
+    del state_dict
     gc.collect()
     if local_rank == 0:
         print("✅ Stage 2.5 training state resumed successfully.")
@@ -309,21 +310,36 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
             json.dump(metrics_history, f, indent=4)
         print(f"✅ Metrics saved to {metrics_path}")
 
+    # Get the full state dict from all ranks to the CPU of rank 0
     save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
     with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, save_policy):
-        cpu_state_dict = llm.state_dict()
+        full_state_dict = llm.state_dict()
 
-    if local_rank == 0:        
+    # On rank 0, filter and save only the trainable weights
+    if local_rank == 0:
+        # 1. Create a new dictionary to hold only the weights we trained.
+        router_weights = {}
+        
+        # 2. Iterate through all the parameters of the model.
+        for name, param in llm.named_parameters():
+            # 3. If a parameter has requires_grad=True, it means we trained it.
+            if param.requires_grad:
+                # 4. Add this parameter's weights from the full state dict to our new dict.
+                router_weights[name] = full_state_dict[name]
+
+        # 5. Save the new, small dictionary of router weights.
         os.makedirs(STAGE2_5_CHECKPOINT_DIR, exist_ok=True)
-        file_path = os.path.join(STAGE2_5_CHECKPOINT_DIR, f"llm_stage2_5_epoch_{epoch+1}.pth")
+        save_path = os.path.join(STAGE2_5_CHECKPOINT_DIR, f"llm_stage2_5_epoch_{epoch+1}.pth")
+        torch.save(router_weights, save_path)
+        print(f"✅ Saved small router-only checkpoint to {save_path}")
         
-        torch.save(cpu_state_dict, file_path)
-        print(f"Router checkpoint saved to {file_path}")
-        
+        # 6. Remove the previous small checkpoint to save space.
         previous_checkpoint_path = os.path.join(STAGE2_5_CHECKPOINT_DIR, f"llm_stage2_5_epoch_{epoch}.pth")
         if os.path.exists(previous_checkpoint_path):
             os.remove(previous_checkpoint_path)
-            print(f"Removed previous checkpoint: {previous_checkpoint_path}")
+            print(f"Removed previous router checkpoint: {previous_checkpoint_path}")
+
+    # Use a barrier to make sure all processes wait until rank 0 is done saving.
     dist.barrier()
 
 dist.destroy_process_group()
