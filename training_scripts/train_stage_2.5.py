@@ -213,7 +213,8 @@ for param in vision_connector.parameters(): param.requires_grad = False
 if local_rank == 0:
     print(f"Optimizing {sum(p.numel() for p in trainable_params)} trainable router parameters.")
 
-metrics_history = {"epoch": [], "train_loss": [], "val_loss": [], "learning_rate":[]}
+# CHANGE 1: Add new keys to the metrics dictionary
+metrics_history = {"epoch": [], "train_loss": [], "train_ce_loss": [], "train_lb_loss": [], "val_loss": [], "learning_rate":[]}
 metrics_path = os.path.join(OUTPUT_DIR, "training_metrics_stage2.5.json")
 if local_rank == 0 and latest_epoch > 0 and os.path.exists(metrics_path):
     with open(metrics_path, "r") as f:
@@ -227,7 +228,12 @@ if local_rank == 0:
 for epoch in range(latest_epoch, NUM_EPOCHS):
     train_sampler.set_epoch(epoch)
     llm.train()
+    
+    # CHANGE 2: Initialize accumulators for individual losses
     total_train_loss = 0
+    total_ce_loss = 0
+    total_lb_loss = 0
+    
     optimizer.zero_grad()
     for i, (images, input_ids, attention_mask) in enumerate(train_loader):
         images, input_ids, attention_mask = (images.to(DEVICE), input_ids.to(DEVICE), attention_mask.to(DEVICE))
@@ -257,8 +263,12 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
             loss = (ce_loss + LOAD_BALANCING_COEFF * total_load_balancing_loss) / accumulation_steps
 
         scaler.scale(loss).backward()
+
+        # CHANGE 3: Accumulate individual loss values
         if loss.item() > 0:
             total_train_loss += loss.item() * accumulation_steps
+            total_ce_loss += ce_loss.item()
+            total_lb_loss += total_load_balancing_loss.item()
 
         if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):
             scaler.step(optimizer)
@@ -270,9 +280,14 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
         if local_rank == 0 and (i + 1) % 100 == 0:
             print(f"  Epoch {epoch+1}, Batch [{i+1}/{len(train_loader)}]")
 
+    # CHANGE 4: Calculate averages for individual losses
     avg_train_loss = total_train_loss / len(train_loader)
+    avg_ce_loss = total_ce_loss / len(train_loader)
+    avg_lb_loss = total_lb_loss / len(train_loader)
+    
     if local_rank == 0:
-        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] - Training Loss: {avg_train_loss:.4f}")
+        # CHANGE 5: Update print statement to show all losses
+        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] - Training Loss: {avg_train_loss:.4f} | CE Loss: {avg_ce_loss:.4f} | LB Loss: {avg_lb_loss:.4f}")
 
     # --- Validation Phase ---
     llm.eval()
@@ -304,6 +319,9 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
     if local_rank == 0:
         metrics_history["epoch"].append(epoch + 1)
         metrics_history["train_loss"].append(avg_train_loss)
+        # CHANGE 6: Add new loss values to metrics dictionary
+        metrics_history["train_ce_loss"].append(avg_ce_loss)
+        metrics_history["train_lb_loss"].append(avg_lb_loss)
         metrics_history["val_loss"].append(avg_val_loss)
         metrics_history["learning_rate"].append(optimizer.param_groups[0]['lr'])
         with open(metrics_path, "w") as f:

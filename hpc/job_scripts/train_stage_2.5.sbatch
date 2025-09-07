@@ -26,6 +26,12 @@ python -c "import torch; print(f'PyTorch: {torch.__version__}, CUDA available: {
 cd $HOME/MoE-Specialisation
 export PYTHONPATH="${PWD}:${PYTHONPATH}"
 
+# Increase NCCL timeout to 30 minutes (default is 10 minutes)
+export NCCL_TIMEOUT=1800
+
+# Optionally, enable blocking wait for better error reporting
+export NCCL_BLOCKING_WAIT=1
+
 echo "Starting Stage 2.5 Router Training script..."
 srun torchrun --nproc_per_node=4 training_scripts/train_stage_2.5.py
 
