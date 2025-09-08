@@ -3,6 +3,8 @@ import torch
 import os
 import json
 import gc
+import random
+import numpy as np
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
@@ -15,8 +17,23 @@ from transformers import (
 from models import VisionLanguageConnector
 from data import COCO_Loader
 from torch.cuda.amp import autocast, GradScaler
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
+# --- IMPROVEMENT: Seed setting for reproducibility ---
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seed()
 
 # --- 1. Load Configuration ---
+print("--- Initializing Stage 1: Vision Connector Training ---")
 with open("./configs/training_config.yaml", "r") as file:
     config = yaml.safe_load(file)
 
@@ -26,6 +43,10 @@ loader_params = config["dataloader"]
 NUM_EPOCHS = train_params["num_epochs"]
 OUTPUT_DIR = paths["output_dir"]
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# --- NEW: Add Gradient Accumulation Steps from config ---
+accumulation_steps = train_params.get("gradient_accumulation_steps", 1)
+
 
 print(f"Using device: {DEVICE}")
 if DEVICE == "cpu":
@@ -37,7 +58,9 @@ print("Loading foundational models...")
 vision_encoder = CLIPVisionModel.from_pretrained(paths["clip_local_path"]).to(DEVICE)
 clip_processor = AutoProcessor.from_pretrained(paths["clip_local_path"])
 llm = MistralForCausalLM.from_pretrained(
-    paths["mistral_local_path"], load_in_8bit=True
+    paths["mistral_local_path"],
+    load_in_8bit=True,
+    torch_dtype=torch.bfloat16 # Use bfloat16 for consistency
 )
 tokenizer = AutoTokenizer.from_pretrained(paths["mistral_local_path"])
 tokenizer.pad_token = tokenizer.eos_token
@@ -71,58 +94,100 @@ train_loader = DataLoader(
     batch_size=train_params["batch_size"],
     shuffle=True,
     num_workers=loader_params["num_workers"],
+    pin_memory=True # IMPROVEMENT: Faster data transfer to GPU
 )
 val_loader = DataLoader(
     val_dataset,
     batch_size=train_params["batch_size"],
     shuffle=False,
     num_workers=loader_params["num_workers"],
+    pin_memory=True # IMPROVEMENT: Faster data transfer to GPU
 )
 
-# --- 4. Setup Model, Optimizer, and Checkpoint Loading ---
+# --- 4. Setup Model, Optimizer, and Checkpointing ---
 vision_connector = VisionLanguageConnector().to(DEVICE)
-optimizer = optim.AdamW(vision_connector.parameters(), lr=train_params["learning_rate"])
-loss_fn = nn.CrossEntropyLoss()
+
+optimizer = optim.AdamW(
+    vision_connector.parameters(),
+    lr=train_params["learning_rate"],
+    weight_decay=train_params.get("weight_decay", 0.01)
+)
+
+scheduler = CosineAnnealingLR(optimizer, T_max=(len(train_loader) // accumulation_steps) * NUM_EPOCHS)
+loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
 scaler = GradScaler()
-loss_history = {"train": [], "val": []}
+metrics_history = {"epoch": [], "train_loss": [], "val_loss": [], "learning_rate": []}
+best_val_loss = float('inf')
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-save_path = os.path.join(OUTPUT_DIR, "vision_connector_stage1.pth")
+best_model_path = os.path.join(OUTPUT_DIR, "vision_connector_stage1_best.pth")
+latest_model_path = os.path.join(OUTPUT_DIR, "vision_connector_stage1_latest.pth")
 
-if os.path.exists(save_path):
-    print(f"💾 Loading saved weights from {save_path}")
-    vision_connector.load_state_dict(torch.load(save_path, weights_only=True))
+
+if os.path.exists(latest_model_path):
+    print(f"💾 Loading saved weights from {latest_model_path}")
+    vision_connector.load_state_dict(torch.load(latest_model_path, map_location=DEVICE))
 
 # --- 5. The Training and Validation Loop ---
 print("🚀 Starting training...")
 for epoch in range(NUM_EPOCHS):
-    # -- Training Phase --
     vision_connector.train()
     total_train_loss = 0
+    
+    # Reset gradients at the start of the epoch
+    optimizer.zero_grad()
+    
     for i, (images, input_ids, attention_mask) in enumerate(train_loader):
         images, input_ids, attention_mask = (
             images.to(DEVICE), input_ids.to(DEVICE), attention_mask.to(DEVICE)
         )
-        optimizer.zero_grad()
-        with autocast():
-            with torch.no_grad():
-                patch_embeddings = vision_encoder(images).last_hidden_state
-                text_embeddings = llm.model.embed_tokens(input_ids)
+        
+        with torch.no_grad():
+            patch_embeddings = vision_encoder(images).last_hidden_state
+            text_embeddings = llm.model.embed_tokens(input_ids)
+        
+        with autocast(dtype=torch.bfloat16):
             visual_soft_tokens = vision_connector(patch_embeddings)
+            num_visual_tokens = visual_soft_tokens.shape[1]
+
             combined_embeddings = torch.cat([visual_soft_tokens, text_embeddings], dim=1)
-            attention_mask = torch.cat([torch.ones(visual_soft_tokens.shape[:2], device=DEVICE), attention_mask], dim=1)
-            outputs = llm(inputs_embeds=combined_embeddings, attention_mask=attention_mask)
+            combined_attention_mask = torch.cat([
+                torch.ones(visual_soft_tokens.shape[:2], device=DEVICE),
+                attention_mask
+            ], dim=1)
+
+            outputs = llm(inputs_embeds=combined_embeddings, attention_mask=combined_attention_mask)
             logits = outputs.logits
-            shift_logits = logits[..., visual_soft_tokens.shape[1] - 1 : -1, :].contiguous()
-            shift_labels = input_ids[..., :].contiguous()
-            loss = loss_fn(shift_logits.view(-1, llm.config.vocab_size), shift_labels.view(-1))
+
+            text_logits = logits[:, num_visual_tokens - 1: -1, :].contiguous()
+            text_labels = input_ids.contiguous()
+            loss = loss_fn(text_logits.view(-1, llm.config.vocab_size), text_labels.view(-1))
+            
+            # --- CHANGE: Scale loss for gradient accumulation ---
+            loss = loss / accumulation_steps
+
         scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-        total_train_loss += loss.item()
-    
+        
+        # --- CHANGE: Optimizer step only after accumulating gradients ---
+        if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(vision_connector.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            optimizer.zero_grad() # Zero gradients after optimizer step
+
+        total_train_loss += loss.item() * accumulation_steps # Un-scale for logging
+
+        if (i + 1) % 100 == 0:
+            print(f"  Epoch {epoch+1}, Batch [{i+1}/{len(train_loader)}]")
+
+        del images, input_ids, attention_mask, patch_embeddings, text_embeddings
+        del visual_soft_tokens, combined_embeddings, outputs, logits, loss
+        gc.collect()
+        torch.cuda.empty_cache()
+
     avg_train_loss = total_train_loss / len(train_loader)
-    loss_history["train"].append(avg_train_loss)
     print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] - Training Loss: {avg_train_loss:.4f}")
 
     # -- Validation Phase --
@@ -133,31 +198,48 @@ for epoch in range(NUM_EPOCHS):
             images, input_ids, attention_mask = (
                 images.to(DEVICE), input_ids.to(DEVICE), attention_mask.to(DEVICE)
             )
-            with autocast():
+            with autocast(dtype=torch.bfloat16):
                 patch_embeddings = vision_encoder(images).last_hidden_state
                 text_embeddings = llm.model.embed_tokens(input_ids)
                 visual_soft_tokens = vision_connector(patch_embeddings)
+                num_visual_tokens = visual_soft_tokens.shape[1]
+
                 combined_embeddings = torch.cat([visual_soft_tokens, text_embeddings], dim=1)
-                attention_mask = torch.cat([torch.ones(visual_soft_tokens.shape[:2], device=DEVICE), attention_mask], dim=1)
-                outputs = llm(inputs_embeds=combined_embeddings, attention_mask=attention_mask)
+                combined_attention_mask = torch.cat([
+                    torch.ones(visual_soft_tokens.shape[:2], device=DEVICE),
+                    attention_mask
+                ], dim=1)
+
+                outputs = llm(inputs_embeds=combined_embeddings, attention_mask=combined_attention_mask)
                 logits = outputs.logits
-                shift_logits = logits[..., visual_soft_tokens.shape[1] - 1 : -1, :].contiguous()
-                shift_labels = input_ids[..., :].contiguous()
-                loss = loss_fn(shift_logits.view(-1, llm.config.vocab_size), shift_labels.view(-1))
+                text_logits = logits[:, num_visual_tokens - 1: -1, :].contiguous()
+                text_labels = input_ids.contiguous()
+                loss = loss_fn(text_logits.view(-1, llm.config.vocab_size), text_labels.view(-1))
             total_val_loss += loss.item()
 
     avg_val_loss = total_val_loss / len(val_loader)
-    loss_history["val"].append(avg_val_loss)
     print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] - Validation Loss: {avg_val_loss:.4f}")
 
-    # --- Save checkpoint at the end of every epoch ---
-    print(f"💾 Checkpointing model weights after epoch {epoch+1}...")
-    torch.save(vision_connector.state_dict(), save_path)
-    print(f"✅ Checkpoint saved to {save_path}")
+    # --- Early Stopping and Checkpointing Logic ---
+    torch.save(vision_connector.state_dict(), latest_model_path)
+    print(f"💾 Latest model checkpoint saved to {latest_model_path}")
+    
+    if avg_val_loss < best_val_loss:
+        best_val_loss = avg_val_loss
+        torch.save(vision_connector.state_dict(), best_model_path)
+        print(f"🏆 New best validation loss! Model saved to {best_model_path}")
 
-    # Save loss history at the end of every epoch
-    loss_path = os.path.join(OUTPUT_DIR, "loss_history_stage1.json")
-    with open(loss_path, "w") as f:
-        json.dump(loss_history, f)
+    # --- Metrics Logging ---
+    metrics_path = os.path.join(OUTPUT_DIR, "loss_history_stage1.json")
+    
+    metrics_history["epoch"].append(epoch + 1)
+    metrics_history["train_loss"].append(avg_train_loss)
+    metrics_history["val_loss"].append(avg_val_loss)
+    metrics_history["learning_rate"].append(optimizer.param_groups[0]['lr'])
+    
+    with open(metrics_path, "w") as f:
+        json.dump(metrics_history, f, indent=4)
+    print(f"✅ Metrics saved to {metrics_path}")
 
 print("✅ Training complete.")
+

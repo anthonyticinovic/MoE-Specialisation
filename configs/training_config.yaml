@@ -12,9 +12,11 @@ paths:
 # Training parameters for Stage 1
 training_stage1:
   num_epochs: 10
-  batch_size: 8
+  batch_size: 16
   learning_rate: 0.0001
-  subset_fraction: 0.02
+  subset_fraction: 0.30
+  weight_decay: 0.01
+  gradient_accumulation_steps: 2
 
 # Training parameters for Stage 2
 training_stage2:
@@ -28,7 +30,7 @@ training_stage2:
 training_stage2.5:
   num_epochs: 10
   batch_size: 16
-  learning_rate: 0.0001
+  learning_rate: 0.00005
   weight_decay: 0.01
   subset_fraction: 0.1
   gradient_accumulation_steps: 4
