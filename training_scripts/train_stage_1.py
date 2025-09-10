@@ -93,15 +93,17 @@ train_loader = DataLoader(
     train_dataset,
     batch_size=train_params["batch_size"],
     shuffle=True,
-    num_workers=loader_params["num_workers"],
-    pin_memory=True # IMPROVEMENT: Faster data transfer to GPU
+    num_workers=loader_params["num_workers_s1"],
+    pin_memory=True,
+    persistent_workers=True
 )
 val_loader = DataLoader(
     val_dataset,
     batch_size=train_params["batch_size"],
     shuffle=False,
-    num_workers=loader_params["num_workers"],
-    pin_memory=True # IMPROVEMENT: Faster data transfer to GPU
+    num_workers=loader_params["num_workers_s1"],
+    pin_memory=True, # IMPROVEMENT: Faster data transfer to GPU
+    persistent_workers=True
 )
 
 # --- 4. Setup Model, Optimizer, and Checkpointing ---
