@@ -128,6 +128,8 @@ if os.path.exists(latest_model_path):
     print(f"💾 Loading saved weights from {latest_model_path}")
     vision_connector.load_state_dict(torch.load(latest_model_path, map_location=DEVICE))
 
+vision_connector = torch.compile(vision_connector)
+
 # --- 5. The Training and Validation Loop ---
 print("🚀 Starting training...")
 for epoch in range(NUM_EPOCHS):
@@ -221,12 +223,17 @@ for epoch in range(NUM_EPOCHS):
     print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] - Validation Loss: {avg_val_loss:.4f}")
 
     # --- Early Stopping and Checkpointing Logic ---
-    torch.save(vision_connector.state_dict(), latest_model_path)
+    # Access the original model with ._orig_mod to get a compatible state dict
+    state_to_save = vision_connector._orig_mod.state_dict()
+
+    # Save the clean state for the latest checkpoint
+    torch.save(state_to_save, latest_model_path)
     print(f"💾 Latest model checkpoint saved to {latest_model_path}")
-    
+        
+    # If it's the best model, save the clean state for the best checkpoint too
     if avg_val_loss < best_val_loss:
         best_val_loss = avg_val_loss
-        torch.save(vision_connector.state_dict(), best_model_path)
+        torch.save(state_to_save, best_model_path)
         print(f"🏆 New best validation loss! Model saved to {best_model_path}")
 
     # --- Metrics Logging ---
