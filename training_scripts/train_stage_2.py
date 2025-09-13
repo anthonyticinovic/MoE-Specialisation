@@ -201,7 +201,7 @@ llm.model.embed_tokens.to(DEVICE)
 llm.gradient_checkpointing_enable()
 
 vision_connector = VisionLanguageConnector().to(DEVICE)
-stage1_weights_path = os.path.join(OUTPUT_DIR, "vision_connector_stage1.pth")
+stage1_weights_path = os.path.join(OUTPUT_DIR, "vision_connector_stage1_best.pth")
 if os.path.exists(stage1_weights_path):
     if local_rank == 0:
         print(f"💾 Loading Stage 1 Vision Connector weights from {stage1_weights_path}")
