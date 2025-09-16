@@ -171,8 +171,16 @@ for layer in llm.module.model.layers:
         new_gate = nn.Linear(layer.mlp.d_model, layer.mlp.num_experts, bias=False)
         nn.init.normal_(new_gate.weight, std=0.02)
 
-        # Move to same device as experts to avoid mismatch
-        new_gate.to(layer.mlp.experts[0].fc1.weight.device)
+        # ADD THIS DEBUG BLOCK
+        if local_rank == 0:
+            print(f"--- Debugging Sub-layers for Expert 0 in MoE Layer {i} ---")
+            # This will print the structure of the MLP, showing the layer names
+            print(layer.mlp.experts[0])
+            print("-----------------------------------------------------------")
+        # END DEBUG BLOCK
+
+        # This is the line we want to verify
+        new_gate.to(layer.mlp.experts[0].gate_proj.weight.device)
 
         # Replace
         layer.mlp.gate = new_gate
