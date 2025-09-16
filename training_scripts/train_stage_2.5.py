@@ -309,7 +309,7 @@ if local_rank == 0 and latest_epoch > 0 and os.path.exists(metrics_path):
     with open(metrics_path, "r") as f:
         metrics_history = json.load(f)
 
-# ★★★ MINOR FIX ★★★
+
 # Corrected the variable name from 'model' to 'llm' to prevent a NameError.
 if local_rank == 0:
     print("--- Parameters to be trained (Verified by NameError fix) ---")
@@ -317,6 +317,14 @@ if local_rank == 0:
         if param.requires_grad:
             print(name)
     print("----------------------------------------------------------")
+
+if local_rank == 0:
+    print("--- Verifying Gate Parameter Shapes After Checkpoint Load ---")
+    # Access the underlying model with .module since it's wrapped with FSDP
+    for i, layer in enumerate(llm.module.model.layers):
+        if hasattr(layer.mlp, "gate") and hasattr(layer.mlp.gate, "weight"):
+            print(f"  Layer {i} gate shape: {tuple(layer.mlp.gate.weight.shape)}")
+    print("---------------------------------------------------------")
 
 # ====================================================================================
 # 8. TRAINING LOOP
