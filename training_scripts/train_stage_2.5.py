@@ -169,11 +169,33 @@ trainable_params = [p for p in llm.parameters() if p.requires_grad]
 optimizer = optim.AdamW(trainable_params, lr=train_params["learning_rate"], weight_decay=train_params["weight_decay"], fused=True)
 scaler = GradScaler()
 
+# --- DEBUG: Optimizer param groups ---
+for i, group in enumerate(optimizer.param_groups):
+    print(f"[DEBUG] Optimizer group {i}: {len(group['params'])} params")
+    # print shapes of first few params
+    for j, p in enumerate(group['params'][:5]):
+        print(f"   param {j} shape={tuple(p.shape)}, requires_grad={p.requires_grad}")
+# --- END DEBUG ---
+
 # FIX 2: Initialize the scheduler
 total_steps = (len(train_loader) // accumulation_steps) * NUM_EPOCHS
 scheduler = CosineAnnealingLR(optimizer, T_max=total_steps)
 
 loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+
+# --- DEBUG: Print trainable params ---
+trainable_params = [p for p in llm.parameters() if p.requires_grad]
+total = sum(p.numel() for p in trainable_params)
+print(f"[DEBUG] trainable param count = {len(trainable_params)}, total elements = {total}")
+
+count = 0
+for name, p in llm.named_parameters():
+    if p.requires_grad:
+        print(f"[DEBUG] trainable param: {name}, shape={tuple(p.shape)}")
+        count += 1
+        if count >= 30:  # only show first 30 to avoid spam
+            break
+# --- END DEBUG ---
 
 # --- 5.2. Resume from Stage 2.5 Checkpoint (If it exists) ---
 latest_epoch = 0
@@ -206,7 +228,7 @@ if latest_epoch > 0:
 llm.model.embed_tokens.to(DEVICE)
 llm.gradient_checkpointing_enable()
 vision_connector = VisionLanguageConnector().to(DEVICE)
-vision_connector.load_state_dict(torch.load(os.path.join(OUTPUT_DIR, "vision_connector_stage1.pth"), map_location=DEVICE))
+vision_connector.load_state_dict(torch.load(os.path.join(OUTPUT_DIR, "vision_connector_stage1_best.pth"), map_location=DEVICE))
 for param in vision_encoder.parameters(): param.requires_grad = False
 for param in vision_connector.parameters(): param.requires_grad = False
 
@@ -219,6 +241,13 @@ metrics_path = os.path.join(OUTPUT_DIR, "training_metrics_stage2.5.json")
 if local_rank == 0 and latest_epoch > 0 and os.path.exists(metrics_path):
     with open(metrics_path, "r") as f:
         metrics_history = json.load(f)
+
+
+print("--- Parameters to be trained ---")
+for name, param in model.named_parameters():
+    if param.requires_grad:
+        print(name)
+print("--------------------------------")
 
 # ====================================================================================
 # 8. TRAINING LOOP
@@ -263,6 +292,19 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
             loss = (ce_loss + LOAD_BALANCING_COEFF * total_load_balancing_loss) / accumulation_steps
 
         scaler.scale(loss).backward()
+        # --- DEBUG: Router gradient norms ---
+        router_params = [(name, p) for name, p in llm.named_parameters() if "gate" in name and p.requires_grad]
+        if not router_params:
+            print("🚨 No router parameters found with requires_grad=True 🚨")
+        else:
+            for name, p in router_params[:5]:  # only print a few
+                if p.grad is None:
+                    print(f"🚨 {name} grad is None 🚨")
+                else:
+                    grad_norm = torch.linalg.vector_norm(p.grad).item()
+                    grad_max = p.grad.abs().max().item()
+                    print(f"[DEBUG GRAD] {name}: grad_norm={grad_norm:.4e}, grad_max={grad_max:.4e}")
+        # --- END DEBUG ---
 
         # CHANGE 3: Accumulate individual loss values
         if loss.item() > 0:
@@ -279,6 +321,22 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
         
         if local_rank == 0 and (i + 1) % 100 == 0:
             print(f"  Epoch {epoch+1}, Batch [{i+1}/{len(train_loader)}]")
+
+
+    # --- DEBUG: Gate activations & LB loss ---
+    for i, layer in enumerate(llm.module.model.layers if hasattr(llm, "module") else llm.model.layers):
+        if hasattr(layer.mlp, "gate"):
+            gate = layer.mlp.gate
+            if hasattr(gate, "weight"):
+                print(f"[DEBUG] Layer {i} gate weight norm: {gate.weight.norm().item():.4f}")
+        if hasattr(layer.mlp, "load_balancing_loss"):
+            lb = layer.mlp.load_balancing_loss
+            if isinstance(lb, torch.Tensor):
+                print(f"[DEBUG] Layer {i} load balancing loss: {lb.item():.4f}")
+            else:
+                print(f"[DEBUG] Layer {i} LB loss type: {type(lb)}")
+    # --- END DEBUG ---
+
 
     # CHANGE 4: Calculate averages for individual losses
     avg_train_loss = total_train_loss / len(train_loader)
