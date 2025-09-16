@@ -19,14 +19,15 @@ class MoELayer(nn.Module):
         # Attribute to store the load balancing loss for 'soft' routing
         self.load_balancing_loss = 0.0
 
-    def forward(self, hidden_states: torch.Tensor):
+    def forward(self, hidden_states: torch.Tensor, temperature: float = 1.0):
         """
         Main forward pass that dispatches to the correct routing logic.
         """
         if self.routing_mode == 'hard':
             return self._hard_routing_forward(hidden_states)
         elif self.routing_mode == 'soft':
-            return self._soft_routing_forward(hidden_states)
+            # Pass the temperature argument to the soft routing function
+            return self._soft_routing_forward(hidden_states, temperature)
         else:
             raise ValueError(f"Invalid routing mode: {self.routing_mode}. Must be 'hard' or 'soft'.")
 
@@ -53,44 +54,64 @@ class MoELayer(nn.Module):
 
         return final_output
 
-    def _soft_routing_forward(self, hidden_states: torch.Tensor):
+    def _soft_routing_forward(self, hidden_states: torch.Tensor, temperature: float = 1.0):
         """
-        Trainable soft routing logic for Stage 2.5.
-        Uses the internal gating network.
+        Differentiable and sparse soft routing using Straight-Through Gumbel-Softmax.
+    
+        In the forward pass, this behaves like hard routing (only one expert is
+        computed per token). In the backward pass, gradients flow back to all
+        router logits as if it were a soft, probabilistic choice. This provides
+        a rich learning signal while maintaining computational efficiency.
         """
+        # Get initial logits from the gate
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
-
-        # Get routing logits from the gate.
         router_logits = self.gate(hidden_states_reshaped)
-        
-        # --- Load Balancing Loss ---
-        # This loss encourages the gate to use all experts roughly equally.
-        tokens_per_expert = F.one_hot(router_logits.argmax(dim=-1), num_classes=self.num_experts).float()
-        router_load = tokens_per_expert.sum(dim=0)
-        router_prob_per_expert = router_logits.softmax(dim=-1).sum(dim=0)
-        
-        # We store the loss as an attribute to be collected later in the training loop.
-        self.load_balancing_loss = self.num_experts * torch.sum(router_load * router_prob_per_expert) / (hidden_states_reshaped.shape[0]**2)
 
-        # --- Top-1 Gating ---
-        routing_weights, selected_experts = torch.topk(F.softmax(router_logits, dim=1), 1, dim=-1)
-        selected_experts = selected_experts.squeeze(-1)
+        # 1. Gumbel-Softmax for stochastic, differentiable sampling
+        # Gumbel noise is added for exploration during training
+        gumbels = -torch.empty_like(router_logits).exponential_().log()
+        y = (router_logits + gumbels) / temperature
+        # router_probs contains the "soft" probabilities used for the backward pass
+        router_probs = F.softmax(y, dim=-1)
 
-        # --- Route tokens to their selected expert ---
+        # 2. Straight-Through Estimator Trick
+        # Get a "hard" one-hot vector for the forward pass
+        hard_idx = router_probs.argmax(dim=-1, keepdim=True)
+        hard_onehot = torch.zeros_like(router_probs).scatter_(1, hard_idx, 1.0)
+        # This line is the core of the trick:
+        # Forward pass uses `hard_onehot`, backward pass uses `router_probs`
+        router_onehot = hard_onehot - router_probs.detach() + router_probs
+
+        # Initialize a final output tensor of zeros
         final_hidden_states = torch.zeros_like(hidden_states_reshaped)
-        for expert_idx in range(self.num_experts):
-            token_indices = torch.where(selected_experts == expert_idx)[0]
-            
-            if token_indices.shape[0] > 0:
-                tokens_for_expert = hidden_states_reshaped[token_indices]
-                weights_for_expert = routing_weights[token_indices]
-                
-                expert_output = self.experts[expert_idx](tokens_for_expert)
-                weighted_output = expert_output * weights_for_expert
-                weighted_output = weighted_output.to(final_hidden_states.dtype)
 
+        # 3. Sparse Dispatch: Compute only the selected expert for each token
+        for expert_idx, expert in enumerate(self.experts):
+            # Find the indices of all tokens that should be routed to this expert
+            token_indices = torch.where(router_onehot[:, expert_idx] == 1)[0]
+            
+            # If no tokens are routed to this expert, skip it
+            if token_indices.numel() > 0:
+                # Select the hidden states for these specific tokens
+                tokens_for_expert = hidden_states_reshaped[token_indices]
                 
+                # Compute the expert's output ONLY for its assigned tokens
+                expert_output = expert(tokens_for_expert)
+                
+                # Get the weights from the straight-through estimator for these tokens
+                weights_for_expert = router_onehot[token_indices, expert_idx].unsqueeze(-1)
+                
+                # Scale the output by the weights (this carries the gradient)
+                weighted_output = expert_output * weights_for_expert
+                
+                # Add the weighted output back to the final tensor at the correct positions
                 final_hidden_states.index_add_(0, token_indices, weighted_output)
-                
+
+        # 4. Differentiable Load Balancing Loss
+        # Calculated from the soft probabilities to ensure a smooth loss surface
+        importance = router_probs.mean(dim=0)  # Average probability for each expert
+        self.load_balancing_loss = (importance * self.num_experts).sum()
+
+        # Reshape to the original dimensions and return
         return final_hidden_states.view(batch_size, sequence_length, hidden_dim)
