@@ -15,8 +15,6 @@ class MoELayer(nn.Module):
         # The gate is only used for 'soft' routing, but we initialize it
         # to ensure the model structure is consistent when loading weights.
         self.gate = nn.Linear(self.d_model, self.num_experts, bias=False)
-# Add this line to ensure the weights have the correct shape and are initialized
-        nn.init.normal_(self.gate.weight, std=0.02)
 
         # Attribute to store the load balancing loss for 'soft' routing
         self.load_balancing_loss = 0.0

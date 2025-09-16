@@ -161,6 +161,37 @@ else:
             "🚨 WARNING: No Stage 2 checkpoint found. Routers will be trained on unspecialized experts."
         )
 
+# --- Re-initialize all router gates AFTER loading Stage 2 checkpoint ---
+if local_rank == 0:
+    print("--- Forcing re-initialization of router gates ---")
+
+for layer in llm.module.model.layers:
+    if hasattr(layer.mlp, "gate"):
+        # Create fresh Linear with correct shape
+        new_gate = nn.Linear(layer.mlp.d_model, layer.mlp.num_experts, bias=False)
+        nn.init.normal_(new_gate.weight, std=0.02)
+
+        # Move to same device as experts to avoid mismatch
+        new_gate.to(layer.mlp.experts[0].fc1.weight.device)
+
+        # Replace
+        layer.mlp.gate = new_gate
+        layer.mlp.gate.weight.requires_grad = True
+
+# Refresh optimizer so it tracks new params
+trainable_params = [p for p in llm.parameters() if p.requires_grad]
+optimizer = optim.AdamW(
+    trainable_params,
+    lr=train_params["learning_rate"],
+    weight_decay=train_params["weight_decay"],
+    fused=True,
+)
+
+# Debug: print out gate shapes on rank 0
+if local_rank == 0:
+    for i, layer in enumerate(llm.module.model.layers):
+        print(f"[DEBUG] Layer {i} gate shape: {tuple(layer.mlp.gate.weight.shape)}")
+
 # ====================================================================================
 # 6. DATA & OPTIMIZER
 # ====================================================================================
