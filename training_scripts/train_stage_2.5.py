@@ -1,5 +1,3 @@
-
-
 import time
 import json
 import yaml
@@ -19,7 +17,7 @@ from transformers import (
     CLIPVisionModel,
 )
 from models import VisionLanguageConnector
-from data import COCO_Loader  # <-- FIX: Corrected typo from COLO to COCO
+from data import COCO_Loader
 from torch.amp import GradScaler, autocast
 from torch.distributed.fsdp import CPUOffload
 import torch.distributed as dist
@@ -37,9 +35,6 @@ from models.custom_mistral import (
     MistralMoEForCausalLM,
     MistralMoEDecoderLayer,
 )
-
-# Note: This import is not used by the corrected FSDP policy but is kept for context.
-from transformers.models.mistral.modeling_mistral import MistralMLP
 
 # --- 1. Register Custom Architecture ---
 AutoConfig.register("mistral_moe", MistralMoEConfig)
@@ -70,23 +65,27 @@ if local_rank == 0:
     print("--- Initializing Stage 2.5 Training (Training the Router) ---")
 
 # ====================================================================================
-# 3. MODEL LOADING
+# 3. ROBUST MODEL INITIALIZATION
 # ====================================================================================
 if local_rank == 0:
-    print("Loading foundational models...")
+    print("Initializing model architecture from config to ensure correct shapes...")
+
+moe_model_path = "/data/gpfs/projects/COMP90055/aticinovic/models/Mistral-7B-MoE"
+
+# 1. Load the configuration ONLY, without loading the base model's corrupted weights.
+config = AutoConfig.from_pretrained(moe_model_path, trust_remote_code=True)
+
+# 2. Create a model with a correctly initialized architecture and RANDOM weights.
+#    This guarantees all layers, including the gates, have the correct shape from the start.
+llm = MistralMoEForCausalLM(config)
+
+# Load other foundational models
+if local_rank == 0:
+    print("Loading other foundational models...")
 vision_encoder = CLIPVisionModel.from_pretrained(paths["clip_local_path"]).to(DEVICE)
 clip_processor = AutoProcessor.from_pretrained(paths["clip_local_path"])
 tokenizer = AutoTokenizer.from_pretrained(paths["mistral_local_path"])
 tokenizer.pad_token = tokenizer.eos_token
-moe_model_path = "/data/gpfs/projects/COMP90055/aticinovic/models/Mistral-7B-MoE"
-llm = AutoModelForCausalLM.from_pretrained(
-    moe_model_path,
-    trust_remote_code=True,
-    local_files_only=True,
-    torch_dtype=torch.bfloat16,
-    attn_implementation="flash_attention_2",
-    low_cpu_mem_usage=True,
-)
 
 # ====================================================================================
 # 4. TRAINING SETUP
@@ -108,9 +107,6 @@ for name, param in llm.named_parameters():
 # ====================================================================================
 # 5. FSDP WRAPPING & CHECKPOINTING
 # ====================================================================================
-# NOTE: This wrapping policy is still likely incorrect and should be revisited
-# if zero-gradient issues persist after fixing the checkpoint loading.
-# The correct class is likely `MistralMoEDecoderLayer`.
 my_auto_wrap_policy = partial(transformer_auto_wrap_policy, transformer_layer_cls={MistralMLP})
 ignored_modules = [llm.model.embed_tokens]
 
@@ -120,9 +116,7 @@ llm = FSDP(
     auto_wrap_policy=my_auto_wrap_policy,
     cpu_offload=CPUOffload(offload_params=True),
     mixed_precision=torch.distributed.fsdp.MixedPrecision(
-        param_dtype=torch.bfloat16,
-        reduce_dtype=torch.bfloat16,
-        buffer_dtype=torch.bfloat16,
+        param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16, buffer_dtype=torch.bfloat16,
     ),
     use_orig_params=True,
     ignored_modules=ignored_modules,
@@ -134,8 +128,7 @@ if local_rank == 0:
     if os.path.exists(STAGE2_CHECKPOINT_DIR):
         epoch_numbers = [
             int(re.search(r"epoch_(\d+)", f).group(1))
-            for f in os.listdir(STAGE2_CHECKPOINT_DIR)
-            if re.search(r"epoch_(\d+)", f)
+            for f in os.listdir(STAGE2_CHECKPOINT_DIR) if re.search(r"epoch_(\d+)", f)
         ]
         if epoch_numbers:
             latest_stage2_epoch = max(epoch_numbers)
@@ -144,7 +137,6 @@ epoch_tensor = torch.tensor([latest_stage2_epoch], dtype=torch.int).to(DEVICE)
 dist.broadcast(epoch_tensor, src=0)
 latest_stage2_epoch = epoch_tensor.item()
 
-# ★★★ ELEGANT SOLUTION IMPLEMENTED HERE ★★★
 if latest_stage2_epoch > 0:
     checkpoint_path = os.path.join(
         STAGE2_CHECKPOINT_DIR, f"llm_stage2_epoch_{latest_stage2_epoch}.pth"
@@ -152,23 +144,17 @@ if latest_stage2_epoch > 0:
     if local_rank == 0:
         print(f"💾 Loading and filtering Stage 2 expert weights from: {checkpoint_path}")
 
-    # 1. Load the full state dict from the checkpoint file onto the CPU
     full_stage2_state_dict = torch.load(checkpoint_path, map_location="cpu")
-
-    # 2. Create a new state dict, EXCLUDING any parameters related to the router gates
+    
+    # Filter out gate parameters to preserve the correctly initialized ones from the model
     filtered_state_dict = {
         k: v for k, v in full_stage2_state_dict.items() if "mlp.gate" not in k
     }
-    
-    del full_stage2_state_dict  # Free up memory
+    del full_stage2_state_dict
 
-    # 3. Load the filtered state dict. This will update all weights EXCEPT the gates,
-    # preserving the fresh, correctly-shaped gates initialized in the MoELayer.
     load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
     with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
-        # strict=False is important as the dict is missing gate keys
         llm.load_state_dict(filtered_state_dict, strict=False)
-    
     del filtered_state_dict
     gc.collect()
     
@@ -202,27 +188,18 @@ val_dataset = COCO_Loader(
 train_sampler = DistributedSampler(train_dataset)
 val_sampler = DistributedSampler(val_dataset, shuffle=False)
 train_loader = DataLoader(
-    train_dataset,
-    batch_size=train_params["batch_size"],
-    sampler=train_sampler,
-    num_workers=loader_params["num_workers"],
-    pin_memory=True,
+    train_dataset, batch_size=train_params["batch_size"], sampler=train_sampler,
+    num_workers=loader_params["num_workers"], pin_memory=True,
 )
 val_loader = DataLoader(
-    val_dataset,
-    batch_size=train_params["batch_size"],
-    sampler=val_sampler,
-    num_workers=loader_params["num_workers"],
-    pin_memory=True,
+    val_dataset, batch_size=train_params["batch_size"], sampler=val_sampler,
+    num_workers=loader_params["num_workers"], pin_memory=True,
 )
 
 accumulation_steps = train_params.get("gradient_accumulation_steps", 1)
 trainable_params = [p for p in llm.parameters() if p.requires_grad]
 optimizer = optim.AdamW(
-    trainable_params,
-    lr=train_params["learning_rate"],
-    weight_decay=train_params["weight_decay"],
-    fused=True,
+    trainable_params, lr=train_params["learning_rate"], weight_decay=train_params["weight_decay"], fused=True,
 )
 scaler = GradScaler()
 total_steps = (len(train_loader) // accumulation_steps) * NUM_EPOCHS
@@ -235,8 +212,7 @@ if local_rank == 0:
     if os.path.exists(STAGE2_5_CHECKPOINT_DIR):
         epoch_numbers = [
             int(re.search(r"epoch_(\d+)", f).group(1))
-            for f in os.listdir(STAGE2_5_CHECKPOINT_DIR)
-            if re.search(r"epoch_(\d+)", f)
+            for f in os.listdir(STAGE2_5_CHECKPOINT_DIR) if re.search(r"epoch_(\d+)", f)
         ]
         if epoch_numbers:
             latest_epoch = max(epoch_numbers)
@@ -250,15 +226,12 @@ if latest_epoch > 0:
         STAGE2_5_CHECKPOINT_DIR, f"llm_stage2_5_epoch_{latest_epoch}.pth"
     )
     if local_rank == 0:
-        print(
-            f"💾 Resuming Stage 2.5 training from epoch {latest_epoch+1} using {checkpoint_path}"
-        )
+        print(f"💾 Resuming Stage 2.5 training from epoch {latest_epoch+1} using {checkpoint_path}")
 
     state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
     with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
         llm.load_state_dict(state_dict, strict=False)
-
     del state_dict
     gc.collect()
     if local_rank == 0:
@@ -269,10 +242,7 @@ llm.model.embed_tokens.to(DEVICE)
 llm.gradient_checkpointing_enable()
 vision_connector = VisionLanguageConnector().to(DEVICE)
 vision_connector.load_state_dict(
-    torch.load(
-        os.path.join(OUTPUT_DIR, "vision_connector_stage1_best.pth"),
-        map_location=DEVICE,
-    )
+    torch.load(os.path.join(OUTPUT_DIR, "vision_connector_stage1_best.pth"), map_location=DEVICE,)
 )
 for param in vision_encoder.parameters():
     param.requires_grad = False
@@ -280,9 +250,7 @@ for param in vision_connector.parameters():
     param.requires_grad = False
 
 if local_rank == 0:
-    print(
-        f"Optimizing {sum(p.numel() for p in trainable_params)} trainable router parameters."
-    )
+    print(f"Optimizing {sum(p.numel() for p in trainable_params)} trainable router parameters.")
 
 metrics_history = {
     "epoch": [], "train_loss": [], "train_ce_loss": [], "train_lb_loss": [],
@@ -362,7 +330,7 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
                 print("--- Gradient Check ---")
                 for name, p in router_params[:2]:
                     if p.grad is None:
-                        print(f"�� {name} grad is None 🚨")
+                        print(f"🚨 {name} grad is None 🚨")
                     else:
                         grad_norm = torch.linalg.vector_norm(p.grad).item()
                         print(f"[DEBUG GRAD] {name}: grad_norm={grad_norm:.4e}")

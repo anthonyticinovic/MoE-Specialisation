@@ -19,6 +19,14 @@ class MoELayer(nn.Module):
         # Attribute to store the load balancing loss for 'soft' routing
         self.load_balancing_loss = 0.0
 
+    def initialize_gate(self):
+        """
+        Explicitly initializes or re-initializes the gate weights.
+        This ensures the gate has the correct shape and a fresh start.
+        """
+        self.gate = nn.Linear(self.d_model, self.num_experts, bias=False)
+        nn.init.normal_(self.gate.weight, std=0.02)
+
     def forward(self, hidden_states: torch.Tensor, temperature: float = 1.0):
         """
         Main forward pass that dispatches to the correct routing logic.
