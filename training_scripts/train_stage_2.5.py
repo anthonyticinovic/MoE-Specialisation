@@ -1,3 +1,5 @@
+
+
 import time
 import json
 import yaml
@@ -17,7 +19,7 @@ from transformers import (
     CLIPVisionModel,
 )
 from models import VisionLanguageConnector
-from data import COLO_Loader
+from data import COCO_Loader  # <-- FIX: Corrected typo from COLO to COCO
 from torch.amp import GradScaler, autocast
 from torch.distributed.fsdp import CPUOffload
 import torch.distributed as dist
@@ -106,6 +108,9 @@ for name, param in llm.named_parameters():
 # ====================================================================================
 # 5. FSDP WRAPPING & CHECKPOINTING
 # ====================================================================================
+# NOTE: This wrapping policy is still likely incorrect and should be revisited
+# if zero-gradient issues persist after fixing the checkpoint loading.
+# The correct class is likely `MistralMoEDecoderLayer`.
 my_auto_wrap_policy = partial(transformer_auto_wrap_policy, transformer_layer_cls={MistralMLP})
 ignored_modules = [llm.model.embed_tokens]
 
@@ -139,66 +144,39 @@ epoch_tensor = torch.tensor([latest_stage2_epoch], dtype=torch.int).to(DEVICE)
 dist.broadcast(epoch_tensor, src=0)
 latest_stage2_epoch = epoch_tensor.item()
 
+# ★★★ ELEGANT SOLUTION IMPLEMENTED HERE ★★★
 if latest_stage2_epoch > 0:
     checkpoint_path = os.path.join(
         STAGE2_CHECKPOINT_DIR, f"llm_stage2_epoch_{latest_stage2_epoch}.pth"
     )
     if local_rank == 0:
-        print(f"💾 Loading Stage 2 expert weights from: {checkpoint_path}")
+        print(f"💾 Loading and filtering Stage 2 expert weights from: {checkpoint_path}")
 
-    state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    # 1. Load the full state dict from the checkpoint file onto the CPU
+    full_stage2_state_dict = torch.load(checkpoint_path, map_location="cpu")
+
+    # 2. Create a new state dict, EXCLUDING any parameters related to the router gates
+    filtered_state_dict = {
+        k: v for k, v in full_stage2_state_dict.items() if "mlp.gate" not in k
+    }
+    
+    del full_stage2_state_dict  # Free up memory
+
+    # 3. Load the filtered state dict. This will update all weights EXCEPT the gates,
+    # preserving the fresh, correctly-shaped gates initialized in the MoELayer.
     load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
     with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
-        llm.load_state_dict(state_dict, strict=False)
-
-    del state_dict
+        # strict=False is important as the dict is missing gate keys
+        llm.load_state_dict(filtered_state_dict, strict=False)
+    
+    del filtered_state_dict
     gc.collect()
+    
     if local_rank == 0:
-        print("✅ Stage 2 training state resumed successfully.")
+        print("✅ Filtered Stage 2 state loaded successfully. Router gates are preserved.")
 else:
     if local_rank == 0:
-        print(
-            "🚨 WARNING: No Stage 2 checkpoint found. Routers will be trained on unspecialized experts."
-        )
-
-# --- Re-initialize all router gates AFTER loading Stage 2 checkpoint ---
-if local_rank == 0:
-    print("--- Forcing re-initialization of router gates ---")
-
-for layer in llm.module.model.layers:
-    if hasattr(layer.mlp, "gate"):
-        # Create fresh Linear with correct shape
-        new_gate = nn.Linear(layer.mlp.d_model, layer.mlp.num_experts, bias=False)
-        nn.init.normal_(new_gate.weight, std=0.02)
-
-        # ADD THIS DEBUG BLOCK
-        if local_rank == 0:
-            print(f"--- Debugging Sub-layers for Expert 0 in MoE Layer {i} ---")
-            # This will print the structure of the MLP, showing the layer names
-            print(layer.mlp.experts[0])
-            print("-----------------------------------------------------------")
-        # END DEBUG BLOCK
-
-        # This is the line we want to verify
-        new_gate.to(layer.mlp.experts[0].gate_proj.weight.device)
-
-        # Replace
-        layer.mlp.gate = new_gate
-        layer.mlp.gate.weight.requires_grad = True
-
-# Refresh optimizer so it tracks new params
-trainable_params = [p for p in llm.parameters() if p.requires_grad]
-optimizer = optim.AdamW(
-    trainable_params,
-    lr=train_params["learning_rate"],
-    weight_decay=train_params["weight_decay"],
-    fused=True,
-)
-
-# Debug: print out gate shapes on rank 0
-if local_rank == 0:
-    for i, layer in enumerate(llm.module.model.layers):
-        print(f"[DEBUG] Layer {i} gate shape: {tuple(layer.mlp.gate.weight.shape)}")
+        print("🚨 WARNING: No Stage 2 checkpoint found. Training with fresh experts and routers.")
 
 # ====================================================================================
 # 6. DATA & OPTIMIZER
@@ -247,38 +225,9 @@ optimizer = optim.AdamW(
     fused=True,
 )
 scaler = GradScaler()
-
-# --- DEBUG: Optimizer param groups ---
-if local_rank == 0:
-    for i, group in enumerate(optimizer.param_groups):
-        print(f"[DEBUG] Optimizer group {i}: {len(group['params'])} params")
-        for j, p in enumerate(group["params"][:5]):
-            print(
-                f"   param {j} shape={tuple(p.shape)}, requires_grad={p.requires_grad}"
-            )
-# --- END DEBUG ---
-
 total_steps = (len(train_loader) // accumulation_steps) * NUM_EPOCHS
 scheduler = CosineAnnealingLR(optimizer, T_max=total_steps)
-
 loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
-
-# --- DEBUG: Print trainable params ---
-if local_rank == 0:
-    trainable_params_debug = [p for p in llm.parameters() if p.requires_grad]
-    total = sum(p.numel() for p in trainable_params_debug)
-    print(
-        f"[DEBUG] trainable param count = {len(trainable_params_debug)}, total elements = {total}"
-    )
-
-    count = 0
-    for name, p in llm.named_parameters():
-        if p.requires_grad:
-            print(f"[DEBUG] trainable param: {name}, shape={tuple(p.shape)}")
-            count += 1
-            if count >= 30:
-                break
-# --- END DEBUG ---
 
 # --- 5.2. Resume from Stage 2.5 Checkpoint (If it exists) ---
 latest_epoch = 0
@@ -336,30 +285,17 @@ if local_rank == 0:
     )
 
 metrics_history = {
-    "epoch": [],
-    "train_loss": [],
-    "train_ce_loss": [],
-    "train_lb_loss": [],
-    "val_loss": [],
-    "learning_rate": [],
+    "epoch": [], "train_loss": [], "train_ce_loss": [], "train_lb_loss": [],
+    "val_loss": [], "learning_rate": [],
 }
 metrics_path = os.path.join(OUTPUT_DIR, "training_metrics_stage2.5.json")
 if local_rank == 0 and latest_epoch > 0 and os.path.exists(metrics_path):
     with open(metrics_path, "r") as f:
         metrics_history = json.load(f)
 
-
-# Corrected the variable name from 'model' to 'llm' to prevent a NameError.
+# Optional: Verification block to confirm gate shapes are correct before training
 if local_rank == 0:
-    print("--- Parameters to be trained (Verified by NameError fix) ---")
-    for name, param in llm.named_parameters():
-        if param.requires_grad:
-            print(name)
-    print("----------------------------------------------------------")
-
-if local_rank == 0:
-    print("--- Verifying Gate Parameter Shapes After Checkpoint Load ---")
-    # Access the underlying model with .module since it's wrapped with FSDP
+    print("--- Verifying Gate Parameter Shapes Before Training ---")
     for i, layer in enumerate(llm.module.model.layers):
         if hasattr(layer.mlp, "gate") and hasattr(layer.mlp.gate, "weight"):
             print(f"  Layer {i} gate shape: {tuple(layer.mlp.gate.weight.shape)}")
@@ -374,16 +310,12 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
     train_sampler.set_epoch(epoch)
     llm.train()
 
-    total_train_loss = 0
-    total_ce_loss = 0
-    total_lb_loss = 0
-
+    total_train_loss, total_ce_loss, total_lb_loss = 0, 0, 0
     optimizer.zero_grad()
+    
     for i, (images, input_ids, attention_mask) in enumerate(train_loader):
         images, input_ids, attention_mask = (
-            images.to(DEVICE),
-            input_ids.to(DEVICE),
-            attention_mask.to(DEVICE),
+            images.to(DEVICE), input_ids.to(DEVICE), attention_mask.to(DEVICE),
         )
 
         with autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -392,20 +324,14 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
                 visual_soft_tokens = vision_connector(patch_embeddings)
                 text_embeddings = llm.model.embed_tokens(input_ids)
 
-            combined_embeddings = torch.cat(
-                [visual_soft_tokens, text_embeddings], dim=1
-            )
+            combined_embeddings = torch.cat([visual_soft_tokens, text_embeddings], dim=1)
             combined_attention_mask = torch.cat(
-                [
-                    torch.ones(visual_soft_tokens.shape[:2], device=DEVICE),
-                    attention_mask,
-                ],
+                [torch.ones(visual_soft_tokens.shape[:2], device=DEVICE), attention_mask,],
                 dim=1,
             )
 
             outputs = llm(
-                inputs_embeds=combined_embeddings,
-                attention_mask=combined_attention_mask,
+                inputs_embeds=combined_embeddings, attention_mask=combined_attention_mask,
             )
             logits = outputs.logits
 
@@ -426,35 +352,27 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
             ) / accumulation_steps
 
         scaler.scale(loss).backward()
-        # --- DEBUG: Router gradient norms ---
-        if local_rank == 0 and (i + 1) % 100 == 0: # Print only periodically
+        
+        if local_rank == 0 and (i + 1) % 100 == 0:
             router_params = [
-                (name, p)
-                for name, p in llm.named_parameters()
+                (name, p) for name, p in llm.named_parameters()
                 if "gate" in name and p.requires_grad
             ]
-            if not router_params:
-                print("🚨 No router parameters found with requires_grad=True 🚨")
-            else:
+            if router_params:
                 print("--- Gradient Check ---")
-                for name, p in router_params[:2]:  # only print a few layers
+                for name, p in router_params[:2]:
                     if p.grad is None:
-                        print(f"🚨 {name} grad is None 🚨")
+                        print(f"�� {name} grad is None 🚨")
                     else:
                         grad_norm = torch.linalg.vector_norm(p.grad).item()
-                        grad_max = p.grad.abs().max().item()
-                        print(
-                            f"[DEBUG GRAD] {name}: grad_norm={grad_norm:.4e}, grad_max={grad_max:.4e}"
-                        )
+                        print(f"[DEBUG GRAD] {name}: grad_norm={grad_norm:.4e}")
                 print("----------------------")
-        # --- END DEBUG ---
 
         if loss.item() > 0:
             total_train_loss += loss.item() * accumulation_steps
             total_ce_loss += ce_loss.item()
             if isinstance(total_load_balancing_loss, torch.Tensor):
                 total_lb_loss += total_load_balancing_loss.item()
-
 
         if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):
             scaler.step(optimizer)
@@ -464,32 +382,6 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
 
         if local_rank == 0 and (i + 1) % 100 == 0:
             print(f"  Epoch {epoch+1}, Batch [{i+1}/{len(train_loader)}]")
-
-    # --- DEBUG: Gate activations & LB loss ---
-    if local_rank == 0:
-        print("--- End of Epoch Debug ---")
-        layers_to_check = (
-            llm.module.model.layers
-            if hasattr(llm, "module")
-            else llm.model.layers
-        )
-        for i, layer in enumerate(layers_to_check[:2]): # Check first few layers
-            if hasattr(layer.mlp, "gate"):
-                gate = layer.mlp.gate
-                if hasattr(gate, "weight"):
-                    print(
-                        f"[DEBUG] Layer {i} gate weight norm: {gate.weight.norm().item():.4f}"
-                    )
-            if hasattr(layer.mlp, "load_balancing_loss"):
-                lb = layer.mlp.load_balancing_loss
-                if isinstance(lb, torch.Tensor):
-                    print(
-                        f"[DEBUG] Layer {i} load balancing loss: {lb.item():.4f}"
-                    )
-                else:
-                    print(f"[DEBUG] Layer {i} LB loss type: {type(lb)}")
-        print("--------------------------")
-    # --- END DEBUG ---
 
     avg_train_loss = total_train_loss / len(train_loader)
     avg_ce_loss = total_ce_loss / len(train_loader)
@@ -506,9 +398,7 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
     with torch.no_grad():
         for i, (images, input_ids, attention_mask) in enumerate(val_loader):
             images, input_ids, attention_mask = (
-                images.to(DEVICE),
-                input_ids.to(DEVICE),
-                attention_mask.to(DEVICE),
+                images.to(DEVICE), input_ids.to(DEVICE), attention_mask.to(DEVICE),
             )
             with autocast(device_type="cuda", dtype=torch.bfloat16):
                 patch_embeddings = vision_encoder(images).last_hidden_state
@@ -518,19 +408,13 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
                     [visual_soft_tokens, text_embeddings], dim=1
                 )
                 combined_attention_mask = torch.cat(
-                    [
-                        torch.ones(visual_soft_tokens.shape[:2], device=DEVICE),
-                        attention_mask,
-                    ],
+                    [torch.ones(visual_soft_tokens.shape[:2], device=DEVICE), attention_mask,],
                     dim=1,
                 )
-
                 outputs = llm(
-                    inputs_embeds=combined_embeddings,
-                    attention_mask=combined_attention_mask,
+                    inputs_embeds=combined_embeddings, attention_mask=combined_attention_mask,
                 )
                 logits = outputs.logits
-
                 num_visual_tokens = visual_soft_tokens.shape[1]
                 text_logits = logits[..., num_visual_tokens:-1, :].contiguous()
                 text_labels = input_ids[..., 1:].contiguous()
