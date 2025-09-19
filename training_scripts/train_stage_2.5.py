@@ -398,11 +398,7 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
             total_val_loss += loss.item()
 
     avg_val_loss = total_val_loss / len(val_loader)
-    dist.barrier()
-    avg_val_loss_tensor = torch.tensor(avg_val_loss).to(DEVICE)
-    dist.all_reduce(avg_val_loss_tensor, op=dist.ReduceOp.AVG)
-    avg_val_loss = avg_val_loss_tensor.item()
-    
+
     if local_rank == 0:
         print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] - Validation Loss: {avg_val_loss:.4f}")
 
