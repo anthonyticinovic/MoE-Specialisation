@@ -36,6 +36,8 @@ from models.custom_mistral import (
     MistralMoEDecoderLayer,
 )
 
+from transformers.models.mistral.modeling_mistral import MistralMLP
+
 # --- 1. Register Custom Architecture ---
 AutoConfig.register("mistral_moe", MistralMoEConfig)
 AutoModelForCausalLM.register(MistralMoEConfig, MistralMoEForCausalLM)
@@ -65,27 +67,27 @@ if local_rank == 0:
     print("--- Initializing Stage 2.5 Training (Training the Router) ---")
 
 # ====================================================================================
-# 3. ROBUST MODEL INITIALIZATION
+# 3. MODEL LOADING
 # ====================================================================================
 if local_rank == 0:
-    print("Initializing model architecture from config to ensure correct shapes...")
-
-moe_model_path = "/data/gpfs/projects/COMP90055/aticinovic/models/Mistral-7B-MoE"
-
-# 1. Load the configuration ONLY, without loading the base model's corrupted weights.
-config = AutoConfig.from_pretrained(moe_model_path, trust_remote_code=True)
-
-# 2. Create a model with a correctly initialized architecture and RANDOM weights.
-#    This guarantees all layers, including the gates, have the correct shape from the start.
-llm = MistralMoEForCausalLM(config)
-
-# Load other foundational models
-if local_rank == 0:
-    print("Loading other foundational models...")
+    print("Loading foundational models with low_cpu_mem_usage to prevent OOM...")
 vision_encoder = CLIPVisionModel.from_pretrained(paths["clip_local_path"]).to(DEVICE)
 clip_processor = AutoProcessor.from_pretrained(paths["clip_local_path"])
 tokenizer = AutoTokenizer.from_pretrained(paths["mistral_local_path"])
 tokenizer.pad_token = tokenizer.eos_token
+moe_model_path = "/data/gpfs/projects/COMP90055/aticinovic/models/Mistral-7B-MoE"
+
+# ★★★ ROBUST FIX PART 1: Revert to memory-efficient loading ★★★
+# This prevents the Out-of-Memory error by loading the model piece by piece.
+# We accept that this will load corrupted gates, which we will fix next.
+llm = AutoModelForCausalLM.from_pretrained(
+    moe_model_path,
+    trust_remote_code=True,
+    local_files_only=True,
+    torch_dtype=torch.bfloat16,
+    attn_implementation="flash_attention_2",
+    low_cpu_mem_usage=True,
+)
 
 # ====================================================================================
 # 4. TRAINING SETUP
@@ -142,27 +144,32 @@ if latest_stage2_epoch > 0:
         STAGE2_CHECKPOINT_DIR, f"llm_stage2_epoch_{latest_stage2_epoch}.pth"
     )
     if local_rank == 0:
-        print(f"💾 Loading and filtering Stage 2 expert weights from: {checkpoint_path}")
+        print(f"💾 Loading Stage 2 expert weights from: {checkpoint_path}")
 
-    full_stage2_state_dict = torch.load(checkpoint_path, map_location="cpu")
-    
-    # Filter out gate parameters to preserve the correctly initialized ones from the model
-    filtered_state_dict = {
-        k: v for k, v in full_stage2_state_dict.items() if "mlp.gate" not in k
-    }
-    del full_stage2_state_dict
-
+    state_dict = torch.load(checkpoint_path, map_location="cpu")
     load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
     with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
-        llm.load_state_dict(filtered_state_dict, strict=False)
-    del filtered_state_dict
+        llm.load_state_dict(state_dict, strict=False)
+    del state_dict
     gc.collect()
     
     if local_rank == 0:
-        print("✅ Filtered Stage 2 state loaded successfully. Router gates are preserved.")
+        print("✅ Stage 2 state loaded successfully.")
 else:
     if local_rank == 0:
-        print("🚨 WARNING: No Stage 2 checkpoint found. Training with fresh experts and routers.")
+        print("🚨 WARNING: No Stage 2 checkpoint found.")
+
+# ★★★ ROBUST FIX PART 2: Manually re-initialize gates AFTER all loading is done ★★★
+if local_rank == 0:
+    print("--- Forcing re-initialization of router gates to fix corruption ---")
+
+for layer in llm.module.model.layers:
+    if hasattr(layer.mlp, "gate"):
+        new_gate = nn.Linear(layer.mlp.d_model, layer.mlp.num_experts, bias=False)
+        nn.init.normal_(new_gate.weight, std=0.02)
+        new_gate = new_gate.to(DEVICE)
+        layer.mlp.gate = new_gate
+        layer.mlp.gate.weight.requires_grad = True
 
 # ====================================================================================
 # 6. DATA & OPTIMIZER
@@ -170,20 +177,14 @@ else:
 if local_rank == 0:
     print("Creating datasets and dataloaders...")
 train_dataset = COCO_Loader(
-    image_dir=paths["image_dir"],
-    annotations_file=paths["annotations_file"],
-    clip_processor=clip_processor,
-    tokenizer=tokenizer,
-    subset_fraction=train_params["subset_fraction"],
-    split="train",
+    image_dir=paths["image_dir"], annotations_file=paths["annotations_file"],
+    clip_processor=clip_processor, tokenizer=tokenizer,
+    subset_fraction=train_params["subset_fraction"], split="train",
 )
 val_dataset = COCO_Loader(
-    image_dir=paths["image_dir"],
-    annotations_file=paths["annotations_file"],
-    clip_processor=clip_processor,
-    tokenizer=tokenizer,
-    subset_fraction=train_params["subset_fraction"],
-    split="val",
+    image_dir=paths["image_dir"], annotations_file=paths["annotations_file"],
+    clip_processor=clip_processor, tokenizer=tokenizer,
+    subset_fraction=train_params["subset_fraction"], split="val",
 )
 train_sampler = DistributedSampler(train_dataset)
 val_sampler = DistributedSampler(val_dataset, shuffle=False)
@@ -196,6 +197,9 @@ val_loader = DataLoader(
     num_workers=loader_params["num_workers"], pin_memory=True,
 )
 
+# ★★★ ROBUST FIX PART 3: Create optimizer AFTER gates are fixed ★★★
+if local_rank == 0:
+    print("Creating optimizer and scheduler with refreshed trainable parameters...")
 accumulation_steps = train_params.get("gradient_accumulation_steps", 1)
 trainable_params = [p for p in llm.parameters() if p.requires_grad]
 optimizer = optim.AdamW(
@@ -228,6 +232,8 @@ if latest_epoch > 0:
     if local_rank == 0:
         print(f"💾 Resuming Stage 2.5 training from epoch {latest_epoch+1} using {checkpoint_path}")
 
+    # Note: Resuming requires the optimizer state to be loaded after this,
+    # which is not currently implemented. This script assumes starting Stage 2.5 from scratch.
     state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
     with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
@@ -239,7 +245,7 @@ if latest_epoch > 0:
 
 # --- 5.3. Finalize Model Setup ---
 llm.model.embed_tokens.to(DEVICE)
-llm.gradient_checkpointing_enable()
+#llm.gradient_checkpointing_enable()
 vision_connector = VisionLanguageConnector().to(DEVICE)
 vision_connector.load_state_dict(
     torch.load(os.path.join(OUTPUT_DIR, "vision_connector_stage1_best.pth"), map_location=DEVICE,)

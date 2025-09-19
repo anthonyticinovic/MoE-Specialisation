@@ -15,6 +15,7 @@ class MoELayer(nn.Module):
         # The gate is only used for 'soft' routing, but we initialize it
         # to ensure the model structure is consistent when loading weights.
         self.gate = nn.Linear(self.d_model, self.num_experts, bias=False)
+        nn.init.normal_(self.gate.weight, std=0.02)
 
         # Attribute to store the load balancing loss for 'soft' routing
         self.load_balancing_loss = 0.0
@@ -114,12 +115,13 @@ class MoELayer(nn.Module):
                 weighted_output = expert_output * weights_for_expert
                 
                 # Add the weighted output back to the final tensor at the correct positions
-                final_hidden_states.index_add_(0, token_indices, weighted_output)
+                final_hidden_states.index_add_(0, token_indices, weighted_output.to(final_hidden_states.dtype))
 
         # 4. Differentiable Load Balancing Loss
-        # Calculated from the soft probabilities to ensure a smooth loss surface
-        importance = router_probs.mean(dim=0)  # Average probability for each expert
-        self.load_balancing_loss = (importance * self.num_experts).sum()
+        tokens_per_expert = torch.mean(router_onehot, dim=0) # Fraction of tokens to each expert
+        avg_prob_per_expert = torch.mean(router_probs, dim=0) # Average router probability
+        # The loss is scaled by the number of experts
+        self.load_balancing_loss = self.num_experts * torch.sum(tokens_per_expert * avg_prob_per_expert)
 
         # Reshape to the original dimensions and return
         return final_hidden_states.view(batch_size, sequence_length, hidden_dim)
