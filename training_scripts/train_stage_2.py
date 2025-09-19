@@ -148,26 +148,40 @@ llm = FSDP(
 )
 print(f"--- Rank {local_rank} --- ✅ Model wrapped with FSDP.")
 
-# --- MODIFIED: More robust checkpoint loading ---
+# Resuming Logic 
 latest_epoch = 0
-# Let only rank 0 scan the filesystem to find the latest checkpoint
-if local_rank == 0:
-    if os.path.exists(STAGE2_CHECKPOINT_DIR):
-        epoch_numbers = []
-        # Use regex to find all checkpoint files and extract their epoch number
-        for filename in os.listdir(STAGE2_CHECKPOINT_DIR):
-            match = re.match(r"llm_stage2_epoch_(\d+)\.pth", filename)
-            if match:
-                epoch_numbers.append(int(match.group(1)))
-        
-        if epoch_numbers:
-            latest_epoch = max(epoch_numbers)
+best_val_loss = float('inf')
 
-# Broadcast the found latest_epoch from rank 0 to all other ranks
-# This ensures all processes agree on which epoch to start from.
-epoch_tensor = torch.tensor([latest_epoch], dtype=torch.int).to(DEVICE)
-dist.broadcast(epoch_tensor, src=0)
-latest_epoch = epoch_tensor.item()
+# Define the path for the latest model checkpoint
+latest_checkpoint_path = os.path.join(STAGE2_CHECKPOINT_DIR, "latest_model.pth")
+
+# On rank 0, check if the latest checkpoint exists
+if local_rank == 0 and os.path.exists(latest_checkpoint_path):
+    print(f"💾 Found latest checkpoint at {latest_checkpoint_path}. Resuming training...")
+    # Load the checkpoint dictionary, which includes epoch and best_val_loss
+    checkpoint = torch.load(latest_checkpoint_path, map_location="cpu")
+
+    # Load the model's state dict from the checkpoint
+    load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
+    with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
+        llm.load_state_dict(checkpoint['model_state_dict'])
+
+    # Restore the epoch and best validation loss
+    latest_epoch = checkpoint['epoch']
+    best_val_loss = checkpoint['best_val_loss']
+
+    del checkpoint
+    gc.collect()
+    print(f"✅ Resumed from epoch {latest_epoch}. Previous best validation loss: {best_val_loss:.4f}")
+
+# Broadcast the restored epoch and best_val_loss from rank 0 to all other processes
+# This ensures all GPUs are in sync.
+state_tensor = torch.tensor([latest_epoch, best_val_loss], dtype=torch.float32).to(DEVICE)
+dist.broadcast(state_tensor, src=0)
+
+# Unpack the synchronized values on all processes
+latest_epoch = int(state_tensor[0].item())
+best_val_loss = state_tensor[1].item()
 
 # Handle case where training is already complete
 if latest_epoch >= NUM_EPOCHS:
@@ -175,23 +189,6 @@ if latest_epoch >= NUM_EPOCHS:
         print(f"Latest checkpoint (epoch {latest_epoch}) is already >= NUM_EPOCHS ({NUM_EPOCHS}). Nothing to do.")
     dist.destroy_process_group()
     sys.exit(0) # Exit gracefully
-
-# If a checkpoint is found, load it
-if latest_epoch > 0:
-    checkpoint_path = os.path.join(STAGE2_CHECKPOINT_DIR, f"llm_stage2_epoch_{latest_epoch}.pth")
-    if local_rank == 0:
-        print(f"💾 Found existing checkpoint. Resuming training from epoch {latest_epoch+1} using {checkpoint_path}")
-
-    load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
-    with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
-        state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-        llm.load_state_dict(state_dict)
-    
-    del state_dict
-    gc.collect()
-
-    if local_rank == 0:
-        print("✅ Resumed model weights loaded.")
 
 # Manually move the ignored module to the correct GPU device.
 if local_rank == 0:
@@ -299,7 +296,6 @@ metrics_path = os.path.join(OUTPUT_DIR, "training_metrics_stage2.json")
 if local_rank == 0 and latest_epoch > 0 and os.path.exists(metrics_path):
     with open(metrics_path, "r") as f:
         metrics_history = json.load(f)
-
 
 # ====================================================================================
 # 8. TRAINING LOOP
@@ -476,27 +472,37 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
     if local_rank == 0:
         print(f"Saving model checkpoint at the end of epoch {epoch+1}...")
 
-    # Configure the policy for saving the full state dict
+    # NEW Checkpointing Logic for 'latest' and 'best' models 
+
+    # Get the model's state dict, offloaded to CPU on rank 0
     save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
     with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, save_policy):
         cpu_state_dict = llm.state_dict()
 
+    # Only rank 0 handles the file I/O
     if local_rank == 0:
-
         os.makedirs(STAGE2_CHECKPOINT_DIR, exist_ok=True)
-        file_path = os.path.join(STAGE2_CHECKPOINT_DIR, f"llm_stage2_epoch_{epoch+1}.pth")
 
-        # Save the model state dict
-        torch.save(cpu_state_dict, file_path)
-        print(f"Model checkpoint saved to {file_path}")
+        # 1. Save the 'latest' model checkpoint
+        latest_checkpoint_path = os.path.join(STAGE2_CHECKPOINT_DIR, "latest_model.pth")
 
-        # Remove the previous checkpoint to save space ---
-        # The checkpoint for the previous epoch is identified by the loop variable `epoch`.
-        previous_checkpoint_path = os.path.join(STAGE2_CHECKPOINT_DIR, f"llm_stage2_epoch_{epoch}.pth")
-        if os.path.exists(previous_checkpoint_path):
-            os.remove(previous_checkpoint_path)
-            print(f"Removed previous checkpoint: {previous_checkpoint_path}")
+        # We save a dictionary to easily resume training
+        torch.save({
+            'epoch': epoch + 1,  # Save the *next* epoch number to start from
+            'model_state_dict': cpu_state_dict,
+            'best_val_loss': best_val_loss,
+        }, latest_checkpoint_path)
+        print(f"💾 Saved latest model checkpoint to {latest_checkpoint_path}")
 
+        # 2. Check if this is the 'best' model and save if it is
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            best_model_path = os.path.join(STAGE2_CHECKPOINT_DIR, "best_model.pth")
+            # For the 'best' model, we only need the weights for inference
+            torch.save(cpu_state_dict, best_model_path)
+            print(f"🏆 New best model found! Validation loss: {avg_val_loss:.4f}. Saved to {best_model_path}")
+
+    # Use a barrier to ensure all processes wait until rank 0 has finished saving
     dist.barrier()
 
 # --- 3. Calculate and print the total training time ---
