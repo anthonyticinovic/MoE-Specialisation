@@ -148,40 +148,47 @@ llm = FSDP(
 )
 print(f"--- Rank {local_rank} --- ✅ Model wrapped with FSDP.")
 
-# Resuming Logic 
+# --- CORRECTED Resuming Logic ---
 latest_epoch = 0
 best_val_loss = float('inf')
+state_dict = None # Initialize state_dict to None
 
 # Define the path for the latest model checkpoint
 latest_checkpoint_path = os.path.join(STAGE2_CHECKPOINT_DIR, "latest_model.pth")
 
-# On rank 0, check if the latest checkpoint exists
-if local_rank == 0 and os.path.exists(latest_checkpoint_path):
-    print(f"💾 Found latest checkpoint at {latest_checkpoint_path}. Resuming training...")
-    # Load the checkpoint dictionary, which includes epoch and best_val_loss
-    checkpoint = torch.load(latest_checkpoint_path, map_location="cpu")
+# Only rank 0 loads the checkpoint from disk
+if local_rank == 0:
+    if os.path.exists(latest_checkpoint_path):
+        print(f"💾 Found latest checkpoint at {latest_checkpoint_path}. Resuming training...")
+        checkpoint = torch.load(latest_checkpoint_path, map_location="cpu")
+        
+        # Load the state dict and restore training state variables
+        state_dict = checkpoint['model_state_dict']
+        latest_epoch = checkpoint['epoch']
+        best_val_loss = checkpoint['best_val_loss']
+        
+        del checkpoint
+        gc.collect()
+        print(f"✅ Resumed from epoch {latest_epoch}. Previous best validation loss: {best_val_loss:.4f}")
+    else:
+        print("🏁 No checkpoint found. Starting training from scratch.")
 
-    # Load the model's state dict from the checkpoint
-    load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
-    with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
-        llm.load_state_dict(checkpoint['model_state_dict'])
+# Broadcast the training state (epoch, best_val_loss) from rank 0 to all other processes
+state_data = [latest_epoch, best_val_loss]
+dist.broadcast_object_list(state_data, src=0)
 
-    # Restore the epoch and best validation loss
-    latest_epoch = checkpoint['epoch']
-    best_val_loss = checkpoint['best_val_loss']
+# All processes receive the state
+latest_epoch, best_val_loss = state_data[0], state_data[1]
 
-    del checkpoint
-    gc.collect()
-    print(f"✅ Resumed from epoch {latest_epoch}. Previous best validation loss: {best_val_loss:.4f}")
+# Now, load the model state dict into the FSDP model on ALL ranks.
+# FSDP will handle broadcasting the weights from rank 0 (where state_dict is populated)
+# to all other ranks (where state_dict is None).
+load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
+    llm.load_state_dict(state_dict)
 
-# Broadcast the restored epoch and best_val_loss from rank 0 to all other processes
-# This ensures all GPUs are in sync.
-state_tensor = torch.tensor([latest_epoch, best_val_loss], dtype=torch.float32).to(DEVICE)
-dist.broadcast(state_tensor, src=0)
-
-# Unpack the synchronized values on all processes
-latest_epoch = int(state_tensor[0].item())
-best_val_loss = state_tensor[1].item()
+# Barrier to ensure all processes have loaded the model before proceeding
+dist.barrier()
 
 # Handle case where training is already complete
 if latest_epoch >= NUM_EPOCHS:
