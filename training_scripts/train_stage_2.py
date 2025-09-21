@@ -148,7 +148,7 @@ llm = FSDP(
 )
 print(f"--- Rank {local_rank} --- ✅ Model wrapped with FSDP.")
 
-# --- CORRECTED Resuming Logic ---
+# --- FINAL CORRECTED Resuming Logic ---
 latest_epoch = 0
 best_val_loss = float('inf')
 state_dict = None # Initialize state_dict to None
@@ -162,7 +162,6 @@ if local_rank == 0:
         print(f"💾 Found latest checkpoint at {latest_checkpoint_path}. Resuming training...")
         checkpoint = torch.load(latest_checkpoint_path, map_location="cpu")
         
-        # Load the state dict and restore training state variables
         state_dict = checkpoint['model_state_dict']
         latest_epoch = checkpoint['epoch']
         best_val_loss = checkpoint['best_val_loss']
@@ -173,21 +172,25 @@ if local_rank == 0:
     else:
         print("🏁 No checkpoint found. Starting training from scratch.")
 
-# Broadcast the training state (epoch, best_val_loss) from rank 0 to all other processes
+# Broadcast the state_dict from rank 0 to all other ranks.
+# It will be the model weights if found, otherwise it will be None.
+state_dict_list = [state_dict]
+dist.broadcast_object_list(state_dict_list, src=0)
+state_dict = state_dict_list[0] 
+
+# Broadcast the training state (epoch, best_val_loss) from rank 0.
 state_data = [latest_epoch, best_val_loss]
 dist.broadcast_object_list(state_data, src=0)
-
-# All processes receive the state
 latest_epoch, best_val_loss = state_data[0], state_data[1]
 
-# Now, load the model state dict into the FSDP model on ALL ranks.
-# FSDP will handle broadcasting the weights from rank 0 (where state_dict is populated)
-# to all other ranks (where state_dict is None).
-load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
+# --- THE FINAL FIX IS HERE ---
+# All ranks will now only attempt to load the state_dict IF one was found on rank 0.
+if state_dict is not None:
     llm.load_state_dict(state_dict)
+    print(f"--- Rank {local_rank} --- ✅ Model weights loaded successfully.")
+# -----------------------------
 
-# Barrier to ensure all processes have loaded the model before proceeding
+# Barrier to ensure all processes are synchronized before continuing
 dist.barrier()
 
 # Handle case where training is already complete
