@@ -148,50 +148,55 @@ llm = FSDP(
 )
 print(f"--- Rank {local_rank} --- ✅ Model wrapped with FSDP.")
 
-# --- FINAL CORRECTED Resuming Logic ---
+# --- FINAL, MEMORY-EFFICIENT Resuming Logic ---
 latest_epoch = 0
 best_val_loss = float('inf')
-state_dict = None # Initialize state_dict to None
+checkpoint_found = torch.tensor(0.0, device=DEVICE) # Use a tensor for broadcast
 
 # Define the path for the latest model checkpoint
 latest_checkpoint_path = os.path.join(STAGE2_CHECKPOINT_DIR, "latest_model.pth")
 
-# Only rank 0 loads the checkpoint from disk
 if local_rank == 0:
     if os.path.exists(latest_checkpoint_path):
-        print(f"💾 Found latest checkpoint at {latest_checkpoint_path}. Resuming training...")
-        checkpoint = torch.load(latest_checkpoint_path, map_location="cpu")
-        
-        state_dict = checkpoint['model_state_dict']
-        latest_epoch = checkpoint['epoch']
-        best_val_loss = checkpoint['best_val_loss']
-        
-        del checkpoint
-        gc.collect()
-        print(f"✅ Resumed from epoch {latest_epoch}. Previous best validation loss: {best_val_loss:.4f}")
+        checkpoint_found.fill_(1.0) # Signal that a checkpoint was found
     else:
         print("🏁 No checkpoint found. Starting training from scratch.")
 
-# Broadcast the state_dict from rank 0 to all other ranks.
-# It will be the model weights if found, otherwise it will be None.
-state_dict_list = [state_dict]
-dist.broadcast_object_list(state_dict_list, src=0)
-state_dict = state_dict_list[0] 
+# Broadcast the signal to all ranks
+dist.broadcast(checkpoint_found, src=0)
 
-# Broadcast the training state (epoch, best_val_loss) from rank 0.
+# All ranks now know if a checkpoint exists
+if checkpoint_found.item() == 1.0:
+    if local_rank == 0:
+        print(f"💾 Found latest checkpoint. Resuming training...")
+    
+    # Use FSDP's recommended loading pattern, which is memory-efficient
+    load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
+        
+        # Only rank 0 loads the file, but all ranks enter the context
+        state_dict_to_load = None
+        if local_rank == 0:
+            checkpoint = torch.load(latest_checkpoint_path, map_location="cpu")
+            state_dict_to_load = checkpoint['model_state_dict']
+            latest_epoch = checkpoint['epoch']
+            best_val_loss = checkpoint['best_val_loss']
+            del checkpoint
+            gc.collect()
+            print(f"✅ Resumed from epoch {latest_epoch}. Previous best validation loss: {best_val_loss:.4f}")
+        
+        # FSDP will internally broadcast the state_dict from rank 0 to all other ranks
+        llm.load_state_dict(state_dict_to_load)
+
+# Broadcast the training state (epoch, best_val_loss) from rank 0
 state_data = [latest_epoch, best_val_loss]
 dist.broadcast_object_list(state_data, src=0)
 latest_epoch, best_val_loss = state_data[0], state_data[1]
 
-# --- THE FINAL FIX IS HERE ---
-# All ranks will now only attempt to load the state_dict IF one was found on rank 0.
-if state_dict is not None:
-    llm.load_state_dict(state_dict)
-    print(f"--- Rank {local_rank} --- ✅ Model weights loaded successfully.")
-# -----------------------------
-
-# Barrier to ensure all processes are synchronized before continuing
+# Barrier to ensure all processes are synchronized
 dist.barrier()
+if checkpoint_found.item() == 1.0:
+    print(f"--- Rank {local_rank} --- ✅ Model weights and state synchronized.")
 
 # Handle case where training is already complete
 if latest_epoch >= NUM_EPOCHS:
