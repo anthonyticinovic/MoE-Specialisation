@@ -120,18 +120,14 @@ for layer in llm.model.layers:
 # ====================================================================================
 print(f"--- Rank {local_rank} --- Wrapping model with FSDP...")
 
-# The embedding layer is `llm.model.embed_tokens`.
 ignored_modules = [llm.model.embed_tokens]
 
-
-# --- NEW: Define the auto-wrap policy for your custom decoder layer ---
 my_auto_wrap_policy = partial(
     transformer_auto_wrap_policy,
     transformer_layer_cls={
         MistralMLP,
     },
 )
-
 
 llm = FSDP(
     llm,
@@ -148,34 +144,28 @@ llm = FSDP(
 )
 print(f"--- Rank {local_rank} --- ✅ Model wrapped with FSDP.")
 
-# --- FINAL, MEMORY-EFFICIENT Resuming Logic ---
+# --- MODIFIED: Robust 'best' and 'latest' checkpoint loading ---
 latest_epoch = 0
 best_val_loss = float('inf')
-checkpoint_found = torch.tensor(0.0, device=DEVICE) # Use a tensor for broadcast
+checkpoint_found = torch.tensor(0.0, device=DEVICE)
 
-# Define the path for the latest model checkpoint
-latest_checkpoint_path = os.path.join(STAGE2_CHECKPOINT_DIR, "latest_model.pth")
+latest_checkpoint_path = os.path.join(STAGE2_CHECKPOINT_DIR, "llm_stage2_latest.pth")
 
 if local_rank == 0:
     if os.path.exists(latest_checkpoint_path):
-        checkpoint_found.fill_(1.0) # Signal that a checkpoint was found
+        checkpoint_found.fill_(1.0)
     else:
-        print("🏁 No checkpoint found. Starting training from scratch.")
+        print("�� No checkpoint found. Starting training from scratch.")
 
-# Broadcast the signal to all ranks
 dist.broadcast(checkpoint_found, src=0)
 
-# All ranks now know if a checkpoint exists
 if checkpoint_found.item() == 1.0:
     if local_rank == 0:
         print(f"💾 Found latest checkpoint. Resuming training...")
     
-    # Use FSDP's recommended loading pattern, which is memory-efficient
     load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
     with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
-        
-        # Only rank 0 loads the file, but all ranks enter the context
-        state_dict_to_load = None
+        state_dict_to_load = {}
         if local_rank == 0:
             checkpoint = torch.load(latest_checkpoint_path, map_location="cpu")
             state_dict_to_load = checkpoint['model_state_dict']
@@ -185,25 +175,15 @@ if checkpoint_found.item() == 1.0:
             gc.collect()
             print(f"✅ Resumed from epoch {latest_epoch}. Previous best validation loss: {best_val_loss:.4f}")
         
-        # FSDP will internally broadcast the state_dict from rank 0 to all other ranks
         llm.load_state_dict(state_dict_to_load)
 
-# Broadcast the training state (epoch, best_val_loss) from rank 0
 state_data = [latest_epoch, best_val_loss]
 dist.broadcast_object_list(state_data, src=0)
-latest_epoch, best_val_loss = state_data[0], state_data[1]
+latest_epoch, best_val_loss = int(state_data[0]), state_data[1]
 
-# Barrier to ensure all processes are synchronized
 dist.barrier()
 if checkpoint_found.item() == 1.0:
     print(f"--- Rank {local_rank} --- ✅ Model weights and state synchronized.")
-
-# Handle case where training is already complete
-if latest_epoch >= NUM_EPOCHS:
-    if local_rank == 0:
-        print(f"Latest checkpoint (epoch {latest_epoch}) is already >= NUM_EPOCHS ({NUM_EPOCHS}). Nothing to do.")
-    dist.destroy_process_group()
-    sys.exit(0) # Exit gracefully
 
 # Manually move the ignored module to the correct GPU device.
 if local_rank == 0:
@@ -228,12 +208,6 @@ for param in vision_encoder.parameters():
     param.requires_grad = False
 for param in vision_connector.parameters():
     param.requires_grad = False
-
-#if local_rank == 0:
-#    print("Compiling the model with torch.compile()...")
-#llm = torch.compile(llm)
-#if local_rank == 0:
-#    print("✅ Model compiled.")
 
 # ====================================================================================
 # 6. DATA & OPTIMIZER
@@ -275,39 +249,23 @@ val_loader = DataLoader(
     pin_memory=True,
 )
 
-# --- NEW: Add Gradient Accumulation Steps from config ---
 accumulation_steps = train_params.get("gradient_accumulation_steps", 1)
 if local_rank == 0:
     print(f"Using gradient accumulation with {accumulation_steps} steps.")
-    print(
-        f"Effective batch size: {train_params['batch_size'] * accumulation_steps * dist.get_world_size()}"
-    )
+    print(f"Effective batch size: {train_params['batch_size'] * accumulation_steps * dist.get_world_size()}")
 
 trainable_params = [p for p in llm.parameters() if p.requires_grad]
-
 optimizer = optim.AdamW(trainable_params, lr=train_params["learning_rate"], weight_decay=train_params["weight_decay"], fused=True)
 scaler = GradScaler()
-
-# T_max is the total number of optimizer steps in the entire training run.
 total_steps = (len(train_loader) // accumulation_steps) * NUM_EPOCHS
 scheduler = CosineAnnealingLR(optimizer, T_max=total_steps)
-
 loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
 
 if local_rank == 0:
-    print(
-        f"Optimizing {sum(p.numel() for p in llm.parameters() if p.requires_grad)} trainable parameters."
-    )
-# --- NEW: Initialize metrics history ---
-metrics_history = {
-    "epoch": [],
-    "train_loss": [],
-    "val_loss": [],
-    "learning_rate":[]
-}
-metrics_path = os.path.join(OUTPUT_DIR, "training_metrics_stage2.json")
+    print(f"Optimizing {sum(p.numel() for p in llm.parameters() if p.requires_grad)} trainable parameters.")
 
-# If resuming, load previous metrics
+metrics_history = {"epoch": [], "train_loss": [], "val_loss": [], "learning_rate":[]}
+metrics_path = os.path.join(OUTPUT_DIR, "training_metrics_stage2.json")
 if local_rank == 0 and latest_epoch > 0 and os.path.exists(metrics_path):
     with open(metrics_path, "r") as f:
         metrics_history = json.load(f)
@@ -316,18 +274,16 @@ if local_rank == 0 and latest_epoch > 0 and os.path.exists(metrics_path):
 # 8. TRAINING LOOP
 # ====================================================================================
 if local_rank == 0:
-    print(f"🚀 Starting Stage 2 training for {NUM_EPOCHS} epochs...")
+    print(f"🚀 Starting Stage 2 training from epoch {latest_epoch} for {NUM_EPOCHS} total epochs...")
 start_time = time.time()
 for epoch in range(latest_epoch, NUM_EPOCHS):
     train_sampler.set_epoch(epoch)
     llm.train()
     total_train_loss = 0
-    optimizer.zero_grad()  # Zero gradients at the start of each epoch
+    optimizer.zero_grad()
     for i, (images, input_ids, attention_mask) in enumerate(train_loader):
         images, input_ids, attention_mask = (
-            images.to(DEVICE),
-            input_ids.to(DEVICE),
-            attention_mask.to(DEVICE),
+            images.to(DEVICE), input_ids.to(DEVICE), attention_mask.to(DEVICE),
         )
 
         with autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -336,20 +292,13 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
                 visual_soft_tokens = vision_connector(patch_embeddings)
 
             text_embeddings = llm.model.embed_tokens(input_ids)
-            combined_embeddings = torch.cat(
-                [visual_soft_tokens, text_embeddings], dim=1
-            )
-
+            combined_embeddings = torch.cat([visual_soft_tokens, text_embeddings], dim=1)
             combined_embeddings.requires_grad_(True)
 
             routing_mask = torch.cat(
                 [
-                    torch.zeros(
-                        visual_soft_tokens.shape[:2], dtype=torch.long, device=DEVICE
-                    ),
-                    torch.ones(
-                        text_embeddings.shape[:2], dtype=torch.long, device=DEVICE
-                    ),
+                    torch.zeros(visual_soft_tokens.shape[:2], dtype=torch.long, device=DEVICE),
+                    torch.ones(text_embeddings.shape[:2], dtype=torch.long, device=DEVICE),
                 ],
                 dim=1,
             )
@@ -368,36 +317,27 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
                 attention_mask=combined_attention_mask,
             )
             logits = outputs.logits
-
             num_visual_tokens = visual_soft_tokens.shape[1]
             text_logits = logits[..., num_visual_tokens:-1, :].contiguous()
             text_labels = input_ids[..., 1:].contiguous()
 
             if text_logits.shape[1] == text_labels.shape[1]:
-                loss = loss_fn(
-                    text_logits.view(-1, llm.config.vocab_size), text_labels.view(-1)
-                )
-                # --- MODIFIED: Scale loss for accumulation ---
+                loss = loss_fn(text_logits.view(-1, llm.config.vocab_size), text_labels.view(-1))
                 loss = loss / accumulation_steps
             else:
                 loss = torch.tensor(0.0, device=DEVICE, requires_grad=True)
 
         scaler.scale(loss).backward()
-
-        # --- MODIFIED: Rescale for logging before optimizer step ---
         if loss.item() > 0:
             total_train_loss += loss.item() * accumulation_steps
 
-        # --- MODIFIED: Step optimizer only after accumulation_steps ---
         if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
             scheduler.step()
 
-        # --- Add periodic print statement for progress ---
         if local_rank == 0 and (i + 1) % 100 == 0:
-            # This will print an update roughly every 100 batches
             print(f"  Epoch {epoch+1}, Batch [{i+1}/{len(train_loader)}]")
 
     avg_train_loss = total_train_loss / len(train_loader)
@@ -410,29 +350,18 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
     with torch.no_grad():
         for i, (images, input_ids, attention_mask) in enumerate(val_loader):
             images, input_ids, attention_mask = (
-                images.to(DEVICE),
-                input_ids.to(DEVICE),
-                attention_mask.to(DEVICE),
+                images.to(DEVICE), input_ids.to(DEVICE), attention_mask.to(DEVICE),
             )
             with autocast(device_type="cuda", dtype=torch.bfloat16):
                 patch_embeddings = vision_encoder(images).last_hidden_state
                 visual_soft_tokens = vision_connector(patch_embeddings)
-
                 text_embeddings = llm.model.embed_tokens(input_ids)
-                combined_embeddings = torch.cat(
-                    [visual_soft_tokens, text_embeddings], dim=1
-                )
+                combined_embeddings = torch.cat([visual_soft_tokens, text_embeddings], dim=1)
 
                 routing_mask = torch.cat(
                     [
-                        torch.zeros(
-                            visual_soft_tokens.shape[:2],
-                            dtype=torch.long,
-                            device=DEVICE,
-                        ),
-                        torch.ones(
-                            text_embeddings.shape[:2], dtype=torch.long, device=DEVICE
-                        ),
+                        torch.zeros(visual_soft_tokens.shape[:2], dtype=torch.long, device=DEVICE),
+                        torch.ones(text_embeddings.shape[:2], dtype=torch.long, device=DEVICE),
                     ],
                     dim=1,
                 )
@@ -451,7 +380,6 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
                     attention_mask=combined_attention_mask,
                 )
                 logits = outputs.logits
-
                 num_visual_tokens = visual_soft_tokens.shape[1]
                 text_logits = logits[..., num_visual_tokens:-1, :].contiguous()
                 text_labels = input_ids[..., 1:].contiguous()
@@ -464,60 +392,52 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
                 else:
                     loss = torch.tensor(0.0, device=DEVICE)
 
-            total_val_loss += loss.item()
+                total_val_loss += loss.item()
 
     avg_val_loss = total_val_loss / len(val_loader)
+    
+    # --- MODIFIED: Synchronize avg_val_loss across all GPUs ---
+    val_loss_tensor = torch.tensor(avg_val_loss).to(DEVICE)
+    dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
+    avg_val_loss = val_loss_tensor.item()
+    
     if local_rank == 0:
         print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] - Validation Loss: {avg_val_loss:.4f}")
 
-    # Record metrics for the epoch ---
     if local_rank == 0:
         current_lr = optimizer.param_groups[0]['lr']
         metrics_history["epoch"].append(epoch + 1)
         metrics_history["train_loss"].append(avg_train_loss)
         metrics_history["val_loss"].append(avg_val_loss)
         metrics_history["learning_rate"].append(current_lr)
-
-        # Save metrics to a file at the end of each epoch
         with open(metrics_path, "w") as f:
             json.dump(metrics_history, f, indent=4)
         print(f"✅ Metrics saved to {metrics_path}")
 
-    # Save checkpoint at the end of each epoch ---
-    if local_rank == 0:
-        print(f"Saving model checkpoint at the end of epoch {epoch+1}...")
-
-    # NEW Checkpointing Logic for 'latest' and 'best' models 
-
-    # Get the model's state dict, offloaded to CPU on rank 0
+    # --- MODIFIED: 'best' and 'latest' checkpoint saving ---
     save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
     with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, save_policy):
         cpu_state_dict = llm.state_dict()
 
-    # Only rank 0 handles the file I/O
     if local_rank == 0:
         os.makedirs(STAGE2_CHECKPOINT_DIR, exist_ok=True)
-
-        # 1. Save the 'latest' model checkpoint
-        latest_checkpoint_path = os.path.join(STAGE2_CHECKPOINT_DIR, "latest_model.pth")
-
-        # We save a dictionary to easily resume training
+        latest_model_path = os.path.join(STAGE2_CHECKPOINT_DIR, "llm_stage2_latest.pth")
+        
+        # Save the 'latest' model for resuming
         torch.save({
-            'epoch': epoch + 1,  # Save the *next* epoch number to start from
+            'epoch': epoch + 1,
             'model_state_dict': cpu_state_dict,
             'best_val_loss': best_val_loss,
-        }, latest_checkpoint_path)
-        print(f"💾 Saved latest model checkpoint to {latest_checkpoint_path}")
+        }, latest_model_path)
+        print(f"💾 Saved latest model checkpoint to {latest_model_path}")
 
-        # 2. Check if this is the 'best' model and save if it is
+        # Save the 'best' model if validation loss has improved
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            best_model_path = os.path.join(STAGE2_CHECKPOINT_DIR, "best_model.pth")
-            # For the 'best' model, we only need the weights for inference
+            best_model_path = os.path.join(STAGE2_CHECKPOINT_DIR, "llm_stage2_best.pth")
             torch.save(cpu_state_dict, best_model_path)
             print(f"🏆 New best model found! Validation loss: {avg_val_loss:.4f}. Saved to {best_model_path}")
 
-    # Use a barrier to ensure all processes wait until rank 0 has finished saving
     dist.barrier()
 
 # --- 3. Calculate and print the total training time ---
@@ -529,7 +449,7 @@ if local_rank == 0:
     seconds = int(duration_seconds % 60)
     print(f"--- Total Training Time: {hours}h {minutes}m {seconds}s ---")
 
-dist.barrier()  # Wait for all processes to finish before exiting
+dist.barrier()
 dist.destroy_process_group()
 
 print("Job finished.")
