@@ -125,41 +125,43 @@ llm = FSDP(
 )
 
 # --- 5.1. Load Stage 2 Checkpoint (Base weights for experts) ---
-latest_stage2_epoch = 0
-if local_rank == 0:
-    if os.path.exists(STAGE2_CHECKPOINT_DIR):
-        epoch_numbers = [
-            int(re.search(r"epoch_(\d+)", f).group(1))
-            for f in os.listdir(STAGE2_CHECKPOINT_DIR) if re.search(r"epoch_(\d+)", f)
-        ]
-        if epoch_numbers:
-            latest_stage2_epoch = max(epoch_numbers)
+# Define the path to the best checkpoint directly
+checkpoint_path = os.path.join(STAGE2_CHECKPOINT_DIR, "llm_stage2_best.pth")
 
-epoch_tensor = torch.tensor([latest_stage2_epoch], dtype=torch.int).to(DEVICE)
-dist.broadcast(epoch_tensor, src=0)
-latest_stage2_epoch = epoch_tensor.item()
+# Have rank 0 check if the file exists
+file_exists = 1.0 if local_rank == 0 and os.path.exists(checkpoint_path) else 0.0
+file_exists_tensor = torch.tensor([file_exists], dtype=torch.float32).to(DEVICE)
 
-if latest_stage2_epoch > 0:
-    checkpoint_path = os.path.join(
-        STAGE2_CHECKPOINT_DIR, f"llm_stage2_epoch_{latest_stage2_epoch}.pth"
-    )
+# Broadcast the existence status to all other ranks
+dist.broadcast(file_exists_tensor, src=0)
+should_load = file_exists_tensor.item() == 1.0
+
+# All ranks will attempt to load if the file was found on rank 0
+if should_load:
     if local_rank == 0:
-        print(f"💾 Loading Stage 2 expert weights from: {checkpoint_path}")
+        print(f"💾 Loading Stage 2 BEST expert weights from: {checkpoint_path}")
 
+    # Load the state dict. Your 'best' checkpoint saves the state_dict directly.
     state_dict = torch.load(checkpoint_path, map_location="cpu")
+
+    # Load the state dict into the FSDP model
     load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
     with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
         llm.load_state_dict(state_dict, strict=False)
+    
     del state_dict
     gc.collect()
     
+    # Barrier to ensure all processes have loaded before continuing
+    dist.barrier()
+
     if local_rank == 0:
-        print("✅ Stage 2 state loaded successfully.")
+        print("✅ Stage 2 'best' state loaded successfully.")
 else:
     if local_rank == 0:
-        print("🚨 WARNING: No Stage 2 checkpoint found.")
+        print(f"🚨 WARNING: Stage 2 best checkpoint not found at '{checkpoint_path}'. Starting from base weights.")
 
-# ★★★ ROBUST FIX PART 2: Manually re-initialize gates AFTER all loading is done ★★★
+#ROBUST FIX: Manually re-initialize gates AFTER all loading is done
 if local_rank == 0:
     print("--- Forcing re-initialization of router gates to fix corruption ---")
 
