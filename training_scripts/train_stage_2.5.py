@@ -212,38 +212,45 @@ total_steps = (len(train_loader) // accumulation_steps) * NUM_EPOCHS
 scheduler = CosineAnnealingLR(optimizer, T_max=total_steps)
 loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
 
-# --- 5.2. Resume from Stage 2.5 Checkpoint (If it exists) ---
-latest_epoch = 0
-if local_rank == 0:
-    if os.path.exists(STAGE2_5_CHECKPOINT_DIR):
-        epoch_numbers = [
-            int(re.search(r"epoch_(\d+)", f).group(1))
-            for f in os.listdir(STAGE2_5_CHECKPOINT_DIR) if re.search(r"epoch_(\d+)", f)
-        ]
-        if epoch_numbers:
-            latest_epoch = max(epoch_numbers)
+# --- 5.2. Resume from Stage 2.5 Checkpoint ---
+start_epoch = 0
+best_val_loss = float('inf')
+latest_checkpoint_path = os.path.join(STAGE2_5_CHECKPOINT_DIR, "llm_stage2_5_latest.pth")
 
-epoch_tensor = torch.tensor([latest_epoch], dtype=torch.int).to(DEVICE)
-dist.broadcast(epoch_tensor, src=0)
-latest_epoch = epoch_tensor.item()
+# Have rank 0 check if the 'latest' checkpoint exists
+should_resume = 1.0 if local_rank == 0 and os.path.exists(latest_checkpoint_path) else 0.0
+resume_tensor = torch.tensor([should_resume], dtype=torch.float32).to(DEVICE)
+dist.broadcast(resume_tensor, src=0)
 
-if latest_epoch > 0:
-    checkpoint_path = os.path.join(
-        STAGE2_5_CHECKPOINT_DIR, f"llm_stage2_5_epoch_{latest_epoch}.pth"
-    )
+if resume_tensor.item() == 1.0:
     if local_rank == 0:
-        print(f"💾 Resuming Stage 2.5 training from epoch {latest_epoch+1} using {checkpoint_path}")
+        print(f"💾 Resuming training from latest checkpoint: {latest_checkpoint_path}")
 
-    # Note: Resuming requires the optimizer state to be loaded after this,
-    # which is not currently implemented. This script assumes starting Stage 2.5 from scratch.
-    state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    # All ranks load the checkpoint
+    checkpoint = torch.load(latest_checkpoint_path, map_location="cpu")
+    model_state_dict = checkpoint['model_state_dict']
+
     load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
     with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
-        llm.load_state_dict(state_dict, strict=False)
-    del state_dict
+        llm.load_state_dict(model_state_dict, strict=False)
+
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    
+    # Update epoch and best_val_loss from the checkpoint to continue correctly
+    start_epoch = checkpoint['epoch'] + 1
+    best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+
+    del checkpoint
+    del model_state_dict
     gc.collect()
+    
+    dist.barrier()
     if local_rank == 0:
-        print("✅ Stage 2.5 training state resumed successfully.")
+        print(f"✅ Resumed successfully. Starting from epoch {start_epoch}.")
+else:
+    if local_rank == 0:
+        print("🏁 No 'latest' checkpoint found. Starting training from scratch.")
 
 # --- 5.3. Finalize Model Setup ---
 llm.model.embed_tokens.to(DEVICE)
@@ -265,7 +272,7 @@ metrics_history = {
     "val_loss": [], "learning_rate": [],
 }
 metrics_path = os.path.join(OUTPUT_DIR, "training_metrics_stage2.5.json")
-if local_rank == 0 and latest_epoch > 0 and os.path.exists(metrics_path):
+if local_rank == 0 and start_epoch > 0 and os.path.exists(metrics_path):
     with open(metrics_path, "r") as f:
         metrics_history = json.load(f)
 
@@ -281,8 +288,8 @@ if local_rank == 0:
 # 8. TRAINING LOOP
 # ====================================================================================
 if local_rank == 0:
-    print(f"🚀 Starting Stage 2.5 training from epoch {latest_epoch+1}...")
-for epoch in range(latest_epoch, NUM_EPOCHS):
+    print(f"🚀 Starting Stage 2.5 training from epoch {start_epoch}...")
+for epoch in range(start_epoch, NUM_EPOCHS):
     train_sampler.set_epoch(epoch)
     llm.train()
 
@@ -421,25 +428,39 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
         full_state_dict = llm.state_dict()
 
     if local_rank == 0:
+        # Get only the trainable router weights for the checkpoint
         router_weights = {}
         for name, weight in full_state_dict.items():
             param = llm.get_parameter(name)
             if param.requires_grad:
                 router_weights[name] = weight
+        
+        # Create a single consolidated checkpoint for this epoch
+        consolidated_checkpoint = {
+            'model_state_dict': router_weights,
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'epoch': epoch,
+            'best_val_loss': best_val_loss,
+            'current_val_loss': avg_val_loss,
+        }
 
         os.makedirs(STAGE2_5_CHECKPOINT_DIR, exist_ok=True)
-        save_path = os.path.join(
-            STAGE2_5_CHECKPOINT_DIR, f"llm_stage2_5_epoch_{epoch+1}.pth"
-        )
-        torch.save(router_weights, save_path)
-        print(f"✅ Saved small router-only checkpoint to {save_path}")
+        
+        # 1. Save this as the 'latest' checkpoint, overwriting the previous one
+        latest_checkpoint_path = os.path.join(STAGE2_5_CHECKPOINT_DIR, "llm_stage2_5_latest.pth")
+        torch.save(consolidated_checkpoint, latest_checkpoint_path)
+        print(f"💾 Saved latest checkpoint to {latest_checkpoint_path}")
 
-        previous_checkpoint_path = os.path.join(
-            STAGE2_5_CHECKPOINT_DIR, f"llm_stage2_5_epoch_{epoch}.pth"
-        )
-        if os.path.exists(previous_checkpoint_path):
-            os.remove(previous_checkpoint_path)
-            print(f"Removed previous router checkpoint: {previous_checkpoint_path}")
+        # 2. Check if this is the 'best' model and save it if so
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            # Update the best_val_loss in the checkpoint before saving as 'best'
+            consolidated_checkpoint['best_val_loss'] = best_val_loss 
+            
+            best_checkpoint_path = os.path.join(STAGE2_5_CHECKPOINT_DIR, "llm_stage2_5_best.pth")
+            torch.save(consolidated_checkpoint, best_checkpoint_path)
+            print(f"🏆 New best model! Val loss: {avg_val_loss:.4f}. Saved to {best_checkpoint_path}")
 
     dist.barrier()
 
