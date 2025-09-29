@@ -172,7 +172,8 @@ stage1_weights_path = os.path.join(OUTPUT_DIR, "vision_connector_stage1_best.pth
 if os.path.exists(stage1_weights_path):
     if local_rank == 0:
         print(f"💾 Loading Stage 1 Vision Connector weights from {stage1_weights_path}")
-    vision_connector.load_state_dict(torch.load(stage1_weights_path, map_location=DEVICE))
+    map_loc = f"cuda:{DEVICE}"
+    vision_connector.load_state_dict(torch.load(stage1_weights_path, map_location=map_loc))
 
 dist.barrier()
 
