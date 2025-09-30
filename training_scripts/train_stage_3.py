@@ -96,6 +96,12 @@ llm = AutoModelForCausalLM.from_pretrained(
     low_cpu_mem_usage=True,
 )
 
+# Explicitly set all MoE layers to use soft routing for training
+if local_rank == 0:
+    print("Setting MoE layers to 'soft' routing mode for Stage 3.")
+for layer in llm.model.layers:
+    if hasattr(layer.mlp, "routing_mode"):
+        layer.mlp.routing_mode = 'soft'
 # ====================================================================================
 # 4. TRAINING SETUP (PART 1 - Parameter Freezing)
 # ====================================================================================
@@ -269,6 +275,7 @@ if local_rank == 0 and start_epoch > 0 and os.path.exists(metrics_path):
 # ====================================================================================
 # 8. TRAINING LOOP
 # ====================================================================================
+llm.to(DEVICE)
 if local_rank == 0:
     print(f"🚀 Starting Stage 3 training from epoch {start_epoch}...")
 start_time = time.time()
