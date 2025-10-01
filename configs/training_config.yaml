@@ -37,13 +37,23 @@ training_stage2.5:
   load_balancing_coeff: 0.03
 
 training_stage3:
-  num_epochs: 15
+  num_epochs: 10
   batch_size: 16
   learning_rate: 0.0001
   weight_decay: 0.01
   subset_fraction: 0.2
   gradient_accumulation_steps: 4
   load_balancing_coeff: 0.02
+
+dense_control:
+  num_epochs: 10
+  batch_size: 16
+  learning_rate: 0.0001
+  weight_decay: 0.01
+  subset_fraction: 0.2
+  gradient_accumulation_steps: 4
+  load_balancing_coeff: 0.02
+
 
 # Dataloader parameters
 dataloader:

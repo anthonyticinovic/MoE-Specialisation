@@ -15,6 +15,8 @@ from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
     CLIPVisionModel,
+    MistralForCausalLM,
+    MistralConfig,
 )
 from models import VisionLanguageConnector
 from data import COCO_Loader
@@ -29,22 +31,14 @@ from torch.distributed.fsdp import (
     StateDictType,
     FullStateDictConfig,
 )
-from torch.utils.data.distributed import DistributedSampler
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-from functools import partial
-
-# Import your custom MoE classes
-from models.custom_mistral import (
-    MistralMoEConfig,
-    MistralMoEForCausalLM,
-    MistralMoEDecoderLayer,
-)
 
 from transformers.models.mistral.modeling_mistral import MistralMLP
 
-# --- 1. Register Your Custom Architecture ---
-AutoConfig.register("mistral_moe", MistralMoEConfig)
-AutoModelForCausalLM.register(MistralMoEConfig, MistralMoEForCausalLM)
+from torch.utils.data.distributed import DistributedSampler
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from functools import partial
+from transformers.models.mistral.modeling_mistral import MistralDecoderLayer
+
 
 # ====================================================================================
 # 2. SETUP AND CONFIGURATION
@@ -53,17 +47,13 @@ with open("./configs/training_config.yaml", "r") as file:
     config = yaml.safe_load(file)
 
 paths = config["paths"]
-# CHANGED: Use training_stage3 parameters from config
-train_params = config["training_stage3"]
+# CHANGED: Use dense_control parameters from config
+train_params = config["dense_control"]
 loader_params = config["dataloader"]
 NUM_EPOCHS = train_params["num_epochs"]
 OUTPUT_DIR = paths["output_dir"]
-# CHANGED: Define all necessary checkpoint directories
-STAGE2_CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "stage2_checkpoints")
-STAGE2_5_CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "stage2_5_checkpoints")
-STAGE3_CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "stage3_checkpoints")
-# ADDED: Load balancing coefficient for MoE training
-LOAD_BALANCING_COEFF = train_params.get("load_balancing_coeff", 0.01)
+# CHANGED: New checkpoint directory for the dense model
+DENSE_CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "dense_checkpoints")
 
 # --- Initialize the distributed environment ---
 dist.init_process_group("nccl")
@@ -72,8 +62,8 @@ torch.cuda.set_device(local_rank)
 DEVICE = local_rank
 
 if local_rank == 0:
-    # CHANGED: Print statement for Stage 3
-    print("--- Initializing Stage 3 Training (End-to-End) ---")
+    # CHANGED: Print statement for Dense Control model
+    print("--- Initializing Dense Control Model Training ---")
 
 # ====================================================================================
 # 3. MODEL LOADING
@@ -85,37 +75,34 @@ clip_processor = AutoProcessor.from_pretrained(paths["clip_local_path"])
 tokenizer = AutoTokenizer.from_pretrained(paths["mistral_local_path"])
 tokenizer.pad_token = tokenizer.eos_token
 
-moe_model_path = "/data/gpfs/projects/COMP90055/aticinovic/models/Mistral-7B-MoE"
-
+# CHANGED: Load the standard dense Mistral-7B model
+dense_model_path = paths["mistral_local_path"] 
 llm = AutoModelForCausalLM.from_pretrained(
-    moe_model_path,
-    trust_remote_code=True,
-    local_files_only=True,
+    dense_model_path,
     torch_dtype=torch.bfloat16,
     attn_implementation="flash_attention_2",
     low_cpu_mem_usage=True,
 )
 
-# Explicitly set all MoE layers to use soft routing for training
-if local_rank == 0:
-    print("Setting MoE layers to 'soft' routing mode for Stage 3.")
-for layer in llm.model.layers:
-    if hasattr(layer.mlp, "routing_mode"):
-        layer.mlp.routing_mode = 'soft'
 # ====================================================================================
 # 4. TRAINING SETUP (PART 1 - Parameter Freezing)
 # ====================================================================================
 if local_rank == 0:
-    print("Preparing model for Stage 3: Unfreezing all LLM and Connector layers.")
+    print("Preparing dense model: Freezing vision, VLC, and embeddings.")
 
-# Unfreeze all LLM parameters for end-to-end training
+# Freeze all parameters by default
 for param in llm.parameters():
-    param.requires_grad = True
+    param.requires_grad = False
+
+# NEW: Unfreeze only the attention and MLP layers
+for layer in llm.model.layers:
+    layer.self_attn.requires_grad_(True)
+    layer.mlp.requires_grad_(True)
 
 vision_connector = VisionLanguageConnector().to(DEVICE)
-#  Unfreeze vision connector for end-to-end training
+# NEW: Freeze the vision connector
 for param in vision_connector.parameters():
-    param.requires_grad = True
+    param.requires_grad = False
 
 # Ensure the vision encoder remains frozen
 for param in vision_encoder.parameters():
@@ -144,42 +131,12 @@ llm = FSDP(
     use_orig_params=True,
 )
 
-# --- NEW: Load best weights from Stage 2 (Experts) and Stage 2.5 (Routers) ---
-load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
-
-# 1. Load Stage 2 weights to get the trained experts
-stage2_checkpoint_path = os.path.join(STAGE2_CHECKPOINT_DIR, "llm_stage2_best.pth")
-if os.path.exists(stage2_checkpoint_path):
-    if local_rank == 0:
-        print(f"💾 Loading Stage 2 (Expert) weights from: {stage2_checkpoint_path}")
-    s2_state_dict = torch.load(stage2_checkpoint_path, map_location="cpu")
-    with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
-        llm.load_state_dict(s2_state_dict, strict=False)
-    del s2_state_dict
-    gc.collect()
-    if local_rank == 0:
-        print("✅ Stage 2 weights loaded.")
-
-# 2. Load Stage 2.5 weights to get the trained routers
-stage2_5_checkpoint_path = os.path.join(STAGE2_5_CHECKPOINT_DIR, "llm_stage2_5_best.pth")
-if os.path.exists(stage2_5_checkpoint_path):
-    if local_rank == 0:
-        print(f"💾 Loading Stage 2.5 (Router) weights from: {stage2_5_checkpoint_path}")
-    s2_5_checkpoint = torch.load(stage2_5_checkpoint_path, map_location="cpu")
-    with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
-        llm.load_state_dict(s2_5_checkpoint['model_state_dict'], strict=False)
-    del s2_5_checkpoint
-    gc.collect()
-    if local_rank == 0:
-        print("✅ Stage 2.5 router weights loaded.")
-
-# 3. Load Stage 1 Vision Connector weights
+# --- Load Stage 1 Vision Connector weights ---
 stage1_weights_path = os.path.join(OUTPUT_DIR, "vision_connector_stage1_best.pth")
 if os.path.exists(stage1_weights_path):
     if local_rank == 0:
         print(f"💾 Loading Stage 1 Vision Connector weights from {stage1_weights_path}")
-    map_loc = f"cuda:{DEVICE}"
-    vision_connector.load_state_dict(torch.load(stage1_weights_path, map_location=map_loc))
+    vision_connector.load_state_dict(torch.load(stage1_weights_path, map_location=DEVICE))
 
 dist.barrier()
 
@@ -219,18 +176,18 @@ val_loader = DataLoader(
 
 accumulation_steps = train_params.get("gradient_accumulation_steps", 1)
 
-# NEW: Combine all trainable parameters (LLM + Vision Connector) for the optimizer
-trainable_params = list(llm.parameters()) + list(vision_connector.parameters())
+# Get only the parameters that are unfrozen
+trainable_params = [p for p in llm.parameters() if p.requires_grad]
 optimizer = optim.AdamW(trainable_params, lr=train_params["learning_rate"], weight_decay=train_params["weight_decay"], fused=True)
 scaler = GradScaler()
 total_steps = (len(train_loader) // accumulation_steps) * NUM_EPOCHS
 scheduler = CosineAnnealingLR(optimizer, T_max=total_steps)
 loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
 
-# --- Resumption logic for Stage 3 ---
+# --- Resumption logic for Dense Model ---
 start_epoch = 0
 best_val_loss = float('inf')
-latest_checkpoint_path = os.path.join(STAGE3_CHECKPOINT_DIR, "llm_stage3_latest.pth")
+latest_checkpoint_path = os.path.join(DENSE_CHECKPOINT_DIR, "dense_latest.pth")
 
 should_resume = 1.0 if local_rank == 0 and os.path.exists(latest_checkpoint_path) else 0.0
 resume_tensor = torch.tensor([should_resume], dtype=torch.float32).to(DEVICE)
@@ -238,13 +195,13 @@ dist.broadcast(resume_tensor, src=0)
 
 if resume_tensor.item() == 1.0:
     if local_rank == 0:
-        print(f"💾 Resuming Stage 3 training from latest checkpoint: {latest_checkpoint_path}")
-
+        print(f"💾 Resuming dense training from latest checkpoint: {latest_checkpoint_path}")
+    
+    load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
     checkpoint = torch.load(latest_checkpoint_path, map_location="cpu")
     
     with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
         llm.load_state_dict(checkpoint['model_state_dict'])
-    vision_connector.load_state_dict(checkpoint['connector_state_dict'])
     
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
@@ -262,11 +219,10 @@ else:
     if local_rank == 0:
         print("🏁 No 'latest' checkpoint found. Starting training from scratch.")
 
-
 if local_rank == 0:
     print(f"Optimizing {sum(p.numel() for p in trainable_params)} trainable parameters.")
 
-metrics_path = os.path.join(OUTPUT_DIR, "training_metrics_stage3.json")
+metrics_path = os.path.join(OUTPUT_DIR, "training_metrics_dense.json")
 metrics_history = {"epoch": [], "train_loss": [], "val_loss": [], "learning_rate":[]}
 if local_rank == 0 and start_epoch > 0 and os.path.exists(metrics_path):
     with open(metrics_path, "r") as f:
@@ -275,14 +231,12 @@ if local_rank == 0 and start_epoch > 0 and os.path.exists(metrics_path):
 # ====================================================================================
 # 8. TRAINING LOOP
 # ====================================================================================
-llm.to(DEVICE)
 if local_rank == 0:
-    print(f"🚀 Starting Stage 3 training from epoch {start_epoch}...")
+    print(f"🚀 Starting dense model training from epoch {start_epoch}...")
 start_time = time.time()
 for epoch in range(start_epoch, NUM_EPOCHS):
     train_sampler.set_epoch(epoch)
     llm.train()
-    vision_connector.train()
     total_train_loss = 0
     optimizer.zero_grad()
     for i, (images, input_ids, attention_mask) in enumerate(train_loader):
@@ -291,11 +245,12 @@ for epoch in range(start_epoch, NUM_EPOCHS):
         )
 
         with autocast(device_type="cuda", dtype=torch.bfloat16):
+            # The VLC and embedding layers are frozen, so run them in no_grad
             with torch.no_grad():
                 patch_embeddings = vision_encoder(images).last_hidden_state
+                visual_soft_tokens = vision_connector(patch_embeddings)
+                text_embeddings = llm.model.embed_tokens(input_ids)
             
-            visual_soft_tokens = vision_connector(patch_embeddings)
-            text_embeddings = llm.model.embed_tokens(input_ids)
             combined_embeddings = torch.cat([visual_soft_tokens, text_embeddings], dim=1)
             combined_attention_mask = torch.cat(
                 [torch.ones(visual_soft_tokens.shape[:2], device=DEVICE), attention_mask],
@@ -308,22 +263,12 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             )
             logits = outputs.logits
             
-            # Initialize with correct device AND dtype to match the model
-            total_load_balancing_loss = torch.tensor(0.0, device=DEVICE, dtype=torch.bfloat16)
-            
-            for layer in llm.module.model.layers:
-                # Check if the attribute exists and is a tensor
-                if hasattr(layer.mlp, "load_balancing_loss") and isinstance(layer.mlp.load_balancing_loss, torch.Tensor):
-                    # This .to(DEVICE) is a safeguard that forces the tensor to the GPU
-                    total_load_balancing_loss += layer.mlp.load_balancing_loss.to(DEVICE)
-
             num_visual_tokens = visual_soft_tokens.shape[1]
             text_logits = logits[..., num_visual_tokens:-1, :].contiguous()
             text_labels = input_ids[..., 1:].contiguous()
             
-            ce_loss = loss_fn(text_logits.view(-1, llm.config.vocab_size), text_labels.view(-1))
-            
-            loss = (ce_loss + LOAD_BALANCING_COEFF * total_load_balancing_loss) / accumulation_steps
+            loss = loss_fn(text_logits.view(-1, llm.config.vocab_size), text_labels.view(-1))
+            loss = loss / accumulation_steps
 
         scaler.scale(loss).backward()
         
@@ -345,7 +290,6 @@ for epoch in range(start_epoch, NUM_EPOCHS):
 
     # --- Validation Phase ---
     llm.eval()
-    vision_connector.eval()
     total_val_loss = 0
     with torch.no_grad():
         for i, (images, input_ids, attention_mask) in enumerate(val_loader):
@@ -397,12 +341,9 @@ for epoch in range(start_epoch, NUM_EPOCHS):
     with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, save_policy):
         llm_state_dict = llm.state_dict()
     
-    connector_state_dict = vision_connector.state_dict()
-
     if local_rank == 0:
         consolidated_checkpoint = {
             'model_state_dict': llm_state_dict,
-            'connector_state_dict': connector_state_dict,
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'epoch': epoch,
@@ -410,9 +351,9 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             'current_val_loss': avg_val_loss,
         }
 
-        os.makedirs(STAGE3_CHECKPOINT_DIR, exist_ok=True)
+        os.makedirs(DENSE_CHECKPOINT_DIR, exist_ok=True)
         
-        latest_checkpoint_path = os.path.join(STAGE3_CHECKPOINT_DIR, "llm_stage3_latest.pth")
+        latest_checkpoint_path = os.path.join(DENSE_CHECKPOINT_DIR, "dense_latest.pth")
         torch.save(consolidated_checkpoint, latest_checkpoint_path)
         print(f"💾 Saved latest checkpoint to {latest_checkpoint_path}")
 
@@ -420,7 +361,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             best_val_loss = avg_val_loss
             consolidated_checkpoint['best_val_loss'] = best_val_loss 
             
-            best_checkpoint_path = os.path.join(STAGE3_CHECKPOINT_DIR, "llm_stage3_best.pth")
+            best_checkpoint_path = os.path.join(DENSE_CHECKPOINT_DIR, "dense_best.pth")
             torch.save(consolidated_checkpoint, best_checkpoint_path)
             print(f"🏆 New best model! Val loss: {avg_val_loss:.4f}. Saved to {best_checkpoint_path}")
 
