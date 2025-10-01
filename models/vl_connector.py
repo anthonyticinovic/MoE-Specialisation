@@ -7,7 +7,7 @@ class VisionLanguageConnector(nn.Module):
     A two-layer MLP to project CLIP's visual embeddings into the
     LLM's (Mistral 7B) latent space.
     """
-    def __init__(self, clip_hidden_size: int = 1024, llm_hidden_size: int = 4096, dropout_rate: float = 0.1):
+    def __init__(self, clip_hidden_size: int = 1024, llm_hidden_size: int = 4096, dropout_rate: float = 0.3):
         super().__init__()
 
         # nn.Sequential is a container that allows us to stack layers in a sequence.

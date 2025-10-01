@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=expert_analysis
-#SBATCH -p gpu-h100
+#SBATCH -p gpu-l40s
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1

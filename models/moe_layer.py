@@ -19,6 +19,9 @@ class MoELayer(nn.Module):
 
         # Attribute to store the load balancing loss for 'soft' routing
         self.load_balancing_loss = 0.0
+        
+        #I am hard coding this for now
+        self.router_dropout = nn.Dropout(0.1) 
 
     def initialize_gate(self):
         """
@@ -76,6 +79,8 @@ class MoELayer(nn.Module):
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
         router_logits = self.gate(hidden_states_reshaped)
+
+        router_logits = self.router_dropout(router_logits)
 
         # 1. Gumbel-Softmax for stochastic, differentiable sampling
         # Gumbel noise is added for exploration during training

@@ -1,10 +1,3 @@
-# This diagnostic script analyses the trained Mixture of Experts (MoE) model to show if its experts have specialized by modality. 
-# It loads the best VL connector, specialised experts, and trained router, then processes a dataset, using a "forward hook" 
-# to capture the router's activation probabilities for every token. Finally, the script generates a report providing two key 
-# pieces of evidence - a quantitative breakdown showing the percentage of vision versus text tokens handled by each expert, 
-# and a qualitative list of the specific "max activating" tokens that each expert responded to most strongly.
-
-
 import torch
 import torch.nn as nn
 import json
@@ -15,7 +8,13 @@ import heapq
 import re
 from tqdm import tqdm
 
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoProcessor, CLIPVisionModel, AutoConfig
+from transformers import (
+    LlamaTokenizer,
+    AutoModelForCausalLM, 
+    AutoProcessor, 
+    CLIPVisionModel, 
+    AutoConfig
+)
 from torch.utils.data import DataLoader
 
 # Important: Import your custom model classes
@@ -35,6 +34,7 @@ def get_activation_hook(layer_name):
     Creates a forward hook function that captures the softmax output of the router gate.
     """
     def hook(model, input, output):
+        # The output of the gate is the router_logits
         router_logits = output
         probabilities = torch.softmax(router_logits, dim=-1)
         activation_capture[layer_name] = probabilities.detach().cpu()
@@ -68,6 +68,15 @@ def analyze_specialization(args, paths):
 
     # --- 1. Load Models and Tokenizer ---
     print("Loading models and tokenizer...")
+
+    # --- FIX: Use the correct path for the tokenizer ---
+    # The tokenizer files are in the original Mistral directory, not the custom MoE directory.
+    print(f"Loading tokenizer from: {paths['tokenizer_path']}")
+    tokenizer = LlamaTokenizer.from_pretrained(paths["tokenizer_path"])
+    clip_processor = AutoProcessor.from_pretrained(paths["clip_path"])
+
+    # Now load the custom model from its specific path
+    print(f"Loading base MoE model from: {paths['base_model_path']}")
     llm = AutoModelForCausalLM.from_pretrained(
         paths["base_model_path"],
         trust_remote_code=True,
@@ -93,8 +102,7 @@ def analyze_specialization(args, paths):
     vision_encoder.eval()
     vision_connector.eval()
 
-    tokenizer = AutoTokenizer.from_pretrained(paths["base_model_path"])
-    clip_processor = AutoProcessor.from_pretrained(paths["clip_path"])
+
 
     # --- 2. Attach Forward Hooks ---
     print("Attaching forward hooks to MoE router gates...")
@@ -107,7 +115,8 @@ def analyze_specialization(args, paths):
         gate = layer.mlp.gate
         hook = gate.register_forward_hook(get_activation_hook(layer_name))
         hooks.append(hook)
-        num_experts = gate.out_features
+        if hasattr(gate, 'out_features'):
+            num_experts = gate.out_features
     print(f"Found {num_experts} experts. Hooks attached to {len(hooks)} layers.")
 
     # --- 3. Prepare Data Structures for Analysis ---
@@ -126,15 +135,19 @@ def analyze_specialization(args, paths):
         clip_processor=clip_processor,
         tokenizer=tokenizer,
         subset_fraction=1.0,
-        split="val",
-        return_filename=True
+        split="val"
     )
     data_loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
 
     # --- 5. The Analysis Loop ---
-    for i, (image, input_ids, attention_mask, image_filename) in tqdm(enumerate(data_loader), total=args.num_samples, desc="Analyzing samples"):
+    for i, (image, input_ids, attention_mask) in tqdm(enumerate(data_loader), total=args.num_samples, desc="Analyzing samples"):
         if i >= args.num_samples:
             break
+        
+        try:
+            image_id = dataset.annotations[i]['image_id']
+        except (AttributeError, IndexError, KeyError):
+            image_id = f"unknown_index_{i}"
 
         image, input_ids = image.to(DEVICE), input_ids.to(DEVICE)
         
@@ -149,11 +162,9 @@ def analyze_specialization(args, paths):
         combined_embeddings = torch.cat([visual_soft_tokens, text_embeddings], dim=1)
         llm(inputs_embeds=combined_embeddings)
 
-        # Process activations for all captured layers
         for layer_name, probabilities in activation_capture.items():
             top_scores, top_experts = torch.topk(probabilities, 1, dim=-1)
             
-            # --- Token-Level and Modality Stats Analysis ---
             for token_idx in range(probabilities.shape[0]):
                 score = top_scores[token_idx].item()
                 expert_idx = top_experts[token_idx].item()
@@ -172,7 +183,7 @@ def analyze_specialization(args, paths):
                     end = min(num_text_tokens, text_token_idx + 6)
                     context = tokenizer.decode(input_ids[0, start:end])
 
-                token_example = (score, {"token_type": token_type, "context": context.replace("\n", " ")})
+                token_example = (score, {"token_type": token_type, "context": context.replace("\n", " "), "source_image_id": image_id})
                 if len(top_k_tokens_per_layer[layer_name][expert_idx]) < args.top_k:
                     heapq.heappush(top_k_tokens_per_layer[layer_name][expert_idx], token_example)
                 else:
@@ -259,7 +270,7 @@ def print_report_for_layer(report_data, top_k):
     for expert_idx, examples in report_data["top_activating_tokens"].items():
         print(f"\n--- Top {top_k} Tokens for Expert {expert_idx} ---")
         for score, data in examples:
-            print(f'  Score: {score:.4f} | Type: {data["token_type"]:<10} | Context: "{data["context"]}"')
+            print(f'  Score: {score:.4f} | Image ID: {str(data["source_image_id"]):<12} | Type: {data["token_type"]:<10} | Context: "{data["context"]}"')
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Analyze MoE expert specialization.")
@@ -273,15 +284,16 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     # --- PATHS ---
-    # Hardcode paths for easier execution on HPC
     config_path = "./configs/training_config.yaml"
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
 
     output_dir = config["paths"]["output_dir"]
-    
+
+    # --- FIX: Define separate paths for the tokenizer and the custom model ---
     paths = {
         "base_model_path": "/data/gpfs/projects/COMP90055/aticinovic/models/Mistral-7B-MoE",
+        "tokenizer_path": config["paths"]["mistral_local_path"], # Use the path from config for the tokenizer
         "stage2_checkpoint_path": os.path.join(output_dir, "stage2_checkpoints", "llm_stage2_best.pth"),
         "stage2_5_checkpoint_path": os.path.join(output_dir, "stage2_5_checkpoints", "llm_stage2_5_best.pth"),
         "clip_path": config["paths"]["clip_local_path"],
@@ -292,4 +304,3 @@ if __name__ == "__main__":
     }
 
     analyze_specialization(args, paths)
-
