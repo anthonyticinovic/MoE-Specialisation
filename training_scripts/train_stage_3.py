@@ -308,7 +308,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             )
             logits = outputs.logits
             
-            total_load_balancing_loss = 0
+            total_load_balancing_loss = torch.tensor(0.0, device=DEVICE)
             for layer in llm.module.model.layers:
                 if hasattr(layer.mlp, "load_balancing_loss"):
                     total_load_balancing_loss += layer.mlp.load_balancing_loss

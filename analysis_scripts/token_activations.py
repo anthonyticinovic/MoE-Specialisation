@@ -73,6 +73,7 @@ def analyze_specialization(args, paths):
     # The tokenizer files are in the original Mistral directory, not the custom MoE directory.
     print(f"Loading tokenizer from: {paths['tokenizer_path']}")
     tokenizer = LlamaTokenizer.from_pretrained(paths["tokenizer_path"])
+    tokenizer.pad_token = tokenizer.eos_token
     clip_processor = AutoProcessor.from_pretrained(paths["clip_path"])
 
     # Now load the custom model from its specific path
@@ -160,7 +161,7 @@ def analyze_specialization(args, paths):
         num_text_tokens = text_embeddings.shape[1]
 
         combined_embeddings = torch.cat([visual_soft_tokens, text_embeddings], dim=1)
-        llm(inputs_embeds=combined_embeddings)
+        llm(inputs_embeds=combined_embeddings.to(torch.bfloat16))
 
         for layer_name, probabilities in activation_capture.items():
             top_scores, top_experts = torch.topk(probabilities, 1, dim=-1)
