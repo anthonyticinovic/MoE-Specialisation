@@ -279,22 +279,13 @@ if __name__ == "__main__":
         config = yaml.safe_load(f)
 
     output_dir = config["paths"]["output_dir"]
-    stage2_dir = os.path.join(output_dir, "stage2_checkpoints")
-    stage2_5_dir = os.path.join(output_dir, "stage2_5_checkpoints")
-
-    # Automatically find the latest checkpoints
-    stage2_checkpoint_path = find_latest_checkpoint(stage2_dir, r"llm_stage2_epoch_(\d+)\.pth")
-    stage2_5_checkpoint_path = find_latest_checkpoint(stage2_5_dir, r"llm_stage2_5_epoch_(\d+)\.pth")
     
-    if not stage2_checkpoint_path or not stage2_5_checkpoint_path:
-        raise FileNotFoundError("Could not find the latest checkpoint for Stage 2 or 2.5. Please ensure the directories are correct and contain checkpoint files.")
-
     paths = {
         "base_model_path": "/data/gpfs/projects/COMP90055/aticinovic/models/Mistral-7B-MoE",
-        "stage2_checkpoint_path": stage2_checkpoint_path,
-        "stage2_5_checkpoint_path": stage2_5_checkpoint_path,
+        "stage2_checkpoint_path": os.path.join(output_dir, "stage2_checkpoints", "llm_stage2_best.pth"),
+        "stage2_5_checkpoint_path": os.path.join(output_dir, "stage2_5_checkpoints", "llm_stage2_5_best.pth"),
         "clip_path": config["paths"]["clip_local_path"],
-        "connector_path": os.path.join(output_dir, "vision_connector_stage1_best.pth"),
+        "connector_path": os.path.join(output_dir, "archive/vision_connector_stage1_best.pth"),
         "image_dir": config["paths"]["image_dir"],
         "annotations_file": config["paths"]["annotations_file"],
         "output_dir": output_dir
