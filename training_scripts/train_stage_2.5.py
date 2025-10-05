@@ -77,9 +77,6 @@ tokenizer = AutoTokenizer.from_pretrained(paths["mistral_local_path"])
 tokenizer.pad_token = tokenizer.eos_token
 moe_model_path = "/data/gpfs/projects/COMP90055/aticinovic/models/Mistral-7B-MoE"
 
-# ★★★ ROBUST FIX PART 1: Revert to memory-efficient loading ★★★
-# This prevents the Out-of-Memory error by loading the model piece by piece.
-# We accept that this will load corrupted gates, which we will fix next.
 llm = AutoModelForCausalLM.from_pretrained(
     moe_model_path,
     trust_remote_code=True,
@@ -199,7 +196,7 @@ val_loader = DataLoader(
     num_workers=loader_params["num_workers"], pin_memory=True,
 )
 
-# ★★★ ROBUST FIX PART 3: Create optimizer AFTER gates are fixed ★★★
+# Create optimizer AFTER gates are fixed 
 if local_rank == 0:
     print("Creating optimizer and scheduler with refreshed trainable parameters...")
 accumulation_steps = train_params.get("gradient_accumulation_steps", 1)
@@ -257,7 +254,7 @@ llm.model.embed_tokens.to(DEVICE)
 #llm.gradient_checkpointing_enable()
 vision_connector = VisionLanguageConnector().to(DEVICE)
 vision_connector.load_state_dict(
-    torch.load(os.path.join(OUTPUT_DIR, "vision_connector_stage1_best.pth"), map_location=DEVICE,)
+    torch.load(os.path.join(OUTPUT_DIR, "archive/vision_connector_stage1_best.pth"), map_location=DEVICE,)
 )
 for param in vision_encoder.parameters():
     param.requires_grad = False

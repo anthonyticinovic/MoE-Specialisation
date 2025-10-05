@@ -9,16 +9,14 @@ paths:
 
   output_dir: "/data/gpfs/projects/COMP90055/aticinovic/outputs"
 
-# Training parameters for Stage 1
 training_stage1:
-  num_epochs: 15
+  num_epochs: 5
   batch_size: 18
-  learning_rate: 0.0001
-  subset_fraction: 0.2
-  weight_decay: 0.75
+  learning_rate: 0.00001
+  subset_fraction: 1
+  weight_decay: 0.1
   gradient_accumulation_steps: 2
 
-# Training parameters for Stage 2
 training_stage2:
   num_epochs: 20
   batch_size: 16
@@ -30,11 +28,11 @@ training_stage2:
 training_stage2.5:
   num_epochs: 20
   batch_size: 12
-  learning_rate: 0.00001
-  weight_decay: 0.02
-  subset_fraction: 0.15
+  learning_rate: 0.0001
+  weight_decay: 0.01
+  subset_fraction: 0.05
   gradient_accumulation_steps: 2
-  load_balancing_coeff: 0.03
+  load_balancing_coeff: 0.0
 
 training_stage3:
   num_epochs: 10
@@ -57,5 +55,5 @@ dense_control:
 
 # Dataloader parameters
 dataloader:
-  num_workers: 5
-  num_workers_s1: 14
+  num_workers: 4
+  num_workers_s1: 4

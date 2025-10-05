@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=vlm_stage3_training
 #SBATCH -p gpu-h100
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:2
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
@@ -34,6 +34,6 @@ export NCCL_DEBUG=INFO # Optional: for debugging network communication
 export PYTHONFAULTHANDLER=1 # Optional: for better tracebacks on segfaults
 export NCCL_TIMEOUT=900    
 
-srun torchrun --nproc_per_node=1 training_scripts/train_stage_3.py
+srun torchrun --nproc_per_node=2 training_scripts/train_stage_3.py
 
 echo "Job finished."

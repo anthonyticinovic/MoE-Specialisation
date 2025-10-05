@@ -1,15 +1,14 @@
 #!/bin/bash
 #SBATCH --job-name=vlm_stage2_5_router_training
-#SBATCH -p gpu-l40s
-#SBATCH --gres=gpu:4
+#SBATCH -p gpu-h100
+#SBATCH --gres=gpu:2
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=256G
-#SBATCH --time=23:30:00
+#SBATCH --time=00:10:00
 #SBATCH --output=../out_slurm/train_stage_2_5/train_stage_2_5_%j.out
 #SBATCH --error=../err_slurm/train_stage_2_5/train_stage_2_5_%j.err
-#SBATCH --gpus-per-task=4
 
 # Load modules
 module purge
@@ -26,13 +25,15 @@ python -c "import torch; print(f'PyTorch: {torch.__version__}, CUDA available: {
 cd $HOME/MoE-Specialisation
 export PYTHONPATH="${PWD}:${PYTHONPATH}"
 
-# Increase NCCL timeout to 30 minutes (default is 10 minutes)
-export NCCL_TIMEOUT=1800
 
-# Optionally, enable blocking wait for better error reporting
-export NCCL_BLOCKING_WAIT=1
+export NCCL_TIMEOUT=3600
+export OMP_NUM_THREADS=8
+
+# enable blocking wait for better error reporting
+export TORCH_NCCL_BLOCKING_WAIT=1  # ✅ Correct
+export NCCL_DEBUG=WARN
 
 echo "Starting Stage 2.5 Router Training script..."
-srun torchrun --nproc_per_node=4 training_scripts/train_stage_2.5.py
+srun torchrun --nproc_per_node=2 training_scripts/train_stage_2.5.py
 
 echo "Job finished."

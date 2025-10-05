@@ -21,7 +21,7 @@ class MoELayer(nn.Module):
         self.load_balancing_loss = 0.0
         
         #I am hard coding this for now
-        self.router_dropout = nn.Dropout(0.1) 
+        self.router_dropout = nn.Dropout(0.3) 
 
     def initialize_gate(self):
         """

@@ -38,7 +38,7 @@ echo "Starting expert analysis script..."
 #
 python analysis_scripts/token_activations.py \
     --num_samples 500 \
-    --top_k 10 \
+    --top_k 3 \
     --layer_to_analyze "average"
 
 echo "Job finished."

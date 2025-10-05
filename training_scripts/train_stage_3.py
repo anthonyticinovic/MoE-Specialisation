@@ -96,6 +96,8 @@ llm = AutoModelForCausalLM.from_pretrained(
     low_cpu_mem_usage=True,
 )
 
+llm.gradient_checkpointing_enable()
+
 # Explicitly set all MoE layers to use soft routing for training
 if local_rank == 0:
     print("Setting MoE layers to 'soft' routing mode for Stage 3.")
@@ -135,7 +137,7 @@ llm = FSDP(
     llm,
     device_id=torch.cuda.current_device(),
     auto_wrap_policy=my_auto_wrap_policy,
-    cpu_offload=CPUOffload(offload_params=True),
+    cpu_offload=CPUOffload(offload_params=False),
     mixed_precision=torch.distributed.fsdp.MixedPrecision(
         param_dtype=torch.bfloat16,
         reduce_dtype=torch.bfloat16,
@@ -144,37 +146,53 @@ llm = FSDP(
     use_orig_params=True,
 )
 
-# --- NEW: Load best weights from Stage 2 (Experts) and Stage 2.5 (Routers) ---
 load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
 
-# 1. Load Stage 2 weights to get the trained experts
+# Load Stage 2 weights first (expert weights)
 stage2_checkpoint_path = os.path.join(STAGE2_CHECKPOINT_DIR, "llm_stage2_best.pth")
 if os.path.exists(stage2_checkpoint_path):
     if local_rank == 0:
         print(f"💾 Loading Stage 2 (Expert) weights from: {stage2_checkpoint_path}")
     s2_state_dict = torch.load(stage2_checkpoint_path, map_location="cpu")
+    
     with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
-        llm.load_state_dict(s2_state_dict, strict=False)
+        missing_keys, unexpected_keys = llm.load_state_dict(s2_state_dict, strict=False)
+        if local_rank == 0:
+            print(f"  Missing keys: {len(missing_keys)}, Unexpected keys: {len(unexpected_keys)}")
+    
     del s2_state_dict
     gc.collect()
     if local_rank == 0:
         print("✅ Stage 2 weights loaded.")
 
-# 2. Load Stage 2.5 weights to get the trained routers
+# Load Stage 2.5 router weights separately (safer!)
 stage2_5_checkpoint_path = os.path.join(STAGE2_5_CHECKPOINT_DIR, "llm_stage2_5_best.pth")
 if os.path.exists(stage2_5_checkpoint_path):
     if local_rank == 0:
-        print(f"💾 Loading Stage 2.5 (Router) weights from: {stage2_5_checkpoint_path}")
-    s2_5_checkpoint = torch.load(stage2_5_checkpoint_path, map_location="cpu")
-    with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
-        llm.load_state_dict(s2_5_checkpoint['model_state_dict'], strict=False)
-    del s2_5_checkpoint
+        print(f"💾 Loading Stage 2.5 (Router-only) weights from: {stage2_5_checkpoint_path}")
+    
+    checkpoint = torch.load(stage2_5_checkpoint_path, map_location="cpu")
+    router_state_dict = checkpoint['model_state_dict']  # Now contains only router weights!
+    
+    # Load router weights directly into the model (no FSDP state dict needed)
+    with torch.no_grad():
+        for name, param in llm.named_parameters():
+            if name in router_state_dict:
+                param.data.copy_(router_state_dict[name].to(param.device))
+                if local_rank == 0:
+                    print(f"  Loaded router: {name}")
+    
+    del checkpoint, router_state_dict
     gc.collect()
     if local_rank == 0:
         print("✅ Stage 2.5 router weights loaded.")
 
+else:
+    if local_rank == 0:
+        print("⚠️  Stage 2 or router checkpoints not found. Using base MoE weights.")
+
 # 3. Load Stage 1 Vision Connector weights
-stage1_weights_path = os.path.join(OUTPUT_DIR, "vision_connector_stage1_best.pth")
+stage1_weights_path = os.path.join(OUTPUT_DIR, "archive/vision_connector_stage1_best.pth")
 if os.path.exists(stage1_weights_path):
     if local_rank == 0:
         print(f"💾 Loading Stage 1 Vision Connector weights from {stage1_weights_path}")
@@ -272,6 +290,55 @@ if local_rank == 0 and start_epoch > 0 and os.path.exists(metrics_path):
     with open(metrics_path, "r") as f:
         metrics_history = json.load(f)
 
+# After loading all checkpoints and before the training loop, add this debugging:
+if local_rank == 0:
+    print("=== DEBUGGING EMBEDDING LAYER ===")
+    embed_layer = llm.module.model.embed_tokens
+    print(f"Embedding weight shape: {embed_layer.weight.shape}")
+    print(f"Embedding weight device: {embed_layer.weight.device}")
+    print(f"Embedding weight dtype: {embed_layer.weight.dtype}")
+    print("=================================")
+
+# If the embedding layer is corrupted, reinitialize it
+embed_layer = llm.module.model.embed_tokens
+if len(embed_layer.weight.shape) != 2:
+    if local_rank == 0:
+        print(f"🚨 Embedding layer corrupted! Shape: {embed_layer.weight.shape}")
+        print("🔧 Reinitializing embedding layer...")
+    
+    # Reinitialize the embedding layer with correct dimensions
+    vocab_size = llm.config.vocab_size
+    hidden_size = llm.config.hidden_size
+    
+    new_embedding = nn.Embedding(vocab_size, hidden_size, padding_idx=llm.config.pad_token_id)
+    new_embedding = new_embedding.to(DEVICE, dtype=torch.bfloat16)
+    
+    # Replace the corrupted embedding layer
+    llm.module.model.embed_tokens = new_embedding
+    
+    if local_rank == 0:
+        print(f"✅ Embedding layer reinitialized: {new_embedding.weight.shape}")
+
+dist.barrier()
+
+# Add this right before the training loop (line ~281)
+if local_rank == 0:
+    print("=== FINAL MODEL VERIFICATION ===")
+    try:
+        # Test the embedding layer with a dummy input
+        dummy_input = torch.tensor([[1, 2, 3]], device=DEVICE)
+        dummy_embed = llm.module.model.embed_tokens(dummy_input)
+        print(f"✅ Embedding test passed: {dummy_embed.shape}")
+    except Exception as e:
+        print(f"🚨 Embedding test failed: {e}")
+        # Emergency fix: reinitialize embedding
+        vocab_size = llm.config.vocab_size
+        hidden_size = llm.config.hidden_size
+        llm.module.model.embed_tokens = nn.Embedding(vocab_size, hidden_size).to(DEVICE, dtype=torch.bfloat16)
+        print("🔧 Emergency embedding reinitialization completed")
+    print("================================")
+
+dist.barrier()
 # ====================================================================================
 # 8. TRAINING LOOP
 # ====================================================================================
@@ -295,7 +362,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
                 patch_embeddings = vision_encoder(images).last_hidden_state
             
             visual_soft_tokens = vision_connector(patch_embeddings)
-            text_embeddings = llm.model.embed_tokens(input_ids)
+            text_embeddings = llm.module.model.embed_tokens(input_ids)
             combined_embeddings = torch.cat([visual_soft_tokens, text_embeddings], dim=1)
             combined_attention_mask = torch.cat(
                 [torch.ones(visual_soft_tokens.shape[:2], device=DEVICE), attention_mask],
@@ -323,6 +390,14 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             
             ce_loss = loss_fn(text_logits.view(-1, llm.config.vocab_size), text_labels.view(-1))
             
+            if i == 0: # Only print for the first batch to avoid spamming logs
+                print("\n--- DEBUG INFO ---")
+                print(f"  - text_logits device: {text_logits.device}")
+                print(f"  - text_labels device: {text_labels.device}")
+                print(f"  - ce_loss device: {ce_loss.device}")
+                print(f"  - total_load_balancing_loss device: {total_load_balancing_loss.device}")
+                print("--------------------\n")
+
             loss = (ce_loss + LOAD_BALANCING_COEFF * total_load_balancing_loss) / accumulation_steps
 
         scaler.scale(loss).backward()
@@ -355,7 +430,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             with autocast(device_type="cuda", dtype=torch.bfloat16):
                 patch_embeddings = vision_encoder(images).last_hidden_state
                 visual_soft_tokens = vision_connector(patch_embeddings)
-                text_embeddings = llm.model.embed_tokens(input_ids)
+                text_embeddings = llm.module.model.embed_tokens(input_ids)
                 combined_embeddings = torch.cat([visual_soft_tokens, text_embeddings], dim=1)
                 combined_attention_mask = torch.cat(
                     [torch.ones(visual_soft_tokens.shape[:2], device=DEVICE), attention_mask],

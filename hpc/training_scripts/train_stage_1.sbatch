@@ -6,7 +6,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=256G
-#SBATCH --time=22:00:00
+#SBATCH --time=26:00:00
 #SBATCH --output=../out_slurm/train_stage_1/train_stage_1_%j.out
 #SBATCH --error=../err_slurm/train_stage_1/train_stage_1_%j.err
 
