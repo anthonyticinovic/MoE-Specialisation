@@ -165,7 +165,7 @@ if local_rank == 0:
 for layer in llm.module.model.layers:
     if hasattr(layer.mlp, "gate"):
         new_gate = nn.Linear(layer.mlp.d_model, layer.mlp.num_experts, bias=False)
-        nn.init.normal_(new_gate.weight, std=0.02)
+        nn.init.normal_(new_gate.weight, std=0.01)
         new_gate = new_gate.to(DEVICE)
         layer.mlp.gate = new_gate
         layer.mlp.gate.weight.requires_grad = True
@@ -333,32 +333,66 @@ for epoch in range(start_epoch, NUM_EPOCHS):
 
         scaler.scale(loss).backward()
         
-        if local_rank == 0 and (i + 1) % 100 == 0:
-            router_params = [
-                (name, p) for name, p in llm.named_parameters()
-                if "gate" in name and p.requires_grad
-            ]
+        if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):
+            # Step 1: Unscale gradients
+            scaler.unscale_(optimizer)
+
+            # Step 2: Collect all router parameters and compute their norm BEFORE clipping
+            router_params = []
+            for name, param in llm.named_parameters():
+                if 'mlp.gate' in name and param.requires_grad:  # ← Remove grad check
+                    router_params.append(param)
+
             if router_params:
-                print("--- Gradient Check ---")
-                for name, p in router_params[:2]:
-                    if p.grad is None:
-                        print(f"🚨 {name} grad is None 🚨")
-                    else:
-                        grad_norm = torch.linalg.vector_norm(p.grad).item()
-                        print(f"[DEBUG GRAD] {name}: grad_norm={grad_norm:.4e}")
-                print("----------------------")
+                # Compute the ACTUAL gradient norm before clipping
+                total_norm = 0.0
+                for p in router_params:
+                    if p.grad is not None:  # ← Add this check
+                        param_norm = p.grad.detach().data.norm(2)
+                        total_norm += param_norm.item() ** 2
+                total_norm = total_norm ** 0.5
+                
+                # Now clip the gradients
+                clipped_norm = torch.nn.utils.clip_grad_norm_(
+                    router_params, 
+                    max_norm=1.0
+                )
+                
+                # Debug logging every 100 batches
+                if local_rank == 0 and (i + 1) % 100 == 0:
+                    print(f"--- Gradient Check ---")
+                    print(f"  Router grad norm BEFORE clip: {total_norm:.2f}")
+                    print(f"  Router grad norm AFTER clip: {clipped_norm:.2f}")
+                    max_norm = 1.0
+                    was_clipped = total_norm > max_norm
+                    actual_norm_after_clip = min(total_norm, max_norm)
+                    print(f"  Clipping applied: {'YES' if was_clipped else 'NO'}")
+                    print(f"  Actual norm after clip: {actual_norm_after_clip:.2f}")
+                    
+                    # Sample a few layers to check individual norms
+                    sample_layers = [0, 1, 15, 31]  # First, second, middle, last
+                    for name, param in llm.named_parameters():
+                        if 'mlp.gate' in name and param.grad is not None:
+                            # Extract layer number from name (e.g., "model.layers.15.mlp.gate.weight")
+                            match = re.search(r'layers\.(\d+)\.mlp\.gate', name)
+                            if match:
+                                layer_idx = int(match.group(1))
+                                if layer_idx in sample_layers:
+                                    layer_norm = param.grad.detach().data.norm(2).item()
+                                    print(f"    Layer {layer_idx} gate: {layer_norm:.2e}")
+                    print("----------------------")
+
+            # Step 3: Update optimizer
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+            scheduler.step()
 
         if loss.item() > 0:
             total_train_loss += loss.item() * accumulation_steps
             total_ce_loss += ce_loss.item()
             if isinstance(total_load_balancing_loss, torch.Tensor):
                 total_lb_loss += total_load_balancing_loss.item()
-
-        if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-            scheduler.step()
 
         if local_rank == 0 and (i + 1) % 100 == 0:
             print(f"  Epoch {epoch+1}, Batch [{i+1}/{len(train_loader)}]")
