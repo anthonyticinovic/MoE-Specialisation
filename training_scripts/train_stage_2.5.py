@@ -165,7 +165,7 @@ if local_rank == 0:
 for layer in llm.module.model.layers:
     if hasattr(layer.mlp, "gate"):
         new_gate = nn.Linear(layer.mlp.d_model, layer.mlp.num_experts, bias=False)
-        nn.init.normal_(new_gate.weight, std=0.01)
+        nn.init.normal_(new_gate.weight, std=0.02)  # Increased from 0.01 to match working version
         new_gate = new_gate.to(DEVICE)
         layer.mlp.gate = new_gate
         layer.mlp.gate.weight.requires_grad = True
@@ -254,7 +254,7 @@ llm.model.embed_tokens.to(DEVICE)
 #llm.gradient_checkpointing_enable()
 vision_connector = VisionLanguageConnector().to(DEVICE)
 vision_connector.load_state_dict(
-    torch.load(os.path.join(OUTPUT_DIR, "archive/vision_connector_stage1_best.pth"), map_location=DEVICE,)
+    torch.load(os.path.join(OUTPUT_DIR, "vision_connector_stage1_best.pth"), map_location=DEVICE,)
 )
 for param in vision_encoder.parameters():
     param.requires_grad = False
@@ -352,24 +352,22 @@ for epoch in range(start_epoch, NUM_EPOCHS):
                         total_norm += param_norm.item() ** 2
                 total_norm = total_norm ** 0.5
                 
-                # Now clip the gradients
+                # Now clip the gradients - use MUCH higher threshold
                 clipped_norm = torch.nn.utils.clip_grad_norm_(
                     router_params, 
-                    max_norm=1.0
+                    max_norm=10.0  # Increased from 1.0 to 10.0
                 )
                 
-                # Debug logging every 100 batches
+                    # Debug logging every 100 batches
                 if local_rank == 0 and (i + 1) % 100 == 0:
                     print(f"--- Gradient Check ---")
                     print(f"  Router grad norm BEFORE clip: {total_norm:.2f}")
                     print(f"  Router grad norm AFTER clip: {clipped_norm:.2f}")
-                    max_norm = 1.0
+                    max_norm = 10.0  # Updated to match new clipping threshold
                     was_clipped = total_norm > max_norm
                     actual_norm_after_clip = min(total_norm, max_norm)
                     print(f"  Clipping applied: {'YES' if was_clipped else 'NO'}")
-                    print(f"  Actual norm after clip: {actual_norm_after_clip:.2f}")
-                    
-                    # Sample a few layers to check individual norms
+                    print(f"  Actual norm after clip: {actual_norm_after_clip:.2f}")                    # Sample a few layers to check individual norms
                     sample_layers = [0, 1, 15, 31]  # First, second, middle, last
                     for name, param in llm.named_parameters():
                         if 'mlp.gate' in name and param.grad is not None:
@@ -409,8 +407,17 @@ for epoch in range(start_epoch, NUM_EPOCHS):
     # --- Validation Phase ---
     llm.eval()
     total_val_loss = 0
+    val_steps = 0
+    MAX_VAL_BATCHES = 300  # Limit validation to prevent timeout
+    
     with torch.no_grad():
         for i, (images, input_ids, attention_mask) in enumerate(val_loader):
+            # Early stop after MAX_VAL_BATCHES
+            if i >= MAX_VAL_BATCHES:
+                if local_rank == 0:
+                    print(f"  ⚠️  Validation stopped early at {MAX_VAL_BATCHES} batches")
+                break
+                
             images, input_ids, attention_mask = (
                 images.to(DEVICE), input_ids.to(DEVICE), attention_mask.to(DEVICE),
             )
@@ -436,11 +443,12 @@ for epoch in range(start_epoch, NUM_EPOCHS):
                     text_logits.view(-1, llm.config.vocab_size), text_labels.view(-1)
                 )
             total_val_loss += loss.item()
+            val_steps += 1
 
-    avg_val_loss = total_val_loss / len(val_loader)
+    avg_val_loss = total_val_loss / val_steps if val_steps > 0 else float('inf')
 
     if local_rank == 0:
-        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] - Validation Loss: {avg_val_loss:.4f}")
+        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] - Validation Loss: {avg_val_loss:.4f} (evaluated on {val_steps} batches)")
 
     # --- Metrics and Checkpoint Saving ---
     if local_rank == 0:

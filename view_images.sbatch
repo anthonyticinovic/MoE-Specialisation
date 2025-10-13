@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=view_images
-#SBATCH -p gpu-a100
+#SBATCH -p gpu-h100
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1

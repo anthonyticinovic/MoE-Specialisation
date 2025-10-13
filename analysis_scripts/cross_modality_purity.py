@@ -58,26 +58,39 @@ class SyntheticImageGenerator:
             return Image.new("RGB", (self.image_size, self.image_size), self.colors[parts[0]])
         
         # Shape (with optional color)
-        color_name = parts[0] if len(parts) == 2 else "red"
-        shape_name = parts[-1]
-        
-        if color_name not in self.colors or shape_name not in ["circle", "square", "triangle"]:
+        if len(parts) == 2:
+            # Colored shape: "red circle"
+            color_name = parts[0]
+            shape_name = parts[1]
+            if color_name not in self.colors or shape_name not in ["circle", "square", "triangle"]:
+                raise ValueError(f"Unknown concept: {concept}")
+            fill_color = self.colors[color_name]
+            outline_color = self.colors[color_name]
+        elif len(parts) == 1 and parts[0] in ["circle", "square", "triangle"]:
+            # Pure shape: black outline only, white fill (no color contamination)
+            shape_name = parts[0]
+            fill_color = (255, 255, 255)  # white fill
+            outline_color = (0, 0, 0)  # black outline
+        else:
             raise ValueError(f"Unknown concept: {concept}")
         
         # Create white background and draw shape
         image = Image.new("RGB", (self.image_size, self.image_size), (255, 255, 255))
         draw = ImageDraw.Draw(image)
         margin = self.image_size // 4
-        rgb = self.colors[color_name]
+        line_width = 3  # Make outline visible
         
         if shape_name == "circle":
-            draw.ellipse([margin, margin, self.image_size - margin, self.image_size - margin], fill=rgb, outline=rgb)
+            draw.ellipse([margin, margin, self.image_size - margin, self.image_size - margin], 
+                        fill=fill_color, outline=outline_color, width=line_width)
         elif shape_name == "square":
-            draw.rectangle([margin, margin, self.image_size - margin, self.image_size - margin], fill=rgb, outline=rgb)
+            draw.rectangle([margin, margin, self.image_size - margin, self.image_size - margin], 
+                          fill=fill_color, outline=outline_color, width=line_width)
         elif shape_name == "triangle":
             center_x = self.image_size // 2
             draw.polygon([(center_x, margin), (margin, self.image_size - margin), 
-                         (self.image_size - margin, self.image_size - margin)], fill=rgb, outline=rgb)
+                         (self.image_size - margin, self.image_size - margin)], 
+                        fill=fill_color, outline=outline_color)
         
         return image
 
@@ -188,15 +201,14 @@ class CrossModalityPurityAnalyzer:
 
         print("✅ All models loaded successfully")
 
-    def _prepare_vision_input(
-        self, concept: str, use_connector: bool = True
-    ) -> torch.Tensor:
-        """Generate synthetic image and convert to visual tokens.
+    def _prepare_vision_input(self, concept: str) -> torch.Tensor:
+        """Generate synthetic image and convert to visual tokens via vision connector.
 
         Args:
             concept: Concept to generate image for
-            use_connector: If False, return raw CLIP embeddings with simple linear projection.
-                          If True, use learned vision connector (default).
+
+        Returns:
+            Visual tokens after CLIP and vision connector (pre-transformer)
         """
         # Generate synthetic image
         image = self.image_generator.generate_concept_image(concept)
@@ -208,21 +220,8 @@ class CrossModalityPurityAnalyzer:
 
         with torch.no_grad():
             patch_embeddings = self.vision_encoder(pixel_values).last_hidden_state
-
-            if use_connector:
-                # Use learned vision connector (layer -1)
-                visual_tokens = self.vision_connector(patch_embeddings)
-            else:
-                # Simple Xavier-initialized linear projection (layer -2, baseline)
-                # This gives us raw CLIP embeddings projected to 4096-dim without learned weights
-                clip_dim = patch_embeddings.shape[-1]  # 1024
-                llm_dim = 4096
-                simple_proj = nn.Linear(clip_dim, llm_dim, bias=False).to(
-                    self.device, dtype=patch_embeddings.dtype
-                )
-                nn.init.xavier_uniform_(simple_proj.weight)
-                visual_tokens = simple_proj(patch_embeddings)
-
+            # Use learned vision connector
+            visual_tokens = self.vision_connector(patch_embeddings)
             # Convert to bfloat16 to match model dtype
             visual_tokens = visual_tokens.to(torch.bfloat16)
 
@@ -314,20 +313,22 @@ class CrossModalityPurityAnalyzer:
             raise ValueError(f"Invalid expert: {expert}. Must be 'vision' or 'text'.")
         if modality not in ["vision", "text"]:
             raise ValueError(f"Invalid modality: {modality}. Must be 'vision' or 'text'.")
-        if not (-2 <= layer < 32):
-            raise ValueError(f"Invalid layer: {layer}. Must be in range [-2, 31].")
+        if not (-1 <= layer < 32):
+            raise ValueError(f"Invalid layer: {layer}. Must be in range [-1, 31].")
 
         expert_id = 0 if expert == "vision" else 1
 
         # Prepare input based on layer
-        if layer in [-2, -1]:
-            if expert == "vision":
-                embeddings = self._prepare_vision_input(concept, use_connector=(layer == -1))
+        if layer == -1:
+            # Layer -1: Pre-transformer embeddings (vision connector output vs text embeddings)
+            if modality == "vision":
+                embeddings = self._prepare_vision_input(concept)
             else:
                 embeddings = self._prepare_text_input(concept)
             hidden_state = embeddings
         else:
-            embeddings = self._prepare_vision_input(concept, use_connector=True) if modality == "vision" else self._prepare_text_input(concept)
+            # Layers 0-31: Post-transformer hidden states with expert routing
+            embeddings = self._prepare_vision_input(concept) if modality == "vision" else self._prepare_text_input(concept)
             batch_size, num_tokens = embeddings.shape[0], embeddings.shape[1]
             routing_mask = self._force_routing_through_expert(expert_id, batch_size, num_tokens)
             
@@ -395,7 +396,7 @@ class CrossModalityPurityAnalyzer:
         """Compute cosine similarity between vision and text expert representations."""
         # Only debug first concept and select layers
         should_debug = (hasattr(self, '_debug_mode') and self._debug_mode and 
-                       layer in [-2, -1, 0, 15, 31] and 
+                       layer in [-1, 0, 15, 31] and 
                        not hasattr(self, f'_logged_cosine_{concept}_{layer}_{pooling}'))
         
         if should_debug:
@@ -464,7 +465,7 @@ class CrossModalityPurityAnalyzer:
             
             # Add debug summary for first concept only
             if hasattr(self, '_debug_mode') and self._debug_mode and concept_idx == 0:
-                print(f"   🐛 Debug info will be shown for layers: -2, -1, 0, 15, 31")
+                print(f"   🐛 Debug info will be shown for layers: -1, 0, 15, 31")
             
             results["cosine_similarity"][concept] = {}
             results["euclidean_distance"][concept] = {}
@@ -579,13 +580,13 @@ def main():
         "--layers",
         nargs="+",
         type=int,
-        default=[-2, -1, 0, 8, 16, 24, 31],
-        help="Layer indices to analyze (-2=raw CLIP, -1=with connector, 0-31=transformer layers)",
+        default=[-1, 0, 8, 16, 24, 31],
+        help="Layer indices to analyze (-1=pre-transformer embeddings, 0-31=transformer layers)",
     )
     parser.add_argument(
         "--all-layers",
         action="store_true",
-        help="Analyze all layers from -2 to 31 (overrides --layers)",
+        help="Analyze all layers from -1 to 31 (overrides --layers)",
     )
     parser.add_argument(
         "--output-dir",
@@ -615,7 +616,7 @@ def main():
 
     # Handle --all-layers flag
     if args.all_layers:
-        layers = [-2, -1] + list(range(32))
+        layers = [-1] + list(range(32))
         print(
             f"📊 Using --all-layers: analyzing layers {layers[0]} to {layers[-1]} ({len(layers)} total layers)"
         )
@@ -634,7 +635,7 @@ def main():
     # Enable debug mode if requested
     if args.debug:
         analyzer._debug_mode = True
-        print("🐛 Debug mode: Will show tokenization + detailed stats for layers [-2, -1, 0, 15, 31]")
+        print("🐛 Debug mode: Will show tokenization + detailed stats for layers [-1, 0, 15, 31]")
 
     # Load models
     analyzer.load_models()

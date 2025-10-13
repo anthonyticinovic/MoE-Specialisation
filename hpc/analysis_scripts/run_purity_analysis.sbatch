@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=purity_analysis
-#SBATCH -p gpu-l40s
+#SBATCH -p gpu-h100
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1

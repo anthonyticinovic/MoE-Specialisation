@@ -108,11 +108,18 @@ for layer in llm.model.layers:
 # 4. TRAINING SETUP (PART 1 - Parameter Freezing)
 # ====================================================================================
 if local_rank == 0:
-    print("Preparing model for Stage 3: Unfreezing all LLM and Connector layers.")
+    print("Preparing model for Stage 3: Selective unfreezing (self-attn, router, MLP only).")
 
-# Unfreeze all LLM parameters for end-to-end training
+# Freeze all LLM parameters first
 for param in llm.parameters():
-    param.requires_grad = True
+    param.requires_grad = False
+
+# Selectively unfreeze: self-attention, router (gate), and MLP layers
+for name, param in llm.named_parameters():
+    if any(x in name for x in ['self_attn', 'mlp.gate', 'mlp.experts']):
+        param.requires_grad = True
+        if local_rank == 0 and 'layers.0' in name:  # Print first layer as example
+            print(f"  Unfrozen: {name}")
 
 vision_connector = VisionLanguageConnector().to(DEVICE)
 #  Unfreeze vision connector for end-to-end training
@@ -122,6 +129,11 @@ for param in vision_connector.parameters():
 # Ensure the vision encoder remains frozen
 for param in vision_encoder.parameters():
     param.requires_grad = False
+
+if local_rank == 0:
+    trainable_count = sum(p.numel() for p in llm.parameters() if p.requires_grad)
+    total_count = sum(p.numel() for p in llm.parameters())
+    print(f"LLM: {trainable_count:,} / {total_count:,} parameters trainable ({100*trainable_count/total_count:.1f}%)")
 
 # ====================================================================================
 # 5. FSDP WRAPPING & CHECKPOINTING
