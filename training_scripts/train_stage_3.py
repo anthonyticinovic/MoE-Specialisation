@@ -153,17 +153,24 @@ stage2_checkpoint_path = os.path.join(STAGE2_CHECKPOINT_DIR, "llm_stage2_best.pt
 if os.path.exists(stage2_checkpoint_path):
     if local_rank == 0:
         print(f"💾 Loading Stage 2 (Expert) weights from: {stage2_checkpoint_path}")
-    s2_state_dict = torch.load(stage2_checkpoint_path, map_location="cpu")
+    
+    checkpoint = torch.load(stage2_checkpoint_path, map_location="cpu")
+    s2_state_dict = checkpoint['model_state_dict']  # Extract nested dict
     
     with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
         missing_keys, unexpected_keys = llm.load_state_dict(s2_state_dict, strict=False)
         if local_rank == 0:
             print(f"  Missing keys: {len(missing_keys)}, Unexpected keys: {len(unexpected_keys)}")
     
-    del s2_state_dict
+    del checkpoint, s2_state_dict
     gc.collect()
     if local_rank == 0:
-        print("✅ Stage 2 weights loaded.")
+        print("✅ Stage 2 expert weights loaded.")
+else:
+    if local_rank == 0:
+        print("⚠️ WARNING: Stage 2 checkpoint not found. Using base MoE weights.")
+
+dist.barrier()
 
 # Load Stage 2.5 router weights separately (safer!)
 stage2_5_checkpoint_path = os.path.join(STAGE2_5_CHECKPOINT_DIR, "llm_stage2_5_best.pth")
@@ -172,27 +179,31 @@ if os.path.exists(stage2_5_checkpoint_path):
         print(f"💾 Loading Stage 2.5 (Router-only) weights from: {stage2_5_checkpoint_path}")
     
     checkpoint = torch.load(stage2_5_checkpoint_path, map_location="cpu")
-    router_state_dict = checkpoint['model_state_dict']  # Now contains only router weights!
+    router_state_dict = checkpoint['model_state_dict']
     
-    # Load router weights directly into the model (no FSDP state dict needed)
+    # Load router weights directly into the model
+    loaded_count = 0
     with torch.no_grad():
         for name, param in llm.named_parameters():
-            if name in router_state_dict:
+            if name in router_state_dict and 'mlp.gate' in name:
                 param.data.copy_(router_state_dict[name].to(param.device))
-                if local_rank == 0:
-                    print(f"  Loaded router: {name}")
+                loaded_count += 1
+    
+    if local_rank == 0:
+        print(f"  Loaded {loaded_count} router parameters")
     
     del checkpoint, router_state_dict
     gc.collect()
     if local_rank == 0:
         print("✅ Stage 2.5 router weights loaded.")
-
 else:
     if local_rank == 0:
-        print("⚠️  Stage 2 or router checkpoints not found. Using base MoE weights.")
+        print("⚠️ WARNING: Stage 2.5 checkpoint not found. Using random router initialization.")
+
+dist.barrier()
 
 # 3. Load Stage 1 Vision Connector weights
-stage1_weights_path = os.path.join(OUTPUT_DIR, "archive/vision_connector_stage1_best.pth")
+stage1_weights_path = os.path.join(OUTPUT_DIR, "vision_connector_stage1_best.pth")
 if os.path.exists(stage1_weights_path):
     if local_rank == 0:
         print(f"💾 Loading Stage 1 Vision Connector weights from {stage1_weights_path}")
@@ -299,50 +310,10 @@ if local_rank == 0:
     print(f"Embedding weight dtype: {embed_layer.weight.dtype}")
     print("=================================")
 
-# If the embedding layer is corrupted, reinitialize it
-embed_layer = llm.module.model.embed_tokens
-if len(embed_layer.weight.shape) != 2:
-    if local_rank == 0:
-        print(f"🚨 Embedding layer corrupted! Shape: {embed_layer.weight.shape}")
-        print("🔧 Reinitializing embedding layer...")
-    
-    # Reinitialize the embedding layer with correct dimensions
-    vocab_size = llm.config.vocab_size
-    hidden_size = llm.config.hidden_size
-    
-    new_embedding = nn.Embedding(vocab_size, hidden_size, padding_idx=llm.config.pad_token_id)
-    new_embedding = new_embedding.to(DEVICE, dtype=torch.bfloat16)
-    
-    # Replace the corrupted embedding layer
-    llm.module.model.embed_tokens = new_embedding
-    
-    if local_rank == 0:
-        print(f"✅ Embedding layer reinitialized: {new_embedding.weight.shape}")
-
-dist.barrier()
-
-# Add this right before the training loop (line ~281)
-if local_rank == 0:
-    print("=== FINAL MODEL VERIFICATION ===")
-    try:
-        # Test the embedding layer with a dummy input
-        dummy_input = torch.tensor([[1, 2, 3]], device=DEVICE)
-        dummy_embed = llm.module.model.embed_tokens(dummy_input)
-        print(f"✅ Embedding test passed: {dummy_embed.shape}")
-    except Exception as e:
-        print(f"🚨 Embedding test failed: {e}")
-        # Emergency fix: reinitialize embedding
-        vocab_size = llm.config.vocab_size
-        hidden_size = llm.config.hidden_size
-        llm.module.model.embed_tokens = nn.Embedding(vocab_size, hidden_size).to(DEVICE, dtype=torch.bfloat16)
-        print("🔧 Emergency embedding reinitialization completed")
-    print("================================")
-
 dist.barrier()
 # ====================================================================================
 # 8. TRAINING LOOP
 # ====================================================================================
-llm.to(DEVICE)
 if local_rank == 0:
     print(f"🚀 Starting Stage 3 training from epoch {start_epoch}...")
 start_time = time.time()

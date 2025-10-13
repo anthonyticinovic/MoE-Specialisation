@@ -18,11 +18,11 @@ training_stage1:
   gradient_accumulation_steps: 2
 
 training_stage2:
-  num_epochs: 20
+  num_epochs: 15
   batch_size: 16
-  learning_rate: 0.0001
+  learning_rate: 0.00004
   weight_decay: 0.01
-  subset_fraction: 0.3
+  subset_fraction: 0.5
   gradient_accumulation_steps: 4
 
 training_stage2.5:

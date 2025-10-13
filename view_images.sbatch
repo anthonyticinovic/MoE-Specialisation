@@ -1,14 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name=vlm_stage2_training
-#SBATCH -p gpu-h100
-#SBATCH --gres=gpu:4
+#SBATCH --job-name=view_images
+#SBATCH -p gpu-a100
+#SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=16
 #SBATCH --mem=256G
-#SBATCH --time=23:30:00
-#SBATCH --output=../out_slurm/train_stage_2/train_stage_2_%j.out
-#SBATCH --error=../err_slurm/train_stage_2/train_stage_2_%j.err
+#SBATCH --time=00:05:00
+#SBATCH --output=../out_slurm/view_images/view_images_%j.out
+#SBATCH --error=../err_slurm/view_images/view_images_%j.err
 
 # Load modules
 module purge
@@ -30,10 +30,5 @@ cd $HOME/MoE-Specialisation
 export PYTHONPATH="${PWD}:${PYTHONPATH}"
 
 echo "Starting training script..."
-export NCCL_DEBUG=INFO # Optional: for debugging network communication
-export PYTHONFAULTHANDLER=1 # Optional: for better tracebacks on segfaults
-export NCCL_TIMEOUT=900    
-
-srun torchrun --nproc_per_node=4 training_scripts/train_stage_2.py
-
+python -u view_synthetic_images.py
 echo "Job finished."

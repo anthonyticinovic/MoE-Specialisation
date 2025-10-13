@@ -165,18 +165,26 @@ if checkpoint_found.item() == 1.0:
     
     load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
     with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
-        state_dict_to_load = {}
         if local_rank == 0:
-            checkpoint = torch.load(latest_checkpoint_path, map_location="cpu")
+            checkpoint = torch.load(latest_checkpoint_path, map_location="cpu", weights_only=False)
             state_dict_to_load = checkpoint['model_state_dict']
             latest_epoch = checkpoint['epoch']
             best_val_loss = checkpoint['best_val_loss']
+            
+            print(f"✅ Resumed from epoch {latest_epoch}. Previous best validation loss: {best_val_loss:.4f}")
+            
             del checkpoint
             gc.collect()
-            print(f"✅ Resumed from epoch {latest_epoch}. Previous best validation loss: {best_val_loss:.4f}")
+        else:
+            state_dict_to_load = {}
         
-        llm.load_state_dict(state_dict_to_load)
+        # Use strict=False for FSDP rank0_only loading
+        llm.load_state_dict(state_dict_to_load, strict=False)
+        
+        if local_rank == 0:
+            print(f"✅ Checkpoint loaded successfully!")
 
+# Broadcast epoch and best_val_loss to all ranks
 state_data = [latest_epoch, best_val_loss]
 dist.broadcast_object_list(state_data, src=0)
 latest_epoch, best_val_loss = int(state_data[0]), state_data[1]
