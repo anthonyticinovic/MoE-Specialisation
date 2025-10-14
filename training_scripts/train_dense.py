@@ -152,6 +152,7 @@ train_dataset = COCO_Loader(
     tokenizer=tokenizer,
     subset_fraction=train_params["subset_fraction"],
     split="train",
+    seed=loader_params.get("data_seed", 42),  # Fixed seed for reproducibility
 )
 val_dataset = COCO_Loader(
     image_dir=paths["image_dir"],
@@ -160,6 +161,7 @@ val_dataset = COCO_Loader(
     tokenizer=tokenizer,
     subset_fraction=train_params["subset_fraction"],
     split="val",
+    seed=loader_params.get("data_seed", 42),  # Same seed ensures consistent splits
 )
 
 train_sampler = DistributedSampler(train_dataset)

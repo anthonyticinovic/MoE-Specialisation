@@ -60,7 +60,6 @@ NUM_EPOCHS = train_params["num_epochs"]
 OUTPUT_DIR = paths["output_dir"]
 # CHANGED: Define all necessary checkpoint directories
 STAGE2_CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "stage2_checkpoints")
-STAGE2_5_CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "stage2_5_checkpoints")
 STAGE3_CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "stage3_checkpoints")
 # ADDED: Load balancing coefficient for MoE training
 LOAD_BALANCING_COEFF = train_params.get("load_balancing_coeff", 0.01)
@@ -145,6 +144,9 @@ my_auto_wrap_policy = partial(
     },
 )
 
+# Prevent FSDP from sharding the embedding layer (accessed directly in training loop)
+ignored_modules = [llm.model.embed_tokens]
+
 llm = FSDP(
     llm,
     device_id=torch.cuda.current_device(),
@@ -156,7 +158,13 @@ llm = FSDP(
         buffer_dtype=torch.bfloat16,
     ),
     use_orig_params=True,
+    ignored_modules=ignored_modules,
 )
+
+# Manual device placement for ignored modules (required after FSDP wrapping)
+if local_rank == 0:
+    print(f"Manually placing ignored modules on device {DEVICE}")
+llm.model.embed_tokens.to(DEVICE)
 
 load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
 
@@ -166,51 +174,49 @@ if os.path.exists(stage2_checkpoint_path):
     if local_rank == 0:
         print(f"💾 Loading Stage 2 (Expert) weights from: {stage2_checkpoint_path}")
     
-    checkpoint = torch.load(stage2_checkpoint_path, map_location="cpu")
-    s2_state_dict = checkpoint['model_state_dict']  # Extract nested dict
-    
-    with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
-        missing_keys, unexpected_keys = llm.load_state_dict(s2_state_dict, strict=False)
+    try:
+        # Load checkpoint (handle both old bare state_dict and new nested format)
+        checkpoint = torch.load(stage2_checkpoint_path, map_location="cpu")
+        
+        # Check if it's the new format (dict with 'model_state_dict') or old format (bare state_dict)
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            s2_state_dict = checkpoint['model_state_dict']
+            if local_rank == 0:
+                print("  ✅ Detected new checkpoint format (with optimizer/scheduler)")
+                if 'epoch' in checkpoint:
+                    print(f"     Checkpoint from epoch {checkpoint['epoch']}")
+        else:
+            # Old format: bare state_dict (no nested structure)
+            s2_state_dict = checkpoint
+            if local_rank == 0:
+                print("  ✅ Detected old checkpoint format (bare state_dict - no optimizer/scheduler)")
+        
+        with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
+            missing_keys, unexpected_keys = llm.load_state_dict(s2_state_dict, strict=False)
+            if local_rank == 0:
+                if len(missing_keys) > 0:
+                    print(f"  ⚠️  Missing keys: {len(missing_keys)} (expected for partial loading)")
+                if len(unexpected_keys) > 0:
+                    print(f"  ⚠️  Unexpected keys: {len(unexpected_keys)}")
+        
+        del checkpoint, s2_state_dict
+        gc.collect()
         if local_rank == 0:
-            print(f"  Missing keys: {len(missing_keys)}, Unexpected keys: {len(unexpected_keys)}")
+            print("✅ Stage 2 expert weights loaded successfully.")
     
-    del checkpoint, s2_state_dict
-    gc.collect()
-    if local_rank == 0:
-        print("✅ Stage 2 expert weights loaded.")
+    except Exception as e:
+        if local_rank == 0:
+            print(f"❌ ERROR loading Stage 2 checkpoint: {e}")
+            print("   Continuing with base MoE weights.")
 else:
     if local_rank == 0:
         print("⚠️ WARNING: Stage 2 checkpoint not found. Using base MoE weights.")
 
 dist.barrier()
 
-# Load Stage 2.5 router weights separately (safer!)
-stage2_5_checkpoint_path = os.path.join(STAGE2_5_CHECKPOINT_DIR, "llm_stage2_5_best.pth")
-if os.path.exists(stage2_5_checkpoint_path):
-    if local_rank == 0:
-        print(f"💾 Loading Stage 2.5 (Router-only) weights from: {stage2_5_checkpoint_path}")
-    
-    checkpoint = torch.load(stage2_5_checkpoint_path, map_location="cpu")
-    router_state_dict = checkpoint['model_state_dict']
-    
-    # Load router weights directly into the model
-    loaded_count = 0
-    with torch.no_grad():
-        for name, param in llm.named_parameters():
-            if name in router_state_dict and 'mlp.gate' in name:
-                param.data.copy_(router_state_dict[name].to(param.device))
-                loaded_count += 1
-    
-    if local_rank == 0:
-        print(f"  Loaded {loaded_count} router parameters")
-    
-    del checkpoint, router_state_dict
-    gc.collect()
-    if local_rank == 0:
-        print("✅ Stage 2.5 router weights loaded.")
-else:
-    if local_rank == 0:
-        print("⚠️ WARNING: Stage 2.5 checkpoint not found. Using random router initialization.")
+# Stage 3 uses fresh router initialization (routers will be trained end-to-end)
+if local_rank == 0:
+    print("ℹ️  Stage 3 uses fresh router initialization (will be trained end-to-end)")
 
 dist.barrier()
 
@@ -236,6 +242,7 @@ train_dataset = COCO_Loader(
     tokenizer=tokenizer,
     subset_fraction=train_params["subset_fraction"],
     split="train",
+    seed=loader_params.get("data_seed", 42),  # Fixed seed for reproducibility
 )
 val_dataset = COCO_Loader(
     image_dir=paths["image_dir"],
@@ -244,6 +251,7 @@ val_dataset = COCO_Loader(
     tokenizer=tokenizer,
     subset_fraction=train_params["subset_fraction"],
     split="val",
+    seed=loader_params.get("data_seed", 42),  # Same seed ensures consistent splits
 )
 
 train_sampler = DistributedSampler(train_dataset)
@@ -261,7 +269,8 @@ val_loader = DataLoader(
 accumulation_steps = train_params.get("gradient_accumulation_steps", 1)
 
 # NEW: Combine all trainable parameters (LLM + Vision Connector) for the optimizer
-trainable_params = list(llm.parameters()) + list(vision_connector.parameters())
+# Filter to only include parameters that require gradients
+trainable_params = [p for p in llm.parameters() if p.requires_grad] + list(vision_connector.parameters())
 optimizer = optim.AdamW(trainable_params, lr=train_params["learning_rate"], weight_decay=train_params["weight_decay"], fused=True)
 scaler = GradScaler()
 total_steps = (len(train_loader) // accumulation_steps) * NUM_EPOCHS
@@ -293,6 +302,11 @@ if resume_tensor.item() == 1.0:
     start_epoch = checkpoint['epoch'] + 1
     best_val_loss = checkpoint.get('best_val_loss', float('inf'))
 
+    if local_rank == 0:
+        print(f"  ✅ Loaded optimizer state (learning_rate: {optimizer.param_groups[0]['lr']:.2e})")
+        print(f"  ✅ Loaded scheduler state (last_epoch: {scheduler.last_epoch})")
+        print(f"  ✅ Best validation loss so far: {best_val_loss:.4f}")
+
     del checkpoint
     gc.collect()
     
@@ -313,14 +327,19 @@ if local_rank == 0 and start_epoch > 0 and os.path.exists(metrics_path):
     with open(metrics_path, "r") as f:
         metrics_history = json.load(f)
 
-# After loading all checkpoints and before the training loop, add this debugging:
+# Final model verification before training
 if local_rank == 0:
-    print("=== DEBUGGING EMBEDDING LAYER ===")
-    embed_layer = llm.module.model.embed_tokens
-    print(f"Embedding weight shape: {embed_layer.weight.shape}")
-    print(f"Embedding weight device: {embed_layer.weight.device}")
-    print(f"Embedding weight dtype: {embed_layer.weight.dtype}")
-    print("=================================")
+    print("=== FINAL MODEL VERIFICATION ===")
+    try:
+        # Test the embedding layer with a dummy input
+        dummy_input = torch.tensor([[1, 2, 3]], device=DEVICE)
+        dummy_embed = llm.module.model.embed_tokens(dummy_input)
+        print(f"✅ Embedding layer test passed: {dummy_embed.shape}")
+        print(f"   - Device: {dummy_embed.device}, Dtype: {dummy_embed.dtype}")
+    except Exception as e:
+        print(f"🚨 Embedding layer test FAILED: {e}")
+        raise RuntimeError("Embedding layer is not properly configured") from e
+    print("================================")
 
 dist.barrier()
 # ====================================================================================

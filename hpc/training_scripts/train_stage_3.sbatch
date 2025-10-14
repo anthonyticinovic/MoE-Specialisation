@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=vlm_stage3_training
-#SBATCH -p gpu-h100
+#SBATCH -p gpu-a100
 #SBATCH --gres=gpu:2
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=256G
-#SBATCH --time=22:55:00
+#SBATCH --time=00:55:00
 #SBATCH --output=../out_slurm/train_stage_3/train_stage_3_%j.out
 #SBATCH --error=../err_slurm/train_stage_3/train_stage_3_%j.err
 

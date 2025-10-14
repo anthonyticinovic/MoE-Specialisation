@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=purity_analysis
-#SBATCH -p gpu-h100
+#SBATCH -p gpu-a100
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -29,10 +29,15 @@ export PYTHONPATH="${PWD}:${PYTHONPATH}"
 echo "Starting cross-modality purity analysis..."
 
 # Run with default concepts and layers + DEBUG MODE
-python -u analysis_scripts/cross_modality_purity.py \
-    --concepts red blue circle triangle\
-    --all-layers \
-    --output-dir results/cross_modality \
-    --debug
+# python -u analysis_scripts/cross_modality_purity.py \
+#     --concepts red triangle\
+#     --all-layers \
+#     --output-dir results/cross_modality \
+#     --debug
+
+python analysis_scripts/cross_modality_purity.py \
+ --concepts data/images/cat.jpg data/images/car.jpg \
+ --all-layers \
+ --output-dir results/cross_modality/natural_images
     
 echo "Analysis finished."

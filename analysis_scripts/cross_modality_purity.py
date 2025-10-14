@@ -202,18 +202,25 @@ class CrossModalityPurityAnalyzer:
         print("✅ All models loaded successfully")
 
     def _prepare_vision_input(self, concept: str) -> torch.Tensor:
-        """Generate synthetic image and convert to visual tokens via vision connector.
+        """Generate synthetic image or load from file path and convert to visual tokens via vision connector.
 
         Args:
-            concept: Concept to generate image for
+            concept: Concept to generate image for, or file path to image
 
         Returns:
             Visual tokens after CLIP and vision connector (pre-transformer)
         """
-        # Generate synthetic image
-        image = self.image_generator.generate_concept_image(concept)
+        # Check if concept is a file path
+        if os.path.isfile(concept):
+            # Load image from disk (any size, any format - CLIP processor will resize)
+            image = Image.open(concept).convert("RGB")
+            concept_name = os.path.splitext(os.path.basename(concept))[0]
+            print(f"      📸 Loaded '{concept_name}' from {concept} (original size: {image.size})")
+        else:
+            # Generate synthetic image
+            image = self.image_generator.generate_concept_image(concept)
 
-        # Process through CLIP
+        # Process through CLIP (automatically resizes to 224×224 and normalizes)
         pixel_values = self.clip_processor(
             images=image, return_tensors="pt"
         ).pixel_values.to(self.device)
@@ -228,9 +235,19 @@ class CrossModalityPurityAnalyzer:
         return visual_tokens
 
     def _prepare_text_input(self, concept: str) -> torch.Tensor:
-        """Tokenize concept and convert to text embeddings."""
-        # Add prompt context for better embeddings
-        text = f"{concept}"
+        """Tokenize concept and convert to text embeddings.
+        
+        Args:
+            concept: Either a concept name (e.g., "cat") or file path (e.g., "data/images/cat.jpg")
+                    If file path, extracts concept name from filename
+        """
+        # If concept is a file path, extract the concept name from filename
+        if os.path.isfile(concept):
+            concept_name = os.path.splitext(os.path.basename(concept))[0]
+            print(f"      💬 Extracted text concept '{concept_name}' from image path")
+            text = f"{concept_name}"
+        else:
+            text = f"{concept}"
 
         input_ids = self.tokenizer(
             text,
@@ -240,10 +257,11 @@ class CrossModalityPurityAnalyzer:
         ).input_ids.to(self.device)
 
         # DEBUG: Log tokenization details (only for first occurrence per concept)
-        if hasattr(self, '_debug_mode') and self._debug_mode and not hasattr(self, f'_logged_text_{concept}'):
+        debug_key = concept if not os.path.isfile(concept) else concept_name
+        if hasattr(self, '_debug_mode') and self._debug_mode and not hasattr(self, f'_logged_text_{debug_key}'):
             tokens = [self.tokenizer.decode([tid]) for tid in input_ids[0]]
-            print(f"      💬 Text tokenization: '{concept}' → {tokens} ({len(tokens)} tokens)")
-            setattr(self, f'_logged_text_{concept}', True)
+            print(f"      💬 Text tokenization: '{text}' → {tokens} ({len(tokens)} tokens)")
+            setattr(self, f'_logged_text_{debug_key}', True)
 
         with torch.no_grad():
             text_embeddings = self.llm.model.embed_tokens(input_ids)
@@ -421,6 +439,195 @@ class CrossModalityPurityAnalyzer:
         text_rep = self.analyze_representation(concept, "text", layer, "text", pooling)
         return float(np.linalg.norm(vision_rep - text_rep))
 
+    def compute_purity_matrix(self, concepts: List[str], layer: int, pooling: str = "mean") -> np.ndarray:
+        """
+        Compute pairwise cosine similarity matrix for all concept-modality combinations.
+        
+        Args:
+            concepts: List of exactly 2 concepts to compare
+            layer: Layer index to analyze
+            pooling: Pooling strategy ("mean" for mean-pooled representations)
+            
+        Returns:
+            NxN matrix where N = 2 * len(concepts), organized as:
+            [concept1_vis, concept1_txt, concept2_vis, concept2_txt, ...]
+        """
+        if len(concepts) != 2:
+            raise ValueError(f"Purity matrix requires exactly 2 concepts, got {len(concepts)}")
+        
+        # Extract all representations: [concept1_vis, concept1_txt, concept2_vis, concept2_txt]
+        representations = []
+        labels = []
+        
+        for concept in concepts:
+            # Vision representation through vision expert
+            vis_rep = self.analyze_representation(concept, "vision", layer, "vision", pooling)
+            representations.append(vis_rep)
+            labels.append(f"{concept}_vis")
+            
+            # Text representation through text expert  
+            txt_rep = self.analyze_representation(concept, "text", layer, "text", pooling)
+            representations.append(txt_rep)
+            labels.append(f"{concept}_txt")
+        
+        # Compute pairwise cosine similarities
+        n = len(representations)
+        matrix = np.zeros((n, n))
+        
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    matrix[i, j] = 1.0
+                else:
+                    cos_sim = np.dot(representations[i], representations[j]) / (
+                        np.linalg.norm(representations[i]) * np.linalg.norm(representations[j]) + 1e-8
+                    )
+                    matrix[i, j] = cos_sim
+        
+        return matrix, labels
+
+    def compute_purity_separation_scores(self, concepts: List[str], layers: List[int], pooling: str = "mean") -> Dict:
+        """
+        Compute purity and separation scores across layers.
+        
+        Purity Score: How well vision and text representations align for the SAME concept
+        Separation Score: How well the model distinguishes DIFFERENT concepts
+        
+        Args:
+            concepts: List of exactly 2 concepts
+            layers: Layer indices to analyze
+            pooling: Pooling strategy
+            
+        Returns:
+            Dict with 'purity_scores' and 'separation_scores' lists
+        """
+        if len(concepts) != 2:
+            raise ValueError(f"Purity/separation tracking requires exactly 2 concepts, got {len(concepts)}")
+        
+        concept1, concept2 = concepts
+        purity_scores = []
+        separation_scores = []
+        
+        for layer in layers:
+            # Get all 4 representations
+            c1_vis = self.analyze_representation(concept1, "vision", layer, "vision", pooling)
+            c1_txt = self.analyze_representation(concept1, "text", layer, "text", pooling)
+            c2_vis = self.analyze_representation(concept2, "vision", layer, "vision", pooling)
+            c2_txt = self.analyze_representation(concept2, "text", layer, "text", pooling)
+            
+            # Purity: average cross-modal similarity for same concepts
+            cos_c1 = np.dot(c1_vis, c1_txt) / (np.linalg.norm(c1_vis) * np.linalg.norm(c1_txt) + 1e-8)
+            cos_c2 = np.dot(c2_vis, c2_txt) / (np.linalg.norm(c2_vis) * np.linalg.norm(c2_txt) + 1e-8)
+            purity = (cos_c1 + cos_c2) / 2.0
+            
+            # Separation: 1 - average within-modal similarity for different concepts
+            cos_vis = np.dot(c1_vis, c2_vis) / (np.linalg.norm(c1_vis) * np.linalg.norm(c2_vis) + 1e-8)
+            cos_txt = np.dot(c1_txt, c2_txt) / (np.linalg.norm(c1_txt) * np.linalg.norm(c2_txt) + 1e-8)
+            separation = 1.0 - (cos_vis + cos_txt) / 2.0
+            
+            purity_scores.append(float(purity))
+            separation_scores.append(float(separation))
+        
+        return {
+            "purity_scores": purity_scores,
+            "separation_scores": separation_scores,
+            "layers": layers
+        }
+
+    def compute_clip_connector_comparison(self, concepts: List[str]) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+        """
+        Compare raw CLIP embeddings vs post-connector embeddings for two concepts.
+        
+        This diagnostic analysis helps determine if CLIP already fails to distinguish concepts,
+        or if the vision connector is crushing good CLIP features into a narrow subspace.
+        
+        Args:
+            concepts: List of exactly 2 concepts to compare
+            
+        Returns:
+            Tuple of (clip_matrix, connector_matrix, labels) where:
+            - clip_matrix: 2×2 similarity matrix of raw CLIP embeddings
+            - connector_matrix: 2×2 similarity matrix of post-connector embeddings
+            - labels: List of concept names for axis labels
+        """
+        if len(concepts) != 2:
+            raise ValueError(f"CLIP vs connector comparison requires exactly 2 concepts, got {len(concepts)}")
+        
+        print(f"\n🔬 Comparing raw CLIP vs post-connector embeddings for: {concepts}")
+        
+        # Helper function to load image (file path or synthetic)
+        def load_image(concept):
+            if os.path.isfile(concept):
+                image = Image.open(concept).convert("RGB")
+                label = os.path.splitext(os.path.basename(concept))[0]
+                print(f"      📸 Loaded '{label}' from {concept} (size: {image.size})")
+                return image, label
+            else:
+                image = self.image_generator.generate_concept_image(concept)
+                return image, concept
+        
+        # Extract raw CLIP embeddings (before connector)
+        clip_embeddings = []
+        labels = []
+        for concept in concepts:
+            image, label = load_image(concept)
+            
+            # Process through CLIP only (auto-resizes to 224×224)
+            pixel_values = self.clip_processor(
+                images=image, return_tensors="pt"
+            ).pixel_values.to(self.device)
+            
+            with torch.no_grad():
+                clip_output = self.vision_encoder(pixel_values).last_hidden_state
+                # Mean-pool across all 257 tokens
+                clip_embedding = clip_output.mean(dim=1).squeeze(0).cpu().float().numpy()
+            
+            clip_embeddings.append(clip_embedding)
+            labels.append(label)
+            print(f"  ✓ CLIP embedding for '{label}': shape={clip_embedding.shape}, norm={np.linalg.norm(clip_embedding):.2f}")
+        
+        # Extract post-connector embeddings (after connector)
+        connector_embeddings = []
+        for concept in concepts:
+            image, label = load_image(concept)
+            
+            # Process through CLIP + connector (auto-resizes to 224×224)
+            pixel_values = self.clip_processor(
+                images=image, return_tensors="pt"
+            ).pixel_values.to(self.device)
+            
+            with torch.no_grad():
+                clip_output = self.vision_encoder(pixel_values).last_hidden_state
+                connector_output = self.vision_connector(clip_output)
+                # Mean-pool across all 257 tokens
+                connector_embedding = connector_output.mean(dim=1).squeeze(0).cpu().float().numpy()
+            
+            connector_embeddings.append(connector_embedding)
+            print(f"  ✓ Connector embedding for '{label}': shape={connector_embedding.shape}, norm={np.linalg.norm(connector_embedding):.2f}")
+        
+        # Compute 2×2 similarity matrices
+        def compute_similarity_matrix(embeddings):
+            n = len(embeddings)
+            matrix = np.zeros((n, n))
+            for i in range(n):
+                for j in range(n):
+                    if i == j:
+                        matrix[i, j] = 1.0
+                    else:
+                        cos_sim = np.dot(embeddings[i], embeddings[j]) / (
+                            np.linalg.norm(embeddings[i]) * np.linalg.norm(embeddings[j]) + 1e-8
+                        )
+                        matrix[i, j] = cos_sim
+            return matrix
+        
+        clip_matrix = compute_similarity_matrix(clip_embeddings)
+        connector_matrix = compute_similarity_matrix(connector_embeddings)
+        
+        print(f"\n  📊 CLIP similarity: {labels[0]} vs {labels[1]} = {clip_matrix[0, 1]:.4f}")
+        print(f"  📊 Connector similarity: {labels[0]} vs {labels[1]} = {connector_matrix[0, 1]:.4f}")
+        
+        return clip_matrix, connector_matrix, labels
+
     def run_comprehensive_analysis(
         self,
         concepts: List[str],
@@ -538,6 +745,118 @@ class CrossModalityPurityAnalyzer:
         plt.close()
         print(f"  ✓ Saved {filename}")
 
+    def _plot_purity_matrices(self, matrices: Dict, target_layers: List[int], output_dir: str):
+        """Plot purity matrices as heatmaps for comparison across layers."""
+        # Dynamically create subplots based on number of matrices actually computed
+        num_matrices = len(matrices)
+        fig, axes = plt.subplots(1, num_matrices, figsize=(6 * num_matrices, 5))
+        
+        # Handle case where only 1 matrix (axes won't be an array)
+        if num_matrices == 1:
+            axes = [axes]
+        
+        for idx, layer in enumerate(target_layers):
+            if layer not in matrices:
+                continue  # Skip if this layer wasn't computed
+            matrix, labels = matrices[layer]
+            
+            # Create heatmap
+            sns.heatmap(
+                matrix, 
+                annot=True, 
+                fmt=".3f", 
+                cmap="RdYlGn",
+                vmin=-1, 
+                vmax=1,
+                xticklabels=labels,
+                yticklabels=labels,
+                ax=axes[idx],
+                cbar_kws={'label': 'Cosine Similarity'},
+                square=True
+            )
+            axes[idx].set_title(f"Layer {layer}", fontsize=14, fontweight="bold")
+        
+        plt.suptitle("Cross-Concept Purity Matrix (Mean-Pooled)", fontsize=16, fontweight="bold", y=1.02)
+        plt.tight_layout()
+        
+        output_path = os.path.join(output_dir, "purity_matrix_comparison.png")
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"  ✓ Saved purity_matrix_comparison.png")
+
+    def _plot_purity_separation_scores(self, scores: Dict, output_dir: str):
+        """Plot purity and separation scores across layers."""
+        plt.figure(figsize=(12, 7))
+        
+        layers = scores["layers"]
+        purity = scores["purity_scores"]
+        separation = scores["separation_scores"]
+        
+        plt.plot(layers, purity, marker='o', linewidth=2.5, markersize=8, 
+                label='Purity Score', color='#2ecc71')
+        plt.plot(layers, separation, marker='s', linewidth=2.5, markersize=8, 
+                label='Separation Score', color='#e74c3c')
+        
+        plt.xlabel("Layer", fontsize=13)
+        plt.ylabel("Score", fontsize=13)
+        plt.title("Layer-wise Purity and Separation Scores\n(Mean-Pooled Representations)", 
+                 fontsize=15, fontweight="bold")
+        plt.legend(loc="best", fontsize=12)
+        plt.grid(True, alpha=0.3)
+        plt.ylim(0, 1.05)
+        plt.tight_layout()
+        
+        output_path = os.path.join(output_dir, "purity_separation_scores.png")
+        plt.savefig(output_path, dpi=300)
+        plt.close()
+        print(f"  ✓ Saved purity_separation_scores.png")
+
+    def _plot_clip_connector_comparison(self, clip_matrix: np.ndarray, connector_matrix: np.ndarray, 
+                                        labels: List[str], output_dir: str):
+        """Plot side-by-side comparison of CLIP vs connector similarity matrices."""
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        
+        # Plot raw CLIP embeddings
+        sns.heatmap(
+            clip_matrix,
+            annot=True,
+            fmt=".3f",
+            cmap="RdYlGn",
+            vmin=-1,
+            vmax=1,
+            xticklabels=labels,
+            yticklabels=labels,
+            ax=axes[0],
+            cbar_kws={'label': 'Cosine Similarity'},
+            square=True
+        )
+        axes[0].set_title("Raw CLIP Embeddings\n(1024-dim, mean-pooled)", fontsize=13, fontweight="bold")
+        
+        # Plot post-connector embeddings
+        sns.heatmap(
+            connector_matrix,
+            annot=True,
+            fmt=".3f",
+            cmap="RdYlGn",
+            vmin=-1,
+            vmax=1,
+            xticklabels=labels,
+            yticklabels=labels,
+            ax=axes[1],
+            cbar_kws={'label': 'Cosine Similarity'},
+            square=True
+        )
+        axes[1].set_title("Post-Connector Embeddings\n(4096-dim, mean-pooled)", fontsize=13, fontweight="bold")
+        
+        plt.suptitle("CLIP vs Vision Connector: Concept Similarity Comparison", 
+                    fontsize=15, fontweight="bold", y=1.02)
+        plt.tight_layout()
+        
+        output_path = os.path.join(output_dir, "clip_vs_connector_comparison.png")
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"  ✓ Saved clip_vs_connector_comparison.png")
+
     def _visualize_results(self, results: Dict, output_dir: str):
         """Generate visualization plots from analysis results."""
         print("\n📈 Generating visualizations...")
@@ -561,6 +880,39 @@ class CrossModalityPurityAnalyzer:
         self._plot_metric(results, concepts, layers, "euclidean_distance_mean_pooled", output_dir,
                          "Euclidean Distance (L2 Norm)", "Cross-Modality Representation Distance (Mean-Pooled Vision)",
                          "euclidean_distance_meanpooled_lineplot.png")
+        
+        # Generate purity matrix and divergence tracking if exactly 2 concepts
+        if len(concepts) == 2:
+            print("\n📊 Generating purity matrix and divergence analysis (2 concepts detected)...")
+            
+            # CLIP vs Connector comparison (diagnostic analysis)
+            print("\n🔬 Running CLIP vs Connector diagnostic...")
+            try:
+                clip_matrix, connector_matrix, labels = self.compute_clip_connector_comparison(concepts)
+                self._plot_clip_connector_comparison(clip_matrix, connector_matrix, labels, output_dir)
+            except Exception as e:
+                print(f"  ✗ Error computing CLIP vs connector comparison: {e}")
+            
+            # Purity matrices at key layers
+            target_layers = [-1, 0, 15, 31]
+            matrices = {}
+            for layer in target_layers:
+                if layer in layers:
+                    try:
+                        matrix, labels = self.compute_purity_matrix(concepts, layer, pooling="mean")
+                        matrices[layer] = (matrix, labels)
+                    except Exception as e:
+                        print(f"  ✗ Error computing purity matrix for layer {layer}: {e}")
+            
+            if matrices:
+                self._plot_purity_matrices(matrices, target_layers, output_dir)
+            
+            # Purity/separation scores across all layers
+            try:
+                scores = self.compute_purity_separation_scores(concepts, layers, pooling="mean")
+                self._plot_purity_separation_scores(scores, output_dir)
+            except Exception as e:
+                print(f"  ✗ Error computing purity/separation scores: {e}")
         
         print("✅ Visualization complete!")
 

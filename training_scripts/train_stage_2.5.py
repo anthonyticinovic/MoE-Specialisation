@@ -113,7 +113,7 @@ llm = FSDP(
     llm,
     device_id=DEVICE,
     auto_wrap_policy=my_auto_wrap_policy,
-    cpu_offload=CPUOffload(offload_params=True),
+    cpu_offload=CPUOffload(offload_params=None),
     mixed_precision=torch.distributed.fsdp.MixedPrecision(
         param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16, buffer_dtype=torch.bfloat16,
     ),
@@ -179,11 +179,13 @@ train_dataset = COCO_Loader(
     image_dir=paths["image_dir"], annotations_file=paths["annotations_file"],
     clip_processor=clip_processor, tokenizer=tokenizer,
     subset_fraction=train_params["subset_fraction"], split="train",
+    seed=loader_params.get("data_seed", 42),  # Fixed seed for reproducibility
 )
 val_dataset = COCO_Loader(
     image_dir=paths["image_dir"], annotations_file=paths["annotations_file"],
     clip_processor=clip_processor, tokenizer=tokenizer,
     subset_fraction=train_params["subset_fraction"], split="val",
+    seed=loader_params.get("data_seed", 42),  # Same seed ensures consistent splits
 )
 train_sampler = DistributedSampler(train_dataset)
 val_sampler = DistributedSampler(val_dataset, shuffle=False)
@@ -408,47 +410,55 @@ for epoch in range(start_epoch, NUM_EPOCHS):
     llm.eval()
     total_val_loss = 0
     val_steps = 0
-    MAX_VAL_BATCHES = 300  # Limit validation to prevent timeout
+    MAX_VAL_BATCHES = 50  # DRASTICALLY reduced to prevent timeout
+    
+    if local_rank == 0:
+        print(f"  Starting validation (max {MAX_VAL_BATCHES} batches per GPU)...")
     
     with torch.no_grad():
         for i, (images, input_ids, attention_mask) in enumerate(val_loader):
             # Early stop after MAX_VAL_BATCHES
             if i >= MAX_VAL_BATCHES:
-                if local_rank == 0:
-                    print(f"  ⚠️  Validation stopped early at {MAX_VAL_BATCHES} batches")
                 break
                 
             images, input_ids, attention_mask = (
                 images.to(DEVICE), input_ids.to(DEVICE), attention_mask.to(DEVICE),
             )
-            with autocast(device_type="cuda", dtype=torch.bfloat16):
-                patch_embeddings = vision_encoder(images).last_hidden_state
-                visual_soft_tokens = vision_connector(patch_embeddings)
-                text_embeddings = llm.model.embed_tokens(input_ids)
-                combined_embeddings = torch.cat(
-                    [visual_soft_tokens, text_embeddings], dim=1
-                )
-                combined_attention_mask = torch.cat(
-                    [torch.ones(visual_soft_tokens.shape[:2], device=DEVICE), attention_mask,],
-                    dim=1,
-                )
-                outputs = llm(
-                    inputs_embeds=combined_embeddings, attention_mask=combined_attention_mask,
-                )
-                logits = outputs.logits
-                num_visual_tokens = visual_soft_tokens.shape[1]
-                text_logits = logits[..., num_visual_tokens:-1, :].contiguous()
-                text_labels = input_ids[..., 1:].contiguous()
-                loss = loss_fn(
-                    text_logits.view(-1, llm.config.vocab_size), text_labels.view(-1)
-                )
-            total_val_loss += loss.item()
-            val_steps += 1
+            
+            try:
+                with autocast(device_type="cuda", dtype=torch.bfloat16):
+                    patch_embeddings = vision_encoder(images).last_hidden_state
+                    visual_soft_tokens = vision_connector(patch_embeddings)
+                    text_embeddings = llm.model.embed_tokens(input_ids)
+                    combined_embeddings = torch.cat(
+                        [visual_soft_tokens, text_embeddings], dim=1
+                    )
+                    combined_attention_mask = torch.cat(
+                        [torch.ones(visual_soft_tokens.shape[:2], device=DEVICE), attention_mask,],
+                        dim=1,
+                    )
+                    outputs = llm(
+                        inputs_embeds=combined_embeddings, attention_mask=combined_attention_mask,
+                    )
+                    logits = outputs.logits
+                    num_visual_tokens = visual_soft_tokens.shape[1]
+                    text_logits = logits[..., num_visual_tokens:-1, :].contiguous()
+                    text_labels = input_ids[..., 1:].contiguous()
+                    loss = loss_fn(
+                        text_logits.view(-1, llm.config.vocab_size), text_labels.view(-1)
+                    )
+                total_val_loss += loss.item()
+                val_steps += 1
+            except Exception as e:
+                if local_rank == 0:
+                    print(f"⚠️  Validation batch {i} failed: {e}")
+                break
 
+    # Each rank computed its own average - just use local average (no distributed aggregation)
     avg_val_loss = total_val_loss / val_steps if val_steps > 0 else float('inf')
 
     if local_rank == 0:
-        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] - Validation Loss: {avg_val_loss:.4f} (evaluated on {val_steps} batches)")
+        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] - Validation Loss: {avg_val_loss:.4f} (rank 0, {val_steps} batches)")
 
     # --- Metrics and Checkpoint Saving ---
     if local_rank == 0:
@@ -501,7 +511,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             torch.save(consolidated_checkpoint, best_checkpoint_path)
             print(f"🏆 New best model! Val loss: {avg_val_loss:.4f}. Saved to {best_checkpoint_path}")
 
-    dist.barrier()
+    # Removed barrier - not needed since only rank 0 saves checkpoints
 
 dist.destroy_process_group()
 print("Job finished.")

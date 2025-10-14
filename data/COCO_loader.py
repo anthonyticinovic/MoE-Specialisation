@@ -15,15 +15,19 @@ class COCO_Loader(Dataset):
         subset_fraction=1.0,
         split="train", 
         val_split_fraction=0.1,
+        seed=42,  # Fixed seed for reproducible splits across all stages
     ):
         self.image_dir = image_dir
         self.coco = COCO(annotations_file)
         self.clip_processor = clip_processor
         self.tokenizer = tokenizer
 
-        # --- MODIFIED: Subset based on unique image IDs ---
+        # --- MODIFIED: Subset based on unique image IDs with fixed seed ---
         all_img_ids = list(sorted(self.coco.imgs.keys()))
-        random.shuffle(all_img_ids)
+        
+        # Use a separate Random instance with fixed seed for reproducibility
+        rng = random.Random(seed)
+        rng.shuffle(all_img_ids)
 
         # 1. Take a fraction of the unique image IDs
         subset_size = int(len(all_img_ids) * subset_fraction)

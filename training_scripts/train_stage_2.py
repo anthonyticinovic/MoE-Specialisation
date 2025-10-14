@@ -229,6 +229,7 @@ train_dataset = COCO_Loader(
     tokenizer=tokenizer,
     subset_fraction=train_params["subset_fraction"],
     split="train",
+    seed=loader_params.get("data_seed", 42),  # Fixed seed for reproducibility
 )
 val_dataset = COCO_Loader(
     image_dir=paths["image_dir"],
@@ -237,6 +238,7 @@ val_dataset = COCO_Loader(
     tokenizer=tokenizer,
     subset_fraction=train_params["subset_fraction"],
     split="val",
+    seed=loader_params.get("data_seed", 42),  # Same seed ensures consistent splits
 )
 
 train_sampler = DistributedSampler(train_dataset)
@@ -271,6 +273,29 @@ loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
 
 if local_rank == 0:
     print(f"Optimizing {sum(p.numel() for p in llm.parameters() if p.requires_grad)} trainable parameters.")
+
+# --- Load optimizer & scheduler state if resuming ---
+if checkpoint_found.item() == 1.0:
+    if local_rank == 0:
+        print(f"💾 Loading optimizer and scheduler states from checkpoint...")
+        checkpoint = torch.load(latest_checkpoint_path, map_location="cpu", weights_only=False)
+        
+        if 'optimizer_state_dict' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            print(f"  ✅ Loaded optimizer state (learning_rate: {optimizer.param_groups[0]['lr']:.2e})")
+        else:
+            print(f"  ⚠️ No optimizer state found in checkpoint (old format)")
+        
+        if 'scheduler_state_dict' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            print(f"  ✅ Loaded scheduler state (last_epoch: {scheduler.last_epoch})")
+        else:
+            print(f"  ⚠️ No scheduler state found in checkpoint (old format)")
+        
+        del checkpoint
+        gc.collect()
+    
+    dist.barrier()
 
 metrics_history = {"epoch": [], "train_loss": [], "val_loss": [], "learning_rate":[]}
 metrics_path = os.path.join(OUTPUT_DIR, "training_metrics_stage2.json")
@@ -431,11 +456,14 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
         os.makedirs(STAGE2_CHECKPOINT_DIR, exist_ok=True)
         latest_model_path = os.path.join(STAGE2_CHECKPOINT_DIR, "llm_stage2_latest.pth")
         
-        # Save the 'latest' model for resuming
+        # Save the 'latest' model for resuming (with optimizer & scheduler)
         torch.save({
             'epoch': epoch + 1,
             'model_state_dict': cpu_state_dict,
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
             'best_val_loss': best_val_loss,
+            'current_val_loss': avg_val_loss,
         }, latest_model_path)
         print(f"💾 Saved latest model checkpoint to {latest_model_path}")
 
@@ -443,7 +471,15 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             best_model_path = os.path.join(STAGE2_CHECKPOINT_DIR, "llm_stage2_best.pth")
-            torch.save(cpu_state_dict, best_model_path)
+            # Save best checkpoint with full state for proper resumption
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': cpu_state_dict,
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'best_val_loss': best_val_loss,
+                'current_val_loss': avg_val_loss,
+            }, best_model_path)
             print(f"🏆 New best model found! Validation loss: {avg_val_loss:.4f}. Saved to {best_model_path}")
 
     dist.barrier()
