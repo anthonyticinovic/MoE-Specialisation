@@ -394,7 +394,7 @@ if __name__ == "__main__":
     paths = {
         "base_model_path": "/data/gpfs/projects/COMP90055/aticinovic/models/Mistral-7B-MoE",
         "tokenizer_path": config["paths"]["mistral_local_path"], # Use the path from config for the tokenizer
-        "stage2_checkpoint_path": os.path.join(output_dir, "stage2_checkpoints/archive", "llm_stage2_best.pth"),
+        "stage2_checkpoint_path": os.path.join(output_dir, "stage2_checkpoints", "llm_stage2_best.pth"),
         "stage2_5_checkpoint_path": os.path.join(output_dir, "stage2_5_checkpoints", "llm_stage2_5_best.pth"),
         "clip_path": config["paths"]["clip_local_path"],
         "connector_path": os.path.join(output_dir, "vision_connector_stage1_best.pth"),
