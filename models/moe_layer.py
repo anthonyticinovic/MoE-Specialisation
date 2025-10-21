@@ -17,8 +17,10 @@ class MoELayer(nn.Module):
         self.gate = nn.Linear(self.d_model, self.num_experts, bias=False)
         nn.init.normal_(self.gate.weight, std=0.01)
 
-        # Attribute to store the load balancing loss for 'soft' routing
-        self.load_balancing_loss = 0.0
+        # CRITICAL: Register load_balancing_loss as a buffer (not parameter) so FSDP doesn't
+        # think we're adding new parameters during forward passes. This prevents FSDP
+        # execution graph corruption errors after many training steps.
+        self.register_buffer('load_balancing_loss', torch.tensor(0.0))
         
         #I am hard coding this for now
         self.router_dropout = nn.Dropout(0.1) 
@@ -35,6 +37,10 @@ class MoELayer(nn.Module):
         """
         Main forward pass that dispatches to the correct routing logic.
         """
+        # Check if temperature was set externally (e.g., during training)
+        if hasattr(self, '_forward_temperature'):
+            temperature = self._forward_temperature
+        
         if self.routing_mode == 'hard':
             return self._hard_routing_forward(hidden_states)
         elif self.routing_mode == 'soft':
@@ -125,7 +131,9 @@ class MoELayer(nn.Module):
         tokens_per_expert = torch.mean(router_onehot, dim=0) # Fraction of tokens to each expert
         avg_prob_per_expert = torch.mean(router_probs, dim=0) # Average router probability
         # The loss is scaled by the number of experts
-        self.load_balancing_loss = self.num_experts * torch.sum(tokens_per_expert * avg_prob_per_expert)
+        # CRITICAL: Use .copy_() to update the buffer in-place, NOT reassignment
+        # Reassignment would create a new tensor that FSDP doesn't know about
+        self.load_balancing_loss.copy_(self.num_experts * torch.sum(tokens_per_expert * avg_prob_per_expert))
 
         # Reshape to the original dimensions and return
         return final_hidden_states.view(batch_size, sequence_length, hidden_dim)

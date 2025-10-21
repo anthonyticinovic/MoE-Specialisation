@@ -15,6 +15,7 @@ class COCO_Loader(Dataset):
         subset_fraction=1.0,
         split="train", 
         val_split_fraction=0.1,
+        val_subset_fraction=1.0,  # Additional subsampling for validation set
         seed=42,  # Fixed seed for reproducible splits across all stages
     ):
         self.image_dir = image_dir
@@ -39,8 +40,15 @@ class COCO_Loader(Dataset):
             final_img_ids = subset_img_ids[:split_index]
             print(f"Using {len(final_img_ids)} unique images for training.")
         elif split == "val":
-            final_img_ids = subset_img_ids[split_index:]
-            print(f"Using {len(final_img_ids)} unique images for validation.")
+            val_img_ids = subset_img_ids[split_index:]
+            # Apply additional subsampling to validation set if requested
+            if val_subset_fraction < 1.0:
+                val_subset_size = int(len(val_img_ids) * val_subset_fraction)
+                final_img_ids = val_img_ids[:val_subset_size]
+                print(f"Using {len(final_img_ids)} unique images for validation (subsampled from {len(val_img_ids)}).")
+            else:
+                final_img_ids = val_img_ids
+                print(f"Using {len(final_img_ids)} unique images for validation.")
         
         # 3. Load annotations ONLY for the final set of image IDs
         ann_ids = self.coco.getAnnIds(imgIds=final_img_ids)

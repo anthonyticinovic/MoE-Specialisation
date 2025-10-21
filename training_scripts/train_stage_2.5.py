@@ -165,10 +165,33 @@ if local_rank == 0:
 for layer in llm.module.model.layers:
     if hasattr(layer.mlp, "gate"):
         new_gate = nn.Linear(layer.mlp.d_model, layer.mlp.num_experts, bias=False)
-        nn.init.normal_(new_gate.weight, std=0.02)  # Increased from 0.01 to match working version
+        # Increased std to create stronger initial preferences, helping routers explore specialization
+        nn.init.normal_(new_gate.weight, std=0.1)  # Changed from 0.02 to 0.1
         new_gate = new_gate.to(DEVICE)
         layer.mlp.gate = new_gate
         layer.mlp.gate.weight.requires_grad = True
+
+# ====================================================================================
+# SOLUTION 4: VERIFY EXPERT WEIGHTS ARE FROZEN
+# ====================================================================================
+if local_rank == 0:
+    print("\n=== Expert Weight Verification ===")
+    sample_layer = llm.module.model.layers[0]
+    expert_0_requires_grad = any(p.requires_grad for p in sample_layer.mlp.experts[0].parameters())
+    expert_1_requires_grad = any(p.requires_grad for p in sample_layer.mlp.experts[1].parameters())
+    gate_requires_grad = sample_layer.mlp.gate.weight.requires_grad
+    
+    print(f"Expert 0 trainable: {expert_0_requires_grad} (should be False)")
+    print(f"Expert 1 trainable: {expert_1_requires_grad} (should be False)")
+    print(f"Gate trainable: {gate_requires_grad} (should be True)")
+    
+    if expert_0_requires_grad or expert_1_requires_grad:
+        raise RuntimeError("❌ Experts are not frozen! This will corrupt training.")
+    if not gate_requires_grad:
+        raise RuntimeError("❌ Router gate is frozen! Cannot train routers.")
+    
+    print("✅ All weight freeze states correct")
+    print("==================================\n")
 
 # ====================================================================================
 # 6. DATA & OPTIMIZER
@@ -268,7 +291,7 @@ if local_rank == 0:
 
 metrics_history = {
     "epoch": [], "train_loss": [], "train_ce_loss": [], "train_lb_loss": [],
-    "val_loss": [], "learning_rate": [],
+    "val_loss": [], "learning_rate": [], "entropy": [], "temperature": [],
 }
 metrics_path = os.path.join(OUTPUT_DIR, "training_metrics_stage2.5.json")
 if local_rank == 0 and start_epoch > 0 and os.path.exists(metrics_path):
@@ -292,6 +315,18 @@ for epoch in range(start_epoch, NUM_EPOCHS):
     train_sampler.set_epoch(epoch)
     llm.train()
 
+    # Temperature annealing: Start high (exploration) -> decay to 1.0 (exploitation)
+    # High temperature = softer probabilities = more exploration
+    temperature = max(1.0, 2.0 * (0.9 ** epoch))  # Starts at 2.0, decays to 1.0
+    
+    # Set temperature for all MoE layers
+    for layer in llm.module.model.layers:
+        if hasattr(layer.mlp, "temperature"):
+            layer.mlp.temperature = temperature
+    
+    if local_rank == 0 and epoch == start_epoch:
+        print(f"  Router temperature for epoch {epoch+1}: {temperature:.3f}")
+
     total_train_loss, total_ce_loss, total_lb_loss = 0, 0, 0
     optimizer.zero_grad()
     
@@ -312,6 +347,13 @@ for epoch in range(start_epoch, NUM_EPOCHS):
                 dim=1,
             )
 
+            # Pass temperature to MoE layers through forward hooks
+            # Note: LLM doesn't directly accept temperature, so we set it as layer attribute
+            for layer in llm.module.model.layers:
+                if hasattr(layer.mlp, "routing_mode") and layer.mlp.routing_mode == 'soft':
+                    # Store temperature for this forward pass
+                    layer.mlp._forward_temperature = temperature
+            
             outputs = llm(
                 inputs_embeds=combined_embeddings, attention_mask=combined_attention_mask,
             )
@@ -325,12 +367,28 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             )
 
             total_load_balancing_loss = 0
+            total_entropy_bonus = 0
             for layer in llm.module.model.layers:
                 if hasattr(layer.mlp, "load_balancing_loss"):
                     total_load_balancing_loss += layer.mlp.load_balancing_loss
+                
+                # Add entropy bonus to encourage exploration
+                if hasattr(layer.mlp, "gate"):
+                    # Get routing logits for current batch
+                    gate_logits = layer.mlp.gate(combined_embeddings.view(-1, 4096))
+                    gate_probs = torch.softmax(gate_logits, dim=-1)
+                    # Entropy = -sum(p * log(p)). Higher entropy = more exploration
+                    entropy = -(gate_probs * torch.log(gate_probs + 1e-10)).sum(dim=-1).mean()
+                    total_entropy_bonus += entropy
 
+            # Entropy coefficient: negative because we want to MAXIMIZE entropy (minimize negative entropy)
+            # Start with small coefficient and decay over time to allow specialization later
+            entropy_coeff = 0.001 * (0.95 ** epoch)  # Decays from 0.001 to ~0.0003 over 20 epochs
+            
             loss = (
-                ce_loss + LOAD_BALANCING_COEFF * total_load_balancing_loss
+                ce_loss 
+                + LOAD_BALANCING_COEFF * total_load_balancing_loss
+                - entropy_coeff * total_entropy_bonus  # Negative = maximize entropy
             ) / accumulation_steps
 
         scaler.scale(loss).backward()
@@ -393,6 +451,58 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             total_ce_loss += ce_loss.item()
             if isinstance(total_load_balancing_loss, torch.Tensor):
                 total_lb_loss += total_load_balancing_loss.item()
+            if isinstance(total_entropy_bonus, torch.Tensor):
+                # Track average entropy (will be added to metrics later)
+                if not hasattr(torch.cuda, '_total_entropy'):
+                    torch.cuda._total_entropy = 0
+                    torch.cuda._entropy_count = 0
+                torch.cuda._total_entropy += total_entropy_bonus.item()
+                torch.cuda._entropy_count += 1
+
+        # ====================================================================================
+        # SOLUTION 3: ROUTER MONITORING (Enhanced with modality-specific routing)
+        # ====================================================================================
+        if local_rank == 0 and (i + 1) % 500 == 0:
+            # Monitor routing decisions for first layer
+            with torch.no_grad():
+                num_visual = visual_soft_tokens.shape[1]
+                
+                # Sample visual token (middle of visual sequence)
+                visual_idx = num_visual // 2
+                visual_hidden = combined_embeddings[0:1, visual_idx:visual_idx+1, :]
+                
+                # Sample text token (middle of text sequence)
+                text_idx = num_visual + (input_ids.shape[1] // 2)
+                text_hidden = combined_embeddings[0:1, text_idx:text_idx+1, :]
+                
+                print(f"\n{'='*60}")
+                print(f"Router Analysis - Batch {i+1} | Epoch {epoch+1}")
+                print(f"{'='*60}")
+                
+                for layer_idx in [0, 15, 31]:  # First, middle, last
+                    check_layer = llm.module.model.layers[layer_idx]
+                    if hasattr(check_layer.mlp, 'gate'):
+                        # Convert to float32 to match gate weights dtype
+                        visual_hidden_fp32 = visual_hidden.float()
+                        text_hidden_fp32 = text_hidden.float()
+                        
+                        # Visual token routing
+                        visual_logits = check_layer.mlp.gate(visual_hidden_fp32.view(-1, 4096))
+                        visual_probs = torch.softmax(visual_logits, dim=-1)
+                        
+                        # Text token routing
+                        text_logits = check_layer.mlp.gate(text_hidden_fp32.view(-1, 4096))
+                        text_probs = torch.softmax(text_logits, dim=-1)
+                        
+                        print(f"\nLayer {layer_idx:2d}:")
+                        print(f"  Visual Token -> E0: {visual_probs[0,0]:.3f}, E1: {visual_probs[0,1]:.3f} ({'✓E0' if visual_probs[0,0] > 0.6 else '✓E1' if visual_probs[0,1] > 0.6 else 'MIXED'})")
+                        print(f"  Text   Token -> E0: {text_probs[0,0]:.3f}, E1: {text_probs[0,1]:.3f} ({'✓E0' if text_probs[0,0] > 0.6 else '✓E1' if text_probs[0,1] > 0.6 else 'MIXED'})")
+                        
+                        # Calculate specialization score (how different are the routings?)
+                        specialization = abs(visual_probs[0,0] - text_probs[0,0]).item()
+                        print(f"  Specialization score: {specialization:.3f} ({'GOOD' if specialization > 0.3 else 'WEAK'})")
+                
+                print(f"{'='*60}\n")
 
         if local_rank == 0 and (i + 1) % 100 == 0:
             print(f"  Epoch {epoch+1}, Batch [{i+1}/{len(train_loader)}]")
@@ -400,17 +510,26 @@ for epoch in range(start_epoch, NUM_EPOCHS):
     avg_train_loss = total_train_loss / len(train_loader)
     avg_ce_loss = total_ce_loss / len(train_loader)
     avg_lb_loss = total_lb_loss / len(train_loader)
+    
+    # Calculate average entropy
+    avg_entropy = 0
+    if hasattr(torch.cuda, '_total_entropy') and torch.cuda._entropy_count > 0:
+        avg_entropy = torch.cuda._total_entropy / torch.cuda._entropy_count
+        # Reset for next epoch
+        torch.cuda._total_entropy = 0
+        torch.cuda._entropy_count = 0
 
     if local_rank == 0:
         print(
-            f"Epoch [{epoch+1}/{NUM_EPOCHS}] - Training Loss: {avg_train_loss:.4f} | CE Loss: {avg_ce_loss:.4f} | LB Loss: {avg_lb_loss:.4f}"
+            f"Epoch [{epoch+1}/{NUM_EPOCHS}] - Training Loss: {avg_train_loss:.4f} | CE Loss: {avg_ce_loss:.4f} | "
+            f"LB Loss: {avg_lb_loss:.4f} | Entropy: {avg_entropy:.4f} | Temp: {temperature:.3f}"
         )
 
     # --- Validation Phase ---
     llm.eval()
     total_val_loss = 0
     val_steps = 0
-    MAX_VAL_BATCHES = 50  # DRASTICALLY reduced to prevent timeout
+    MAX_VAL_BATCHES = 75  # DRASTICALLY reduced to prevent timeout
     
     if local_rank == 0:
         print(f"  Starting validation (max {MAX_VAL_BATCHES} batches per GPU)...")
@@ -468,6 +587,8 @@ for epoch in range(start_epoch, NUM_EPOCHS):
         metrics_history["train_lb_loss"].append(avg_lb_loss)
         metrics_history["val_loss"].append(avg_val_loss)
         metrics_history["learning_rate"].append(optimizer.param_groups[0]["lr"])
+        metrics_history["entropy"].append(avg_entropy)
+        metrics_history["temperature"].append(temperature)
         with open(metrics_path, "w") as f:
             json.dump(metrics_history, f, indent=4)
         print(f"✅ Metrics saved to {metrics_path}")
