@@ -453,28 +453,22 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             )
             logits = outputs.logits
             
-            # Initialize with correct device AND dtype to match the model
+            # Load balancing loss computation (only if coefficient > 0)
+            # CRITICAL: Since LOAD_BALANCING_COEFF=0.0, skip the expensive loop through layers
+            # Accessing llm.module.model.layers can also cause FSDP execution order issues
             total_load_balancing_loss = torch.tensor(0.0, device=DEVICE, dtype=torch.bfloat16)
             
-            for layer in llm.module.model.layers:
-                # Check if the attribute exists and is a tensor
-                if hasattr(layer.mlp, "load_balancing_loss") and isinstance(layer.mlp.load_balancing_loss, torch.Tensor):
-                    # This .to(DEVICE) is a safeguard that forces the tensor to the GPU
-                    total_load_balancing_loss += layer.mlp.load_balancing_loss.to(DEVICE)
+            if LOAD_BALANCING_COEFF > 0:
+                for layer in llm.module.model.layers:
+                    if hasattr(layer.mlp, "load_balancing_loss") and isinstance(layer.mlp.load_balancing_loss, torch.Tensor):
+                        # Use .detach() to avoid retaining computation graph across iterations
+                        total_load_balancing_loss += layer.mlp.load_balancing_loss.detach()
 
             num_visual_tokens = visual_soft_tokens.shape[1]
             text_logits = logits[..., num_visual_tokens:-1, :].contiguous()
             text_labels = input_ids[..., 1:].contiguous()
             
             ce_loss = loss_fn(text_logits.view(-1, llm.config.vocab_size), text_labels.view(-1))
-            
-            if i == 0: # Only print for the first batch to avoid spamming logs
-                print("\n--- DEBUG INFO ---")
-                print(f"  - text_logits device: {text_logits.device}")
-                print(f"  - text_labels device: {text_labels.device}")
-                print(f"  - ce_loss device: {ce_loss.device}")
-                print(f"  - total_load_balancing_loss device: {total_load_balancing_loss.device}")
-                print("--------------------\n")
 
             loss = (ce_loss + LOAD_BALANCING_COEFF * total_load_balancing_loss) / accumulation_steps
 
