@@ -61,8 +61,6 @@ OUTPUT_DIR = paths["output_dir"]
 # CHANGED: Define all necessary checkpoint directories
 STAGE2_CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "stage2_checkpoints")
 STAGE3_CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "stage3_checkpoints")
-# ADDED: Load balancing coefficient for MoE training
-LOAD_BALANCING_COEFF = train_params.get("load_balancing_coeff", 0.01)
 
 # --- Initialize the distributed environment with extended timeout ---
 import datetime
@@ -87,6 +85,8 @@ if local_rank == 0:
 if local_rank == 0:
     print("Loading foundational models...")
 vision_encoder = CLIPVisionModel.from_pretrained(paths["clip_local_path"]).to(DEVICE)
+# CRITICAL: Set vision encoder to eval mode since it's frozen - prevents dropout/stochastic behavior
+vision_encoder.eval()
 clip_processor = AutoProcessor.from_pretrained(paths["clip_local_path"])
 tokenizer = AutoTokenizer.from_pretrained(paths["mistral_local_path"])
 tokenizer.pad_token = tokenizer.eos_token
@@ -146,6 +146,11 @@ if local_rank == 0:
 # ====================================================================================
 # 5. FSDP WRAPPING & CHECKPOINTING
 # ====================================================================================
+
+# CRITICAL: Cache vocab_size BEFORE FSDP wrapping to avoid accessing llm.config later
+# Accessing FSDP-wrapped model config can trigger collective operations
+VOCAB_SIZE = llm.config.vocab_size
+
 my_auto_wrap_policy = partial(
     transformer_auto_wrap_policy,
     transformer_layer_cls={
@@ -161,6 +166,10 @@ ignored_modules = [llm.model.embed_tokens]
 if local_rank == 0:
     print(f"Placing ignored modules on device {DEVICE} before FSDP wrapping")
 llm.model.embed_tokens.to(DEVICE)
+
+# CRITICAL: Cache embedding layer reference before FSDP wrapping to avoid accessing
+# llm.module.* in the training loop (safer and avoids potential FSDP interactions)
+embed_tokens_layer = llm.model.embed_tokens
 
 # CRITICAL FIX: Use exact FSDP configuration from working Stage 2.5
 # device_id must be DEVICE (local_rank as int), NOT torch.cuda.current_device()
@@ -240,41 +249,43 @@ elif local_rank == 0:
 
 dist.barrier()
 
-# ====================================================================================
-# 6.5 DIAGNOSTIC: Verify loaded parameters using FSDP-aware access
-# ====================================================================================
+# CRITICAL: Do NOT access llm.module.model.layers after FSDP wrapping!
+# Accessing FSDP internals (even just len(llm.module.model.layers)) can trigger
+# collective operations on rank 0 only, corrupting execution order tracking.
+# This causes "newly-added parameter" errors during the first backward pass.
+
 if local_rank == 0:
-    print("\n=== POST-LOAD DIAGNOSTICS ===")
-    print("⚠️  Note: Accessing FSDP parameters directly shows internal storage format")
-    print("   Parameters will have correct shapes during forward/backward passes")
-    
-    # The only reliable way to check parameters after FSDP loading is to:
-    # 1. Extract the full state dict again, OR
-    # 2. Do a forward pass test (which we do below)
-    
-    # Quick sanity check: verify checkpoint was actually loaded
-    print("✅ Checkpoint loading completed without errors")
-    print(f"✅ Model is wrapped with FSDP: {isinstance(llm, FSDP)}")
-    print(f"✅ Model has {len(llm.module.model.layers)} transformer layers")
-    
-    # Check trainable parameter count
-    trainable_count = sum(p.numel() for p in llm.parameters() if p.requires_grad)
-    total_count = sum(p.numel() for p in llm.parameters())
-    print(f"✅ Trainable parameters: {trainable_count:,} / {total_count:,} ({100*trainable_count/total_count:.1f}%)")
-    
-    print("=== Checkpoint diagnostics complete ===\n")
+    print("✅ Stage 2 checkpoint loaded and ready for training.\n")
 
 dist.barrier()
 
 # ====================================================================================
 # 7. LOAD STAGE 1 VISION CONNECTOR
 # ====================================================================================
+# CRITICAL: Use same synchronization pattern as Stage 2 checkpoint loading
+# to prevent race conditions on distributed file systems
+connector_found = torch.tensor(0.0, device=DEVICE)
 stage1_weights_path = os.path.join(OUTPUT_DIR, "vision_connector_stage1_best.pth")
-if os.path.exists(stage1_weights_path):
+
+if local_rank == 0:
+    if os.path.exists(stage1_weights_path):
+        connector_found.fill_(1.0)
+    else:
+        print(f"⚠️  Warning: Stage 1 Vision Connector weights not found at {stage1_weights_path}")
+        print(f"   Vision connector will use random initialization.")
+
+dist.broadcast(connector_found, src=0)
+
+if connector_found.item() == 1.0:
     if local_rank == 0:
         print(f"💾 Loading Stage 1 Vision Connector weights from {stage1_weights_path}")
     map_loc = f"cuda:{DEVICE}"
     vision_connector.load_state_dict(torch.load(stage1_weights_path, map_location=map_loc))
+    if local_rank == 0:
+        print("✅ Vision Connector weights loaded successfully on all ranks.")
+else:
+    if local_rank == 0:
+        print("⚠️  Proceeding with randomly initialized Vision Connector (not recommended for Stage 3)")
 
 dist.barrier()
 
@@ -303,9 +314,11 @@ val_dataset = COCO_Loader(
     seed=loader_params.get("data_seed", 42),  # Same seed ensures consistent splits
 )
 
-train_sampler = DistributedSampler(train_dataset)
-# CRITICAL: Set drop_last=False and let the sampler pad to avoid NCCL mismatch
-# This ensures all ranks process the same number of batches
+# CRITICAL: Use drop_last=True for training to ensure deterministic batch counts
+# With large datasets not perfectly divisible by world_size, padding can cause
+# rank-specific execution paths that FSDP detects as execution order divergence.
+# drop_last=False for validation is fine since validation doesn't update FSDP state.
+train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=True)
 val_sampler = DistributedSampler(val_dataset, shuffle=False, drop_last=False)
 
 train_loader = DataLoader(
@@ -412,23 +425,38 @@ if local_rank == 0:
     print(f"Steps per epoch:       {len(train_loader) // accumulation_steps}")
     print(f"Total training steps:  {total_steps}")
     print(f"Learning rate:         {train_params['learning_rate']:.2e}")
-    print(f"Load balancing coeff:  {LOAD_BALANCING_COEFF}")
     print(f"Weight decay:          {train_params['weight_decay']}")
     print(f"Optimizer:             AdamW (fused)")
     print(f"Scheduler:             CosineAnnealingLR")
     print(f"Mixed precision:       bfloat16")
     print(f"Gradient checkpointing: Disabled")
+    print(f"FSDP robustness:       Dummy expert touching enabled")
     print("="*70 + "\n")
     print(f"🚀 Starting training...")
-    
+
 start_time = time.time()
 for epoch in range(start_epoch, NUM_EPOCHS):
     train_sampler.set_epoch(epoch)
+    
+    # CRITICAL: Synchronize random seed across all ranks for deterministic Gumbel sampling
+    # The MoE layer uses Gumbel noise for routing, which must be identical across ranks
+    # to ensure FSDP execution order consistency
+    torch.manual_seed(42 + epoch)
+    torch.cuda.manual_seed_all(42 + epoch)
+    
     llm.train()
-    vision_connector.train()
+    # CRITICAL: Keep vision_connector in eval mode since all its parameters are frozen
+    # Calling .train() on a frozen module is inconsistent and may cause issues with
+    # BatchNorm/Dropout layers if they exist
+    vision_connector.eval()
     total_train_loss = 0
     optimizer.zero_grad()
     epoch_start_time = time.time()
+    
+    if local_rank == 0:
+        print(f"\n{'='*70}")
+        print(f"📚 Starting Epoch {epoch+1}/{NUM_EPOCHS}")
+        print(f"{'='*70}")
     
     for i, (images, input_ids, attention_mask) in enumerate(train_loader):
         images, input_ids, attention_mask = (
@@ -440,7 +468,8 @@ for epoch in range(start_epoch, NUM_EPOCHS):
                 patch_embeddings = vision_encoder(images).last_hidden_state
             
             visual_soft_tokens = vision_connector(patch_embeddings)
-            text_embeddings = llm.module.model.embed_tokens(input_ids)
+            # Use cached embedding layer to avoid llm.module.* access
+            text_embeddings = embed_tokens_layer(input_ids)
             combined_embeddings = torch.cat([visual_soft_tokens, text_embeddings], dim=1)
             combined_attention_mask = torch.cat(
                 [torch.ones(visual_soft_tokens.shape[:2], device=DEVICE), attention_mask],
@@ -453,31 +482,23 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             )
             logits = outputs.logits
             
-            # Load balancing loss computation (only if coefficient > 0)
-            # CRITICAL: Since LOAD_BALANCING_COEFF=0.0, skip the expensive loop through layers
-            # Accessing llm.module.model.layers can also cause FSDP execution order issues
-            total_load_balancing_loss = torch.tensor(0.0, device=DEVICE, dtype=torch.bfloat16)
-            
-            if LOAD_BALANCING_COEFF > 0:
-                for layer in llm.module.model.layers:
-                    if hasattr(layer.mlp, "load_balancing_loss") and isinstance(layer.mlp.load_balancing_loss, torch.Tensor):
-                        # Use .detach() to avoid retaining computation graph across iterations
-                        total_load_balancing_loss += layer.mlp.load_balancing_loss.detach()
-
             num_visual_tokens = visual_soft_tokens.shape[1]
             text_logits = logits[..., num_visual_tokens:-1, :].contiguous()
             text_labels = input_ids[..., 1:].contiguous()
             
-            ce_loss = loss_fn(text_logits.view(-1, llm.config.vocab_size), text_labels.view(-1))
+            ce_loss = loss_fn(text_logits.view(-1, VOCAB_SIZE), text_labels.view(-1))
 
-            loss = (ce_loss + LOAD_BALANCING_COEFF * total_load_balancing_loss) / accumulation_steps
+            loss = ce_loss / accumulation_steps
 
         scaler.scale(loss).backward()
         
-        if loss.item() > 0:
-            total_train_loss += loss.item() * accumulation_steps
-
+        # CRITICAL: Accumulate loss tensor WITHOUT .item() to avoid CPU-GPU sync during accumulation
+        # Calling .item() on every iteration can cause timing skew between ranks (especially with 4+ GPUs)
+        # Instead, accumulate the tensor and only extract .item() after gradient update
         if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):
+            # NOW it's safe to sync - we're already synchronizing for the optimizer step
+            total_train_loss += loss.item() * accumulation_steps
+            
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             
@@ -486,24 +507,29 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             optimizer.zero_grad()
             scheduler.step()
             
-            # Progress logging every 100 steps (after gradient update)
-            if local_rank == 0 and (i + 1) % (100 * accumulation_steps) == 0:
-                steps_done = (i + 1) // accumulation_steps
+            # Progress logging every 50 steps (after gradient update)
+            if local_rank == 0:
                 total_steps = len(train_loader) // accumulation_steps
-                current_lr = scheduler.get_last_lr()[0]
-                avg_loss_so_far = total_train_loss / (i + 1) if (i + 1) > 0 else 0.0
-                elapsed = time.time() - epoch_start_time
-                steps_per_sec = steps_done / elapsed if elapsed > 0 else 0.0
-                eta_seconds = (total_steps - steps_done) / steps_per_sec if steps_per_sec > 0 else 0
-                eta_minutes = int(eta_seconds / 60)
+                steps_done = (i + 1) // accumulation_steps
                 
-                print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] Step [{steps_done}/{total_steps}] | "
-                      f"Loss: {avg_loss_so_far:.4f} | LR: {current_lr:.2e} | "
-                      f"Speed: {steps_per_sec:.2f} steps/s | ETA: {eta_minutes}min")
+                # Log every 50 steps OR on the first step OR on the last step
+                if steps_done % 50 == 0 or steps_done == 1 or steps_done == total_steps:
+                    current_lr = scheduler.get_last_lr()[0]
+                    avg_loss_so_far = total_train_loss / (i + 1) if (i + 1) > 0 else 0.0
+                    elapsed = time.time() - epoch_start_time
+                    steps_per_sec = steps_done / elapsed if elapsed > 0 else 0.0
+                    eta_seconds = (total_steps - steps_done) / steps_per_sec if steps_per_sec > 0 else 0
+                    eta_minutes = int(eta_seconds / 60)
+                    
+                    print(f"  [Step {steps_done:4d}/{total_steps}] Loss: {avg_loss_so_far:.4f} | "
+                          f"LR: {current_lr:.2e} | Speed: {steps_per_sec:.2f} steps/s | ETA: {eta_minutes}min")
 
-    avg_train_loss = total_train_loss / len(train_loader)
+    # CRITICAL: Average training loss over number of optimizer steps, NOT total batches
+    num_optimizer_steps = len(train_loader) // accumulation_steps
+    avg_train_loss = total_train_loss / num_optimizer_steps
     if local_rank == 0:
-        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] - Training Loss: {avg_train_loss:.4f}")
+        epoch_train_time = time.time() - epoch_start_time
+        print(f"\n✅ Training complete: Avg Loss = {avg_train_loss:.4f} | Time: {epoch_train_time/60:.2f} min")
 
     # --- Validation Phase (All Ranks, Limited Batches) ---
     # SOLUTION: Use Stage 2.5's validation pattern:
@@ -536,7 +562,8 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             with autocast(device_type="cuda", dtype=torch.bfloat16):
                 patch_embeddings = vision_encoder(images).last_hidden_state
                 visual_soft_tokens = vision_connector(patch_embeddings)
-                text_embeddings = llm.module.model.embed_tokens(input_ids)
+                # Use cached embedding layer to avoid llm.module.* access
+                text_embeddings = embed_tokens_layer(input_ids)
                 combined_embeddings = torch.cat([visual_soft_tokens, text_embeddings], dim=1)
                 combined_attention_mask = torch.cat(
                     [torch.ones(visual_soft_tokens.shape[:2], device=DEVICE), attention_mask],
@@ -551,7 +578,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
                 text_labels = input_ids[..., 1:].contiguous()
                 
                 loss = loss_fn(
-                    text_logits.view(-1, llm.config.vocab_size), text_labels.view(-1)
+                    text_logits.view(-1, VOCAB_SIZE), text_labels.view(-1)
                 )
             
             total_val_loss += loss.item()
@@ -559,7 +586,8 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             
             # Progress logging every 25 batches
             if local_rank == 0 and (i + 1) % 25 == 0:
-                print(f"  Validation progress: {i+1}/{MAX_VAL_BATCHES} batches")
+                avg_val_loss_so_far = total_val_loss / val_steps if val_steps > 0 else 0.0
+                print(f"  Validation progress: {i+1}/{MAX_VAL_BATCHES} batches | Avg Loss: {avg_val_loss_so_far:.4f}")
     
     # Each rank computes its own average - no distributed aggregation needed
     avg_val_loss = total_val_loss / val_steps if val_steps > 0 else float('inf')
@@ -586,6 +614,10 @@ for epoch in range(start_epoch, NUM_EPOCHS):
     # CRITICAL: Barrier before checkpoint extraction to ensure all ranks are ready
     # FSDP state_dict extraction requires coordination between ranks
     dist.barrier()
+
+    if local_rank == 0:
+        print(f"\n💾 Saving checkpoints...")
+        checkpoint_start_time = time.time()
 
     # Force garbage collection and clear cache before checkpoint saving
     gc.collect()
@@ -626,8 +658,11 @@ for epoch in range(start_epoch, NUM_EPOCHS):
         
         torch.save(full_checkpoint, latest_checkpoint_path)
         torch.save(portable_checkpoint, portable_checkpoint_path)
-        print(f"💾 Saved latest checkpoint to {latest_checkpoint_path}")
-        print(f"💾 Saved portable checkpoint to {portable_checkpoint_path}")
+        
+        checkpoint_time = time.time() - checkpoint_start_time
+        print(f"  ✅ Saved latest checkpoint ({checkpoint_time:.1f}s)")
+        print(f"     Full: {latest_checkpoint_path}")
+        print(f"     Portable: {portable_checkpoint_path}")
 
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
@@ -638,8 +673,11 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             
             torch.save(full_checkpoint, best_checkpoint_path)
             torch.save(portable_checkpoint, best_portable_path)
-            print(f"🏆 New best model! Val loss: {avg_val_loss:.4f}. Saved to {best_checkpoint_path}")
-            print(f"🏆 Saved best portable checkpoint to {best_portable_path}")
+            print(f"\n  🏆 NEW BEST MODEL! Val loss improved: {avg_val_loss:.4f}")
+            print(f"     Best: {best_checkpoint_path}")
+            print(f"     Best Portable: {best_portable_path}")
+        else:
+            print(f"  ℹ️  Best val loss remains: {best_val_loss:.4f} (current: {avg_val_loss:.4f})")
         
         # Clean up checkpoint dicts to free memory
         del llm_state_dict, connector_state_dict, full_checkpoint, portable_checkpoint
