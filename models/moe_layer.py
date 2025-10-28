@@ -16,11 +16,6 @@ class MoELayer(nn.Module):
         # to ensure the model structure is consistent when loading weights.
         self.gate = nn.Linear(self.d_model, self.num_experts, bias=False)
         nn.init.normal_(self.gate.weight, std=0.01)
-
-        # CRITICAL: Register load_balancing_loss as a buffer (not parameter) so FSDP doesn't
-        # think we're adding new parameters during forward passes. This prevents FSDP
-        # execution graph corruption errors after many training steps.
-        self.register_buffer('load_balancing_loss', torch.tensor(0.0))
         
         #I am hard coding this for now
         self.router_dropout = nn.Dropout(0.1) 
@@ -105,18 +100,26 @@ class MoELayer(nn.Module):
         # Initialize a final output tensor of zeros
         final_hidden_states = torch.zeros_like(hidden_states_reshaped)
 
-        # 3. Sparse Dispatch: Compute only the selected expert for each token
+        # 3. Sparse Dispatch with FSDP-safe expert touching
+        # CRITICAL: To maintain FSDP execution order consistency across ranks,
+        # we MUST call every expert on every rank, even if no tokens are routed to it.
+        # When an expert has no tokens, we pass a dummy input to trigger the FSDP
+        # all-gather, then discard the output. This ensures all ranks perform the
+        # same collective operations in the same order.
         for expert_idx, expert in enumerate(self.experts):
             # Find the indices of all tokens that should be routed to this expert
             token_indices = torch.where(router_onehot[:, expert_idx] == 1)[0]
             
-            # If no tokens are routed to this expert, skip it
             if token_indices.numel() > 0:
-                # Select the hidden states for these specific tokens
+                # Normal case: select the hidden states for routed tokens
                 tokens_for_expert = hidden_states_reshaped[token_indices]
                 
-                # Compute the expert's output ONLY for its assigned tokens
+                # Compute the expert's output for its assigned tokens
                 expert_output = expert(tokens_for_expert)
+                
+                # Apply expert dropout if configured (Stage 3 regularization)
+                if hasattr(self, 'expert_dropout') and self.training:
+                    expert_output = self.expert_dropout(expert_output)
                 
                 # Get the weights from the straight-through estimator for these tokens
                 weights_for_expert = router_onehot[token_indices, expert_idx].unsqueeze(-1)
@@ -126,14 +129,17 @@ class MoELayer(nn.Module):
                 
                 # Add the weighted output back to the final tensor at the correct positions
                 final_hidden_states.index_add_(0, token_indices, weighted_output.to(final_hidden_states.dtype))
-
-        # 4. Differentiable Load Balancing Loss
-        tokens_per_expert = torch.mean(router_onehot, dim=0) # Fraction of tokens to each expert
-        avg_prob_per_expert = torch.mean(router_probs, dim=0) # Average router probability
-        # The loss is scaled by the number of experts
-        # CRITICAL: Use .copy_() to update the buffer in-place, NOT reassignment
-        # Reassignment would create a new tensor that FSDP doesn't know about
-        self.load_balancing_loss.copy_(self.num_experts * torch.sum(tokens_per_expert * avg_prob_per_expert))
+            else:
+                # FSDP safety: No tokens routed to this expert on this rank.
+                # CRITICAL: We must still call the expert and connect it to the autograd graph
+                # to ensure backward pass visits this expert on all ranks (FSDP requirement).
+                # Pass a single token through the expert, multiply output by 0.0 (zero contribution),
+                # and add to final output. This forces backward to reduce_scatter gradients (which
+                # will be zero) on all ranks, maintaining identical collective operation sequences.
+                dummy_input = hidden_states_reshaped[:1]  # First token, KEEP gradient
+                dummy_output = expert(dummy_input)
+                # Add zero-weighted contribution to force this expert into backward graph
+                final_hidden_states[:1] += dummy_output.to(final_hidden_states.dtype) * 0.0
 
         # Reshape to the original dimensions and return
         return final_hidden_states.view(batch_size, sequence_length, hidden_dim)
