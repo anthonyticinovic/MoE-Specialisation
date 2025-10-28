@@ -17,7 +17,7 @@ from transformers import (
     CLIPVisionModel,
 )
 from models import VisionLanguageConnector
-from data import COCO_Loader
+from data import COCO_Loader, LLaVA_Loader
 from torch.amp import GradScaler, autocast
 from torch.distributed.fsdp import CPUOffload
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -111,6 +111,37 @@ if local_rank == 0:
 for layer in llm.model.layers:
     if hasattr(layer.mlp, "routing_mode"):
         layer.mlp.routing_mode = 'soft'
+
+# Configure dropout for regularization (Stage 3 only)
+if local_rank == 0:
+    print("Configuring dropout for Stage 3 regularization...")
+
+attention_dropout = train_params.get("attention_dropout", 0.0)
+expert_dropout = train_params.get("expert_dropout", 0.0)
+
+# Enable attention dropout in self-attention layers
+for layer in llm.model.layers:
+    # Mistral uses 'attention_dropout' in self_attn
+    if hasattr(layer.self_attn, 'attention_dropout'):
+        layer.self_attn.attention_dropout = attention_dropout
+    # Some models use 'dropout' attribute
+    if hasattr(layer.self_attn, 'dropout') and isinstance(layer.self_attn.dropout, (int, float)):
+        layer.self_attn.dropout = attention_dropout
+
+# Enable expert dropout in MoE layers
+for layer in llm.model.layers:
+    if hasattr(layer.mlp, 'experts'):
+        # Add expert dropout module if not already present
+        if not hasattr(layer.mlp, 'expert_dropout'):
+            layer.mlp.expert_dropout = nn.Dropout(expert_dropout)
+        else:
+            layer.mlp.expert_dropout.p = expert_dropout
+
+if local_rank == 0:
+    print(f"  ✅ Attention dropout: {attention_dropout}")
+    print(f"  ✅ Expert dropout: {expert_dropout}")
+    print(f"  ✅ Router dropout: 0.1 (pre-configured in MoE layer)")
+
 # ====================================================================================
 # 4. TRAINING SETUP (PART 1 - Parameter Freezing)
 # ====================================================================================
@@ -294,25 +325,57 @@ dist.barrier()
 # ====================================================================================
 if local_rank == 0:
     print("Creating datasets and dataloaders...")
-train_dataset = COCO_Loader(
-    image_dir=paths["image_dir"],
-    annotations_file=paths["annotations_file"],
-    clip_processor=clip_processor,
-    tokenizer=tokenizer,
-    subset_fraction=train_params["subset_fraction"],
-    split="train",
-    seed=loader_params.get("data_seed", 42),  # Fixed seed for reproducibility
-)
-val_dataset = COCO_Loader(
-    image_dir=paths["image_dir"],
-    annotations_file=paths["annotations_file"],
-    clip_processor=clip_processor,
-    tokenizer=tokenizer,
-    subset_fraction=train_params["subset_fraction"],
-    split="val",
-    val_subset_fraction=train_params.get("val_subset_fraction", 0.2),  # Subsample validation to 20% by default
-    seed=loader_params.get("data_seed", 42),  # Same seed ensures consistent splits
-)
+
+# Conditional dataset loading based on config
+dataset_type = train_params.get("dataset", "coco")  # Default to COCO for backward compatibility
+
+if dataset_type == "llava":
+    if local_rank == 0:
+        print("📚 Using LLaVA-Instruct-150K dataset (ALL Q&A pairs, multi-turn)")
+    
+    train_dataset = LLaVA_Loader(
+        annotations_file=paths["llava_annotations_file"],
+        image_dir=paths["llava_image_dir"],
+        clip_processor=clip_processor,
+        tokenizer=tokenizer,
+        split="train",
+        subset_fraction=train_params["subset_fraction"],
+        val_fraction=0.2,  # 80/20 train/val split
+        seed=loader_params.get("data_seed", 42),
+    )
+    val_dataset = LLaVA_Loader(
+        annotations_file=paths["llava_annotations_file"],
+        image_dir=paths["llava_image_dir"],
+        clip_processor=clip_processor,
+        tokenizer=tokenizer,
+        split="val",
+        subset_fraction=train_params.get("val_subset_fraction", 1.0),  # Further subsample val if needed
+        val_fraction=0.2,  # Same 80/20 split
+        seed=loader_params.get("data_seed", 42),
+    )
+else:  # "coco"
+    if local_rank == 0:
+        print("📚 Using COCO captions dataset")
+    
+    train_dataset = COCO_Loader(
+        image_dir=paths["image_dir"],
+        annotations_file=paths["annotations_file"],
+        clip_processor=clip_processor,
+        tokenizer=tokenizer,
+        subset_fraction=train_params["subset_fraction"],
+        split="train",
+        seed=loader_params.get("data_seed", 42),  # Fixed seed for reproducibility
+    )
+    val_dataset = COCO_Loader(
+        image_dir=paths["image_dir"],
+        annotations_file=paths["annotations_file"],
+        clip_processor=clip_processor,
+        tokenizer=tokenizer,
+        subset_fraction=train_params["subset_fraction"],
+        split="val",
+        val_subset_fraction=train_params.get("val_subset_fraction", 0.2),  # Subsample validation to 20% by default
+        seed=loader_params.get("data_seed", 42),  # Same seed ensures consistent splits
+    )
 
 # CRITICAL: Use drop_last=True for training to ensure deterministic batch counts
 # With large datasets not perfectly divisible by world_size, padding can cause
@@ -335,13 +398,22 @@ accumulation_steps = train_params.get("gradient_accumulation_steps", 1)
 # Only include LLM trainable parameters for the optimizer (vision connector is frozen)
 # Filter to only include parameters that require gradients
 trainable_params = [p for p in llm.parameters() if p.requires_grad]
-optimizer = optim.AdamW(trainable_params, lr=train_params["learning_rate"], weight_decay=train_params["weight_decay"], fused=True)
+optimizer = optim.AdamW(trainable_params, lr=train_params["learning_rate"], weight_decay=train_params["weight_decay"], fused=False)
 # CRITICAL: GradScaler is not compatible with bfloat16 (only float16)
 # Since we use bfloat16, we don't need GradScaler (bfloat16 has better numerical stability)
 scaler = GradScaler(enabled=False)  # Disabled for bfloat16
 total_steps = (len(train_loader) // accumulation_steps) * NUM_EPOCHS
 scheduler = CosineAnnealingLR(optimizer, T_max=total_steps)
-loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+
+# Add label smoothing for better generalization
+label_smoothing = train_params.get("label_smoothing", 0.0)
+loss_fn = nn.CrossEntropyLoss(
+    ignore_index=-100,  # Standard ignore index for masked tokens
+    label_smoothing=label_smoothing
+)
+
+if local_rank == 0 and label_smoothing > 0:
+    print(f"  ✅ Label smoothing: {label_smoothing}")
 
 # --- Resumption logic for Stage 3 ---
 start_epoch = 0
@@ -413,9 +485,15 @@ if local_rank == 0 and start_epoch > 0 and os.path.exists(metrics_path):
 # The successful checkpoint loading above is sufficient validation.
 if local_rank == 0:
     world_size = dist.get_world_size()
+    label_smoothing = train_params.get("label_smoothing", 0.0)
+    attention_dropout = train_params.get("attention_dropout", 0.0)
+    expert_dropout = train_params.get("expert_dropout", 0.0)
+    dataset_type = train_params.get("dataset", "coco")
+    
     print("\n" + "="*70)
     print("🚀 STAGE 3 TRAINING CONFIGURATION")
     print("="*70)
+    print(f"Dataset:               {dataset_type.upper()}")
     print(f"Epochs:                {NUM_EPOCHS} (starting from epoch {start_epoch})")
     print(f"Training samples:      {len(train_dataset)}")
     print(f"Validation samples:    {len(val_dataset)}")
@@ -426,6 +504,10 @@ if local_rank == 0:
     print(f"Total training steps:  {total_steps}")
     print(f"Learning rate:         {train_params['learning_rate']:.2e}")
     print(f"Weight decay:          {train_params['weight_decay']}")
+    print(f"Label smoothing:       {label_smoothing}")
+    print(f"Attention dropout:     {attention_dropout}")
+    print(f"Expert dropout:        {expert_dropout}")
+    print(f"Router dropout:        0.1 (pre-configured)")
     print(f"Optimizer:             AdamW (fused)")
     print(f"Scheduler:             CosineAnnealingLR")
     print(f"Mixed precision:       bfloat16")
@@ -458,10 +540,23 @@ for epoch in range(start_epoch, NUM_EPOCHS):
         print(f"📚 Starting Epoch {epoch+1}/{NUM_EPOCHS}")
         print(f"{'='*70}")
     
-    for i, (images, input_ids, attention_mask) in enumerate(train_loader):
-        images, input_ids, attention_mask = (
-            images.to(DEVICE), input_ids.to(DEVICE), attention_mask.to(DEVICE),
-        )
+    for i, batch in enumerate(train_loader):
+        # Unpack batch - LLaVA returns 4 items (images, input_ids, attention_mask, labels)
+        # COCO returns 3 items (images, input_ids, attention_mask) - labels = input_ids shifted
+        if len(batch) == 4:
+            # LLaVA dataset with proper loss masking
+            images, input_ids, attention_mask, labels = batch
+            images, input_ids, attention_mask, labels = (
+                images.to(DEVICE), input_ids.to(DEVICE), attention_mask.to(DEVICE), labels.to(DEVICE)
+            )
+            use_llava_labels = True
+        else:
+            # COCO dataset (backward compatibility)
+            images, input_ids, attention_mask = batch
+            images, input_ids, attention_mask = (
+                images.to(DEVICE), input_ids.to(DEVICE), attention_mask.to(DEVICE),
+            )
+            use_llava_labels = False
 
         with autocast(device_type="cuda", dtype=torch.bfloat16):
             with torch.no_grad():
@@ -483,8 +578,21 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             logits = outputs.logits
             
             num_visual_tokens = visual_soft_tokens.shape[1]
-            text_logits = logits[..., num_visual_tokens:-1, :].contiguous()
-            text_labels = input_ids[..., 1:].contiguous()
+            
+            if use_llava_labels:
+                # LLaVA: Use provided labels with masking
+                # Logits for text portion only (skip visual tokens)
+                text_logits = logits[..., num_visual_tokens:, :].contiguous()
+                # Labels already have question tokens masked with -100
+                text_labels = labels.contiguous()
+                
+                # Shift for next-token prediction: logits[:-1] predicts labels[1:]
+                text_logits = text_logits[..., :-1, :].contiguous()
+                text_labels = text_labels[..., 1:].contiguous()
+            else:
+                # COCO: Original behavior (compute loss on all text)
+                text_logits = logits[..., num_visual_tokens:-1, :].contiguous()
+                text_labels = input_ids[..., 1:].contiguous()
             
             ce_loss = loss_fn(text_logits.view(-1, VOCAB_SIZE), text_labels.view(-1))
 
@@ -541,21 +649,31 @@ for epoch in range(start_epoch, NUM_EPOCHS):
     vision_connector.eval()
     total_val_loss = 0
     val_steps = 0
-    MAX_VAL_BATCHES = 100  # Limited to keep validation fast (~5-10 minutes)
+    MAX_VAL_BATCHES = 300  # Limited to keep validation fast (~5-10 minutes)
     
     if local_rank == 0:
         print(f"\n📊 Running validation (all ranks, max {MAX_VAL_BATCHES} batches per GPU)...")
         val_start_time = time.time()
     
     with torch.no_grad():
-        for i, (images, input_ids, attention_mask) in enumerate(val_loader):
+        for i, batch in enumerate(val_loader):
             # Early stop after MAX_VAL_BATCHES to keep validation fast
             if i >= MAX_VAL_BATCHES:
                 break
-                
-            images, input_ids, attention_mask = (
-                images.to(DEVICE), input_ids.to(DEVICE), attention_mask.to(DEVICE),
-            )
+            
+            # Unpack batch (handle both LLaVA and COCO formats)
+            if len(batch) == 4:
+                images, input_ids, attention_mask, labels = batch
+                images, input_ids, attention_mask, labels = (
+                    images.to(DEVICE), input_ids.to(DEVICE), attention_mask.to(DEVICE), labels.to(DEVICE)
+                )
+                use_llava_labels = True
+            else:
+                images, input_ids, attention_mask = batch
+                images, input_ids, attention_mask = (
+                    images.to(DEVICE), input_ids.to(DEVICE), attention_mask.to(DEVICE),
+                )
+                use_llava_labels = False
             
             # CRITICAL: Don't use try-except with break - it can cause ranks to diverge
             # Instead, just skip failed batches but continue the loop
@@ -574,8 +692,18 @@ for epoch in range(start_epoch, NUM_EPOCHS):
                 )
                 logits = outputs.logits
                 num_visual_tokens = visual_soft_tokens.shape[1]
-                text_logits = logits[..., num_visual_tokens:-1, :].contiguous()
-                text_labels = input_ids[..., 1:].contiguous()
+                
+                if use_llava_labels:
+                    # LLaVA: Use provided labels with masking
+                    text_logits = logits[..., num_visual_tokens:, :].contiguous()
+                    text_labels = labels.contiguous()
+                    # Shift for next-token prediction
+                    text_logits = text_logits[..., :-1, :].contiguous()
+                    text_labels = text_labels[..., 1:].contiguous()
+                else:
+                    # COCO: Original behavior
+                    text_logits = logits[..., num_visual_tokens:-1, :].contiguous()
+                    text_labels = input_ids[..., 1:].contiguous()
                 
                 loss = loss_fn(
                     text_logits.view(-1, VOCAB_SIZE), text_labels.view(-1)

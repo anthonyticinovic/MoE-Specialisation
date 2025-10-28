@@ -4,8 +4,14 @@
 paths:
   mistral_local_path: "/data/gpfs/projects/COMP90055/aticinovic/models/Mistral-7B-v0.3"
   clip_local_path: "/data/gpfs/projects/COMP90055/aticinovic/models/clip-vit-large-patch14"
+  
+  # COCO dataset paths (used by Stage 1, 2, 2.5, and dense control)
   image_dir: "/data/gpfs/projects/COMP90055/aticinovic/datasets/coco/train2017"
   annotations_file: "/data/gpfs/projects/COMP90055/aticinovic/datasets/coco/annotations/captions_train2017.json"
+  
+  # LLaVA-Instruct-150K dataset paths (used by Stage 3)
+  llava_annotations_file: "/data/gpfs/projects/COMP90055/aticinovic/datasets/llava/instruct_150k/llava_instruct_150k.json"
+  llava_image_dir: "/data/gpfs/projects/COMP90055/aticinovic/datasets/llava/images/train2017"
 
   output_dir: "/data/gpfs/projects/COMP90055/aticinovic/outputs"
 
@@ -37,12 +43,16 @@ training_stage2.5:
 training_stage3:
   num_epochs: 15
   batch_size: 8
-  learning_rate: 0.0002
-  weight_decay: 0.01
-  subset_fraction: 0.05
-  val_subset_fraction: 0.5 
-  gradient_accumulation_steps: 8  
+  learning_rate: 0.0001
+  weight_decay: 0.03
+  subset_fraction: 0.3
+  val_subset_fraction: 0.03
+  gradient_accumulation_steps: 4
   load_balancing_coeff: 0.00
+  attention_dropout: 0.1
+  expert_dropout: 0.1
+  label_smoothing: 0.1
+  dataset: "llava"  # "coco" or "llava"
 
 dense_control:
   num_epochs: 10
@@ -56,6 +66,6 @@ dense_control:
 
 # Dataloader parameters
 dataloader:
-  num_workers: 4
+  num_workers: 2
   num_workers_s1: 4
   data_seed: 42  # Fixed seed for reproducible data splits across all training stages
