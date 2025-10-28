@@ -15,7 +15,9 @@ class MoELayer(nn.Module):
         # The gate is only used for 'soft' routing, but we initialize it
         # to ensure the model structure is consistent when loading weights.
         self.gate = nn.Linear(self.d_model, self.num_experts, bias=False)
-        nn.init.normal_(self.gate.weight, std=0.01)
+        # CRITICAL: Use std=0.02 (not 0.01) to prevent routing collapse
+        # With only 2 experts, small initialization variance causes one expert to dominate
+        nn.init.normal_(self.gate.weight, std=0.05)
         
         #I am hard coding this for now
         self.router_dropout = nn.Dropout(0.1) 
@@ -26,7 +28,7 @@ class MoELayer(nn.Module):
         This ensures the gate has the correct shape and a fresh start.
         """
         self.gate = nn.Linear(self.d_model, self.num_experts, bias=False)
-        nn.init.normal_(self.gate.weight, std=0.02)
+        nn.init.normal_(self.gate.weight, std=0.05)
 
     def forward(self, hidden_states: torch.Tensor, temperature: float = 1.0):
         """
@@ -81,6 +83,10 @@ class MoELayer(nn.Module):
         hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
         router_logits = self.gate(hidden_states_reshaped)
         router_logits = self.router_dropout(router_logits)
+        
+        # Store router logits for optional return (used for metrics collection)
+        # Reshape to [batch_size, sequence_length, num_experts] for consistency
+        self._last_router_logits = router_logits.view(batch_size, sequence_length, self.num_experts)
 
         # 1. Gumbel-Softmax for stochastic, differentiable sampling
         # Gumbel noise is added for exploration during training

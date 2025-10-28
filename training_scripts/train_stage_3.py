@@ -32,6 +32,7 @@ from torch.distributed.fsdp import (
 from torch.utils.data.distributed import DistributedSampler
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from functools import partial
+import numpy as np
 
 # Import your custom MoE classes
 from models.custom_mistral import (
@@ -41,6 +42,177 @@ from models.custom_mistral import (
 )
 
 from transformers.models.mistral.modeling_mistral import MistralMLP
+
+# ====================================================================================
+# EXPERT USAGE TRACKER FOR RESEARCH METRICS
+# ====================================================================================
+class ExpertUsageTracker:
+    """
+    Lightweight tracker for MoE expert utilization and routing patterns.
+    Collects metrics during validation for research analysis.
+    
+    Tracks 4 key metrics:
+    1. Expert Load Distribution: How evenly work is distributed across experts
+    2. Routing Entropy: Uncertainty in routing decisions
+    3. Routing Confidence: Fraction of high-confidence routing decisions
+    4. Visual vs Text Routing: Routing pattern differences by modality
+    """
+    def __init__(self, num_layers=32, num_experts=2, visual_token_end=255):
+        self.num_layers = num_layers
+        self.num_experts = num_experts
+        self.visual_token_end = visual_token_end  # Tokens 0 to visual_token_end are visual
+        
+        # Per-layer accumulators (memory efficient - just sums and counts)
+        self.layer_expert_loads = [np.zeros(num_experts) for _ in range(num_layers)]
+        self.layer_entropies = [[] for _ in range(num_layers)]
+        self.layer_high_conf_counts = [0 for _ in range(num_layers)]
+        self.layer_total_tokens = [0 for _ in range(num_layers)]
+        
+        # Visual vs Text routing (per-layer)
+        self.layer_visual_expert_loads = [np.zeros(num_experts) for _ in range(num_layers)]
+        self.layer_text_expert_loads = [np.zeros(num_experts) for _ in range(num_layers)]
+        self.layer_visual_tokens = [0 for _ in range(num_layers)]
+        self.layer_text_tokens = [0 for _ in range(num_layers)]
+    
+    def update(self, layer_idx, router_probs, token_positions):
+        """
+        Update metrics for a single layer.
+        
+        Args:
+            layer_idx: Layer index (0-31)
+            router_probs: [batch_size, seq_len, num_experts] routing probabilities
+            token_positions: [batch_size, seq_len] absolute token positions in sequence
+        """
+        # Flatten to [total_tokens, num_experts]
+        probs = router_probs.reshape(-1, self.num_experts)
+        positions = token_positions.reshape(-1)
+        
+        # 1. Expert Load Distribution (how much work each expert gets)
+        expert_loads = probs.sum(dim=0).cpu().numpy()  # [num_experts]
+        self.layer_expert_loads[layer_idx] += expert_loads
+        
+        # 2. Routing Entropy (uncertainty in routing decisions)
+        # H = -sum(p * log(p)) for each token, then average
+        eps = 1e-10
+        token_entropies = -(probs * torch.log(probs + eps)).sum(dim=1)  # [total_tokens]
+        self.layer_entropies[layer_idx].extend(token_entropies.cpu().numpy().tolist())
+        
+        # 3. Routing Confidence (fraction with prob > 0.7 for any expert)
+        max_probs = probs.max(dim=1)[0]  # [total_tokens]
+        high_conf = (max_probs > 0.7).sum().item()
+        self.layer_high_conf_counts[layer_idx] += high_conf
+        self.layer_total_tokens[layer_idx] += probs.shape[0]
+        
+        # 4. Visual vs Text Routing
+        visual_mask = positions <= self.visual_token_end
+        text_mask = positions > self.visual_token_end
+        
+        if visual_mask.any():
+            visual_loads = probs[visual_mask].sum(dim=0).cpu().numpy()
+            self.layer_visual_expert_loads[layer_idx] += visual_loads
+            self.layer_visual_tokens[layer_idx] += visual_mask.sum().item()
+        
+        if text_mask.any():
+            text_loads = probs[text_mask].sum(dim=0).cpu().numpy()
+            self.layer_text_expert_loads[layer_idx] += text_loads
+            self.layer_text_tokens[layer_idx] += text_mask.sum().item()
+    
+    def compute_metrics(self):
+        """
+        Compute final metrics from accumulated data.
+        Returns dict with per-layer and aggregate metrics.
+        """
+        metrics = {
+            "per_layer": [],
+            "aggregate": {}
+        }
+        
+        # Compute per-layer metrics
+        for layer_idx in range(self.num_layers):
+            layer_metrics = {
+                "layer": layer_idx,
+                "expert_load_distribution": {},
+                "avg_routing_entropy": 0.0,
+                "high_confidence_fraction": 0.0,
+                "visual_vs_text_routing": {}
+            }
+            
+            # 1. Expert Load Distribution (normalize to percentages)
+            total_load = self.layer_expert_loads[layer_idx].sum()
+            if total_load > 0:
+                load_pcts = (self.layer_expert_loads[layer_idx] / total_load * 100).tolist()
+                layer_metrics["expert_load_distribution"] = {
+                    f"expert_{i}": round(pct, 2) for i, pct in enumerate(load_pcts)
+                }
+            
+            # 2. Average Routing Entropy
+            if self.layer_entropies[layer_idx]:
+                layer_metrics["avg_routing_entropy"] = round(
+                    np.mean(self.layer_entropies[layer_idx]), 4
+                )
+            
+            # 3. High Confidence Fraction
+            if self.layer_total_tokens[layer_idx] > 0:
+                layer_metrics["high_confidence_fraction"] = round(
+                    self.layer_high_conf_counts[layer_idx] / self.layer_total_tokens[layer_idx], 4
+                )
+            
+            # 4. Visual vs Text Routing
+            visual_total = self.layer_visual_expert_loads[layer_idx].sum()
+            text_total = self.layer_text_expert_loads[layer_idx].sum()
+            
+            if visual_total > 0:
+                visual_pcts = (self.layer_visual_expert_loads[layer_idx] / visual_total * 100).tolist()
+                layer_metrics["visual_vs_text_routing"]["visual"] = {
+                    f"expert_{i}": round(pct, 2) for i, pct in enumerate(visual_pcts)
+                }
+            
+            if text_total > 0:
+                text_pcts = (self.layer_text_expert_loads[layer_idx] / text_total * 100).tolist()
+                layer_metrics["visual_vs_text_routing"]["text"] = {
+                    f"expert_{i}": round(pct, 2) for i, pct in enumerate(text_pcts)
+                }
+            
+            metrics["per_layer"].append(layer_metrics)
+        
+        # Compute aggregate metrics (average across all layers)
+        all_expert_loads = np.sum(self.layer_expert_loads, axis=0)
+        total_load = all_expert_loads.sum()
+        if total_load > 0:
+            metrics["aggregate"]["expert_load_distribution"] = {
+                f"expert_{i}": round(pct, 2) 
+                for i, pct in enumerate((all_expert_loads / total_load * 100).tolist())
+            }
+        
+        all_entropies = [e for layer in self.layer_entropies for e in layer]
+        if all_entropies:
+            metrics["aggregate"]["avg_routing_entropy"] = round(np.mean(all_entropies), 4)
+        
+        total_high_conf = sum(self.layer_high_conf_counts)
+        total_tokens = sum(self.layer_total_tokens)
+        if total_tokens > 0:
+            metrics["aggregate"]["high_confidence_fraction"] = round(total_high_conf / total_tokens, 4)
+        
+        # Aggregate visual vs text
+        all_visual_loads = np.sum(self.layer_visual_expert_loads, axis=0)
+        all_text_loads = np.sum(self.layer_text_expert_loads, axis=0)
+        
+        visual_total = all_visual_loads.sum()
+        text_total = all_text_loads.sum()
+        
+        if visual_total > 0:
+            metrics["aggregate"]["visual_routing"] = {
+                f"expert_{i}": round(pct, 2)
+                for i, pct in enumerate((all_visual_loads / visual_total * 100).tolist())
+            }
+        
+        if text_total > 0:
+            metrics["aggregate"]["text_routing"] = {
+                f"expert_{i}": round(pct, 2)
+                for i, pct in enumerate((all_text_loads / text_total * 100).tolist())
+            }
+        
+        return metrics
 
 # --- 1. Register Your Custom Architecture ---
 AutoConfig.register("mistral_moe", MistralMoEConfig)
@@ -651,8 +823,14 @@ for epoch in range(start_epoch, NUM_EPOCHS):
     val_steps = 0
     MAX_VAL_BATCHES = 300  # Limited to keep validation fast (~5-10 minutes)
     
+    # Initialize expert usage tracker (rank 0 only for efficiency)
+    expert_tracker = None
     if local_rank == 0:
+        # CLIP ViT-Large/14 produces 257 visual tokens (256 patches + 1 CLS token)
+        # Positions 0-256 are visual, 257+ are text tokens
+        expert_tracker = ExpertUsageTracker(num_layers=32, num_experts=2, visual_token_end=256)
         print(f"\n📊 Running validation (all ranks, max {MAX_VAL_BATCHES} batches per GPU)...")
+        print(f"   📈 Collecting expert utilization metrics for research analysis...")
         val_start_time = time.time()
     
     with torch.no_grad():
@@ -687,11 +865,33 @@ for epoch in range(start_epoch, NUM_EPOCHS):
                     [torch.ones(visual_soft_tokens.shape[:2], device=DEVICE), attention_mask],
                     dim=1,
                 )
+                
+                # Forward pass (router logits are stored in each MoE layer's _last_router_logits)
                 outputs = llm(
                     inputs_embeds=combined_embeddings, attention_mask=combined_attention_mask,
                 )
                 logits = outputs.logits
                 num_visual_tokens = visual_soft_tokens.shape[1]
+                
+                # Collect expert routing metrics (rank 0 only, memory efficient)
+                # Access router logits from MoE layers after forward pass
+                if local_rank == 0 and expert_tracker is not None:
+                    batch_size, seq_len = combined_embeddings.shape[:2]
+                    # Create position indices: [batch_size, seq_len] with values 0 to seq_len-1
+                    positions = torch.arange(seq_len, device=DEVICE).unsqueeze(0).expand(batch_size, -1)
+                    
+                    # Access the unwrapped model to get MoE layers
+                    # For FSDP, the actual model is in llm.module if wrapped, else llm directly
+                    model_to_inspect = llm.module if hasattr(llm, 'module') else llm
+                    
+                    # Iterate through layers and collect router logits
+                    for layer_idx, layer in enumerate(model_to_inspect.model.layers):
+                        if hasattr(layer.mlp, '_last_router_logits'):
+                            router_logits = layer.mlp._last_router_logits
+                            # Convert logits to probabilities
+                            router_probs = torch.softmax(router_logits, dim=-1)
+                            # Update tracker
+                            expert_tracker.update(layer_idx, router_probs, positions)
                 
                 if use_llava_labels:
                     # LLaVA: Use provided labels with masking
@@ -719,6 +919,72 @@ for epoch in range(start_epoch, NUM_EPOCHS):
     
     # Each rank computes its own average - no distributed aggregation needed
     avg_val_loss = total_val_loss / val_steps if val_steps > 0 else float('inf')
+    
+    # Compute and save expert metrics (rank 0 only)
+    if local_rank == 0 and expert_tracker is not None:
+        print(f"\n📊 Computing expert utilization metrics...")
+        expert_metrics = expert_tracker.compute_metrics()
+        
+        # Save to JSON file
+        expert_metrics_dir = os.path.join(OUTPUT_DIR, "expert_metrics")
+        os.makedirs(expert_metrics_dir, exist_ok=True)
+        metrics_filename = f"expert_metrics_epoch_{epoch+1}.json"
+        metrics_filepath = os.path.join(expert_metrics_dir, metrics_filename)
+        
+        with open(metrics_filepath, "w") as f:
+            json.dump(expert_metrics, f, indent=2)
+        
+        print(f"✅ Expert metrics saved to {metrics_filepath}")
+        
+        # Print summary table
+        print(f"\n{'='*70}")
+        print(f"📈 EXPERT UTILIZATION METRICS - Epoch {epoch+1}")
+        print(f"{'='*70}")
+        
+        agg = expert_metrics["aggregate"]
+        
+        # 1. Expert Load Distribution (Aggregate)
+        print(f"\n1️⃣  Expert Load Distribution (Aggregate across all layers):")
+        if "expert_load_distribution" in agg:
+            for expert, pct in agg["expert_load_distribution"].items():
+                print(f"   {expert}: {pct}%")
+        
+        # 2. Routing Entropy (Aggregate)
+        print(f"\n2️⃣  Average Routing Entropy (Aggregate):")
+        if "avg_routing_entropy" in agg:
+            print(f"   {agg['avg_routing_entropy']:.4f} (lower = more decisive routing)")
+        
+        # 3. Routing Confidence (Aggregate)
+        print(f"\n3️⃣  High Confidence Routing Fraction (Aggregate):")
+        if "high_confidence_fraction" in agg:
+            print(f"   {agg['high_confidence_fraction']:.2%} of tokens routed with >70% confidence")
+        
+        # 4. Visual vs Text Routing (Aggregate)
+        print(f"\n4️⃣  Visual vs Text Token Routing (Aggregate):")
+        if "visual_routing" in agg:
+            print(f"   Visual Tokens (positions 0-256):")
+            for expert, pct in agg["visual_routing"].items():
+                print(f"      {expert}: {pct}%")
+        if "text_routing" in agg:
+            print(f"   Text Tokens (positions 257+):")
+            for expert, pct in agg["text_routing"].items():
+                print(f"      {expert}: {pct}%")
+        
+        # Sample per-layer metrics (first, middle, last layers)
+        print(f"\n📋 Sample Per-Layer Metrics (Layers 0, 15, 31):")
+        for layer_idx in [0, 15, 31]:
+            layer_metrics = expert_metrics["per_layer"][layer_idx]
+            print(f"\n   Layer {layer_idx}:")
+            print(f"      Expert Load: {layer_metrics['expert_load_distribution']}")
+            print(f"      Entropy: {layer_metrics['avg_routing_entropy']:.4f}")
+            print(f"      High Conf: {layer_metrics['high_confidence_fraction']:.2%}")
+            if "visual" in layer_metrics["visual_vs_text_routing"]:
+                print(f"      Visual: {layer_metrics['visual_vs_text_routing']['visual']}")
+            if "text" in layer_metrics["visual_vs_text_routing"]:
+                print(f"      Text: {layer_metrics['visual_vs_text_routing']['text']}")
+        
+        print(f"\n💡 Full per-layer metrics available in {metrics_filepath}")
+        print(f"{'='*70}\n")
     
     if local_rank == 0:
         val_time = time.time() - val_start_time

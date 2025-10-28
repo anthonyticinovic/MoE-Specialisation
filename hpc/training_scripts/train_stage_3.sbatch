@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=vlm_stage3_training
-#SBATCH -p gpu-a100
-#SBATCH --gres=gpu:2
+#SBATCH --job-name=stage3_llava
+#SBATCH -p gpu-l40s-preempt
+#SBATCH --gres=gpu:4
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=256G
-#SBATCH --time=01:30:00
+#SBATCH --time=60:00:00
 #SBATCH --output=../out_slurm/train_stage_3/train_stage_3_%j.out
 #SBATCH --error=../err_slurm/train_stage_3/train_stage_3_%j.err
 
@@ -48,6 +48,6 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 RANDOM_PORT=$((29500 + RANDOM % 35500))
 echo "Using random port: $RANDOM_PORT"
 
-srun torchrun --nproc_per_node=2 --master_port=$RANDOM_PORT training_scripts/train_stage_3.py
+srun torchrun --nproc_per_node=4 --master_port=$RANDOM_PORT training_scripts/train_stage_3.py
 
 echo "Job finished."
