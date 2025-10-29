@@ -166,21 +166,16 @@ class CrossModalityPurityAnalyzer:
             attn_implementation="eager",  # Required for output_attentions=True
         ).to(self.device)
 
-        # Load Stage 2 expert weights
+        # Load Stage 2 expert weights (for Stage 2 analysis only)
         stage2_path = os.path.join(
             output_dir, "stage2_checkpoints", "llm_stage2_best.pth"
         )
         print(f"  - Loading Stage 2 expert weights from {stage2_path}")
         expert_weights = torch.load(stage2_path, map_location=self.device)
         self.llm.load_state_dict(expert_weights, strict=False)
-
-        # Load Stage 2.5 router weights
-        stage2_5_path = os.path.join(
-            output_dir, "stage2_5_checkpoints", "llm_stage2_5_best.pth"
-        )
-        print(f"  - Loading Stage 2.5 router weights from {stage2_5_path}")
-        router_weights = torch.load(stage2_5_path, map_location=self.device)
-        self.llm.load_state_dict(router_weights, strict=False)
+        
+        # Note: Stage 2.5 router weights not needed
+        # Stage 3 will override with its own learned routers
 
         self.llm.eval()
 
@@ -201,6 +196,51 @@ class CrossModalityPurityAnalyzer:
         self.vision_connector.eval()
 
         print("✅ All models loaded successfully")
+
+    def load_stage3_models(self, checkpoint_path: str, temperature: float = 0.01):
+        """Load Stage 3 models with learned soft routing.
+        
+        Args:
+            checkpoint_path: Path to Stage 3 checkpoint (full or portable version)
+            temperature: Softmax temperature for routing (default: 0.01 for near-deterministic)
+        """
+        print(f"📦 Loading Stage 3 models with learned routing...")
+        
+        # First load base Stage 2 models (experts + connector)
+        self.load_models()
+        
+        # Load Stage 3 checkpoint (contains learned router weights)
+        print(f"  - Loading Stage 3 checkpoint from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        
+        # Check if this is a full checkpoint or portable checkpoint
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            # FULL checkpoint format (with training state and vision connector)
+            print(f"      Detected FULL checkpoint format")
+            self.llm.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            print(f"      ✓ Loaded LLM weights (epoch {checkpoint.get('epoch', 'unknown')})")
+            
+            if 'connector_state_dict' in checkpoint:
+                self.vision_connector.load_state_dict(checkpoint['connector_state_dict'])
+                print(f"      ✓ Loaded vision connector weights (Stage 3 trained)")
+        else:
+            # PORTABLE checkpoint format (direct state_dict, LLM only)
+            print(f"      Detected PORTABLE checkpoint format (state_dict only)")
+            self.llm.load_state_dict(checkpoint, strict=False)
+            print(f"      ✓ Loaded LLM weights (portable format)")
+            print(f"      ⚠️  Note: Vision connector NOT updated (using Stage 1 weights)")
+        
+        # Switch all MoE layers to soft routing mode
+        for layer in self.llm.model.layers:
+            if hasattr(layer.mlp, "routing_mode"):
+                layer.mlp.routing_mode = "soft"
+                layer.mlp.temperature = temperature
+        
+        # Set to eval mode and fix random seed for deterministic routing
+        self.llm.eval()
+        torch.manual_seed(42)
+        
+        print(f"✅ Stage 3 models loaded (soft routing, temperature={temperature})")
 
     def _prepare_vision_input(self, concept: str) -> torch.Tensor:
         """Generate synthetic image or load from file path and convert to visual tokens via vision connector.
@@ -319,6 +359,75 @@ class CrossModalityPurityAnalyzer:
         hidden_state = outputs.hidden_states[target_layer + 1]
 
         return hidden_state
+
+    def _extract_all_layer_states(
+        self, 
+        embeddings: torch.Tensor, 
+        routing_mask: Optional[torch.Tensor] = None
+    ) -> List[torch.Tensor]:
+        """Extract hidden states at ALL layers in one forward pass.
+        
+        Args:
+            embeddings: Input embeddings [batch_size, seq_len, hidden_dim]
+            routing_mask: Optional routing decisions for forced routing mode
+            
+        Returns:
+            List of 33 hidden state tensors: [embedding_output, layer_0, ..., layer_31]
+        """
+        # Set routing mask if forced mode (Stage 2 style)
+        if routing_mask is not None:
+            for layer in self.llm.model.layers:
+                layer.mlp.routing_mask = routing_mask
+        
+        # Single forward pass capturing all layer outputs
+        with torch.no_grad():
+            outputs = self.llm.model(
+                inputs_embeds=embeddings,
+                output_hidden_states=True,
+                return_dict=True
+            )
+        
+        # outputs.hidden_states is a tuple: (embedding_output, layer_0_output, ..., layer_31_output)
+        return list(outputs.hidden_states)
+
+    def _pool_representation(
+        self, 
+        hidden_state: torch.Tensor, 
+        pooling: str, 
+        modality: str
+    ) -> np.ndarray:
+        """Pool hidden state to single representation vector.
+        
+        Args:
+            hidden_state: Hidden state tensor [batch_size, seq_len, hidden_dim]
+            pooling: "cls" or "mean"
+            modality: "vision" or "text"
+            
+        Returns:
+            Pooled representation as numpy array
+        """
+        if modality == "vision":
+            if pooling == "cls":
+                # CLS token (position 0)
+                representation = hidden_state[:, 0, :].squeeze(0)
+            else:  # mean pooling
+                # Average all 257 tokens
+                representation = hidden_state.mean(dim=1).squeeze(0)
+        else:  # text modality
+            seq_len = hidden_state.shape[1]
+            # Always exclude BOS token (position 0)
+            if seq_len == 2:
+                # Single concept token: use position 1 only
+                representation = hidden_state[:, 1, :].squeeze(0)
+            elif seq_len > 2:
+                # Multi-token concept: average positions 1 onwards (excluding BOS)
+                concept_tokens = hidden_state[:, 1:, :]
+                representation = concept_tokens.mean(dim=1).squeeze(0)
+            else:
+                # Edge case: only BOS token
+                representation = hidden_state[:, 0, :].squeeze(0)
+        
+        return representation.cpu().float().numpy()
 
     def analyze_representation(
         self, concept: str, expert: str, layer: int, modality: str, pooling: str = "cls"
@@ -439,6 +548,62 @@ class CrossModalityPurityAnalyzer:
         vision_rep = self.analyze_representation(concept, "vision", layer, "vision", pooling)
         text_rep = self.analyze_representation(concept, "text", layer, "text", pooling)
         return float(np.linalg.norm(vision_rep - text_rep))
+
+    def compute_alignment_curve(
+        self,
+        image_path: str,
+        text: str,
+        pooling: str = "mean",
+        routing_mode: str = "natural"
+    ) -> Dict[int, float]:
+        """Compute cosine similarity at each layer for a concept pair.
+        
+        This method performs a single forward pass per modality and extracts
+        hidden states at all 33 layers (embedding + 32 transformer layers).
+        
+        Args:
+            image_path: Path to image file
+            text: Text concept (e.g., "cat")
+            pooling: "mean" or "cls" pooling strategy
+            routing_mode: "natural" (learned routing) or "forced" (vision→expert_0, text→expert_1)
+            
+        Returns:
+            Dict mapping layer_id (-1 to 31) to cosine similarity
+        """
+        # Prepare inputs
+        vision_embeddings = self._prepare_vision_input(image_path)
+        text_embeddings = self._prepare_text_input(text)
+        
+        # Extract all layer states in one forward pass per modality
+        if routing_mode == "forced":
+            # Stage 2 style: force vision→expert_0, text→expert_1
+            vision_routing = self._force_routing_through_expert(0, 1, vision_embeddings.shape[1])
+            text_routing = self._force_routing_through_expert(1, 1, text_embeddings.shape[1])
+        else:
+            # Stage 3 style: let model route naturally
+            vision_routing = None
+            text_routing = None
+        
+        vision_states = self._extract_all_layer_states(vision_embeddings, vision_routing)
+        text_states = self._extract_all_layer_states(text_embeddings, text_routing)
+        
+        # Compute similarity at each layer
+        similarities = {}
+        for layer_idx, (vis_state, txt_state) in enumerate(zip(vision_states, text_states)):
+            # Pool representations
+            vis_rep = self._pool_representation(vis_state, pooling, modality="vision")
+            txt_rep = self._pool_representation(txt_state, pooling, modality="text")
+            
+            # Cosine similarity
+            cos_sim = np.dot(vis_rep, txt_rep) / (
+                np.linalg.norm(vis_rep) * np.linalg.norm(txt_rep) + 1e-8
+            )
+            
+            # Map layer_idx to actual layer number: 0→-1, 1→0, 2→1, ..., 32→31
+            layer_number = layer_idx - 1
+            similarities[layer_number] = float(cos_sim)
+        
+        return similarities
 
     def compute_purity_matrix(self, concepts: List[str], layer: int, pooling: str = "mean") -> np.ndarray:
         """
@@ -1086,6 +1251,155 @@ class CrossModalityPurityAnalyzer:
         plt.close()
         print(f"  ✓ Saved {filename}")
 
+    def plot_alignment_curves(
+        self,
+        curves: Dict[str, Dict[int, float]],
+        output_dir: str,
+        title_suffix: str = ""
+    ):
+        """Plot layer-by-layer alignment curves for multiple concept pairs.
+        
+        Args:
+            curves: Dict mapping concept_name to {layer: similarity} dict
+            output_dir: Directory to save plot
+            title_suffix: Optional suffix for plot title (e.g., "Stage 3")
+        """
+        plt.figure(figsize=(14, 8))
+        
+        # Plot each concept's alignment curve
+        for concept_name, similarities in curves.items():
+            layers = sorted(similarities.keys())
+            values = [similarities[l] for l in layers]
+            plt.plot(layers, values, marker='o', linewidth=2.5, markersize=8, label=concept_name, alpha=0.8)
+        
+        # Add reference lines
+        plt.axhline(y=0, color='gray', linestyle='--', alpha=0.5, linewidth=1.5)
+        plt.axhline(y=0.5, color='lightgray', linestyle=':', alpha=0.4)
+        plt.axvline(x=-1, color='lightblue', linestyle='--', alpha=0.3, linewidth=1)
+        
+        # Annotations
+        plt.text(-1, plt.ylim()[1] * 0.95, 'Embedding', ha='center', fontsize=9, 
+                bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.3))
+        
+        plt.xlabel("Layer", fontsize=13, fontweight='bold')
+        plt.ylabel("Cosine Similarity (Vision ↔ Text)", fontsize=13, fontweight='bold')
+        
+        title = "Layer-by-Layer Cross-Modal Alignment"
+        if title_suffix:
+            title += f" ({title_suffix})"
+        plt.title(title, fontsize=15, fontweight='bold')
+        
+        plt.legend(loc='best', fontsize=11, framealpha=0.9)
+        plt.grid(True, alpha=0.3)
+        plt.ylim(-0.1, 1.1)
+        plt.tight_layout()
+        
+        output_path = os.path.join(output_dir, "stage3_alignment_curves.png")
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"  ✓ Saved stage3_alignment_curves.png")
+
+    def run_stage3_alignment_analysis(
+        self,
+        config_path: str = "configs/stage3_alignment.json"
+    ) -> Dict:
+        """Run comprehensive Stage 3 layer-by-layer alignment analysis.
+        
+        Args:
+            config_path: Path to Stage 3 alignment config file
+            
+        Returns:
+            Dictionary containing alignment curves and metadata
+        """
+        print("\n" + "=" * 80)
+        print("Stage 3: Layer-by-Layer Cross-Modal Alignment Analysis")
+        print("=" * 80)
+        
+        # Load config
+        print(f"\n📋 Loading config from {config_path}")
+        with open(config_path, 'r') as f:
+            config = json.load(f)["stage3_alignment_analysis"]
+        
+        checkpoint_path = config["checkpoint_path"]
+        temperature = config["temperature"]
+        concept_pairs = config["concept_pairs"]
+        pooling = config["pooling"]
+        routing_mode = config["routing_mode"]
+        output_dir = config["output_dir"]
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        print(f"  ✓ Checkpoint: {checkpoint_path}")
+        print(f"  ✓ Temperature: {temperature}")
+        print(f"  ✓ Pooling: {pooling}")
+        print(f"  ✓ Routing: {routing_mode}")
+        print(f"  ✓ Concepts: {len(concept_pairs)} pairs")
+        
+        # Load Stage 3 models
+        self.load_stage3_models(checkpoint_path, temperature)
+        
+        # Compute alignment curves for each concept pair
+        print(f"\n🔬 Computing alignment curves...")
+        alignment_curves = {}
+        
+        for idx, pair in enumerate(concept_pairs, 1):
+            name = pair["name"]
+            image_path = pair["image_path"]
+            text = pair["text"]
+            
+            print(f"  [{idx}/{len(concept_pairs)}] Processing '{name}' (image: {image_path}, text: '{text}')...", end=" ")
+            
+            try:
+                curve = self.compute_alignment_curve(
+                    image_path=image_path,
+                    text=text,
+                    pooling=pooling,
+                    routing_mode=routing_mode
+                )
+                alignment_curves[name] = curve
+                
+                # Print key layer similarities
+                emb_sim = curve[-1]
+                final_sim = curve[31]
+                print(f"✓ (emb={emb_sim:.3f}, L0={curve[0]:.3f}, L31={final_sim:.3f})")
+                
+            except Exception as e:
+                print(f"✗ Error: {e}")
+                continue
+        
+        # Save results
+        results = {
+            "config": config,
+            "alignment_curves": alignment_curves,
+            "metadata": {
+                "checkpoint": checkpoint_path,
+                "temperature": temperature,
+                "pooling": pooling,
+                "routing_mode": routing_mode,
+                "num_concepts": len(alignment_curves)
+            }
+        }
+        
+        results_path = os.path.join(output_dir, "alignment_curves.json")
+        with open(results_path, 'w') as f:
+            json.dump(results, f, indent=2)
+        print(f"\n💾 Results saved to {results_path}")
+        
+        # Generate visualization
+        print("\n📈 Generating alignment curve plot...")
+        self.plot_alignment_curves(
+            alignment_curves, 
+            output_dir,
+            title_suffix=f"Stage 3, {routing_mode.capitalize()} Routing, {pooling.capitalize()} Pooling"
+        )
+        
+        print("\n" + "=" * 80)
+        print("✅ Stage 3 alignment analysis complete!")
+        print(f"📁 Results saved to: {output_dir}")
+        print("=" * 80)
+        
+        return results
+
     def _visualize_results(self, results: Dict, output_dir: str):
         """Generate visualization plots from analysis results."""
         print("\n📈 Generating visualizations...")
@@ -1210,8 +1524,34 @@ def main():
         action="store_true",
         help="Enable detailed debug output for token extraction and representation analysis",
     )
+    parser.add_argument(
+        "--stage3-alignment",
+        type=str,
+        default=None,
+        metavar="CONFIG_PATH",
+        help="Run Stage 3 layer-by-layer alignment analysis (provide config path, e.g., configs/stage3_alignment.json)",
+    )
 
     args = parser.parse_args()
+
+    # Initialize analyzer
+    print("=" * 80)
+    
+    # Check if running Stage 3 alignment analysis
+    if args.stage3_alignment:
+        print("Stage 3: Layer-by-Layer Alignment Analysis")
+        print("=" * 80)
+        
+        analyzer = CrossModalityPurityAnalyzer(config_path=args.config, device=args.device)
+        results = analyzer.run_stage3_alignment_analysis(config_path=args.stage3_alignment)
+        
+        return  # Exit after Stage 3 analysis
+    
+    # Otherwise run standard Stage 2 purity analysis
+    print("Cross-Modality Purity Analysis")
+    if args.debug:
+        print("🐛 DEBUG MODE ENABLED")
+    print("=" * 80)
 
     # Handle --all-layers flag
     if args.all_layers:
@@ -1221,13 +1561,6 @@ def main():
         )
     else:
         layers = args.layers
-
-    # Initialize analyzer
-    print("=" * 80)
-    print("Cross-Modality Purity Analysis")
-    if args.debug:
-        print("🐛 DEBUG MODE ENABLED")
-    print("=" * 80)
 
     analyzer = CrossModalityPurityAnalyzer(config_path=args.config, device=args.device)
     

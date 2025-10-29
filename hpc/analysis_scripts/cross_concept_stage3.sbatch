@@ -28,7 +28,7 @@ export PYTHONPATH="${PWD}:${PYTHONPATH}"
 
 echo "=== Stage 3 Representation Alignment Analysis ==="
 echo "Mode: Stage 3 (Learned Soft Routing)"
-echo "Checkpoint: llm_stage3_best_portable.pth"
+echo "Checkpoint: llm_stage3_best.pth (FULL checkpoint with vision connector)"
 echo "Temperature: 0.01 (deterministic routing)"
 echo "Image-text pairs: 8 concepts"
 echo "Layers: 31 (final layer)"
@@ -38,7 +38,7 @@ echo ""
 python -u analysis_scripts/cross_concept_similarity_matrix.py \
     --config-file configs/similarity_matrix_stage3.json \
     --mode stage3 \
-    --stage3-checkpoint /data/gpfs/projects/COMP90055/aticinovic/outputs/stage3_checkpoints/llm_stage3_best_portable.pth \
+    --stage3-checkpoint /data/gpfs/projects/COMP90055/aticinovic/outputs/stage3_checkpoints/llm_stage3_best.pth \
     --temperature 0.01 \
     --layers 31 \
     --output-dir results/stage3_alignment/similarity_matrix/ \

@@ -42,7 +42,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import yaml
 
-from cross_modality_purity import CrossModalityPurityAnalyzer
+from analysis_scripts.cross_modality_purity import CrossModalityPurityAnalyzer
 
 
 class CrossConceptSimilarityAnalyzer:
@@ -137,13 +137,22 @@ class CrossConceptSimilarityAnalyzer:
         print(f"   Loading Stage 3 checkpoint: {self.stage3_checkpoint}")
         checkpoint = torch.load(self.stage3_checkpoint, map_location=self.device)
         
-        # Load LLM weights (overwrites Stage 2/2.5 weights)
-        self.base_analyzer.llm.load_state_dict(checkpoint['model_state_dict'], strict=False)
-        print(f"      ✓ Loaded LLM weights (epoch {checkpoint.get('epoch', 'unknown')})")
-        
-        # Load vision connector (overwrites Stage 1 weights)
-        self.base_analyzer.vision_connector.load_state_dict(checkpoint['connector_state_dict'])
-        print(f"      ✓ Loaded vision connector weights")
+        # Check if this is a full checkpoint or portable checkpoint
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            # FULL checkpoint format (with training state)
+            print(f"      Detected FULL checkpoint format")
+            self.base_analyzer.llm.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            print(f"      ✓ Loaded LLM weights (epoch {checkpoint.get('epoch', 'unknown')})")
+            
+            if 'connector_state_dict' in checkpoint:
+                self.base_analyzer.vision_connector.load_state_dict(checkpoint['connector_state_dict'])
+                print(f"      ✓ Loaded vision connector weights")
+        else:
+            # PORTABLE checkpoint format (direct state_dict)
+            print(f"      Detected PORTABLE checkpoint format (state_dict only)")
+            self.base_analyzer.llm.load_state_dict(checkpoint, strict=False)
+            print(f"      ✓ Loaded LLM weights (portable format)")
+            print(f"      ⚠️  Note: Vision connector NOT updated (using Stage 1 weights)")
         
         # Set all MoE layers to soft routing mode (CRITICAL DIFFERENCE from Stage 2)
         print("   Setting MoE layers to soft routing mode...")

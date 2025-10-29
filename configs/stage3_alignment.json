@@ -1,0 +1,47 @@
+{
+  "stage3_alignment_analysis": {
+    "checkpoint_path": "/data/gpfs/projects/COMP90055/aticinovic/outputs/stage3_checkpoints/llm_stage3_best.pth",
+    "temperature": 0.01,
+    "concept_pairs": [
+      {
+        "name": "cat",
+        "image_path": "data/images/cat.jpg",
+        "text": "cat"
+      },
+      {
+        "name": "bus",
+        "image_path": "data/images/bus.jpg",
+        "text": "bus"
+      },
+      {
+        "name": "car",
+        "image_path": "data/images/car.jpg",
+        "text": "car"
+      },
+      {
+        "name": "computer_mouse",
+        "image_path": "data/images/computer_mouse.jpg",
+        "text": "mouse"
+      },
+    {
+        "name": "animal_mouse",
+        "image_path": "data/images/mouse.jpg",
+        "text": "mouse"
+      },
+      {
+        "name": "green_apple",
+        "image_path": "data/images/green_apple.jpg",
+        "text": "apple"
+      },
+      {
+        "name": "stop_sign",
+        "image_path": "data/images/stop_sign.jpg",
+        "text": "stop sign"
+      }
+    ],
+    "layers": "all",
+    "pooling": "mean",
+    "routing_mode": "natural",
+    "output_dir": "results/stage3_alignment"
+  }
+}
