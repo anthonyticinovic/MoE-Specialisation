@@ -89,9 +89,15 @@ class MoELayer(nn.Module):
         self._last_router_logits = router_logits.view(batch_size, sequence_length, self.num_experts)
 
         # 1. Gumbel-Softmax for stochastic, differentiable sampling
-        # Gumbel noise is added for exploration during training
-        gumbels = -torch.empty_like(router_logits).exponential_().log()
-        y = (router_logits + gumbels) / temperature
+        # Gumbel noise is added for exploration during TRAINING only
+        # During eval/inference, use deterministic routing for reproducibility
+        if self.training:
+            gumbels = -torch.empty_like(router_logits).exponential_().log()
+            y = (router_logits + gumbels) / temperature
+        else:
+            # Eval mode: no Gumbel noise for deterministic routing
+            y = router_logits / temperature
+        
         # router_probs contains the "soft" probabilities used for the backward pass
         router_probs = F.softmax(y, dim=-1)
 
