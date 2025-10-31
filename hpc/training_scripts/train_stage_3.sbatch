@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=stage3_llava
-#SBATCH -p gpu-l40s-preempt
+#SBATCH -p gpu-l40s
 #SBATCH --gres=gpu:4
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=256G
-#SBATCH --time=60:00:00
+#SBATCH --time=71:00:00
 #SBATCH --output=../out_slurm/train_stage_3/train_stage_3_%j.out
 #SBATCH --error=../err_slurm/train_stage_3/train_stage_3_%j.err
 

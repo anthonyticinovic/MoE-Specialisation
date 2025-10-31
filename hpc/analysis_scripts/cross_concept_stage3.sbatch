@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=concept_stage3
-#SBATCH -p gpu-a100
+#SBATCH -p gpu-a100-preempt
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -31,7 +31,7 @@ echo "Mode: Stage 3 (Learned Soft Routing)"
 echo "Checkpoint: llm_stage3_best.pth (FULL checkpoint with vision connector)"
 echo "Temperature: 0.01 (deterministic routing)"
 echo "Image-text pairs: 8 concepts"
-echo "Layers: 31 (final layer)"
+echo "Layers: Specified in config file"
 echo ""
 
 # Run Stage 3 cross-concept similarity analysis
@@ -40,7 +40,6 @@ python -u analysis_scripts/cross_concept_similarity_matrix.py \
     --mode stage3 \
     --stage3-checkpoint /data/gpfs/projects/COMP90055/aticinovic/outputs/stage3_checkpoints/llm_stage3_best.pth \
     --temperature 0.01 \
-    --layers 31 \
     --output-dir results/stage3_alignment/similarity_matrix/ \
     --training-config configs/training_config.yaml \
     --device cuda
@@ -48,7 +47,7 @@ python -u analysis_scripts/cross_concept_similarity_matrix.py \
 echo ""
 echo "=== Analysis Complete ==="
 echo "Results saved to: results/stage3_alignment/similarity_matrix/"
-echo "Check for:"
-echo "  - similarity_matrix_layer31.json (raw matrix)"
-echo "  - similarity_matrix_layer31.png (heatmap)"
-echo "  - labels_layer31.json (row/column labels)"
+echo "Check for files for each layer (0, 16, 31):"
+echo "  - similarity_matrix_layerX.json (raw matrix)"
+echo "  - similarity_matrix_layerX.png (heatmap)"
+echo "  - labels_layerX.json (row/column labels)"

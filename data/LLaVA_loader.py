@@ -54,13 +54,30 @@ class LLaVA_Loader(Dataset):
         # Load and process data
         self.data = self._load_data()
         
+        # Calculate pool sizes for informative logging
+        with open(annotations_file, 'r') as f:
+            total_data = len(json.load(f))
+        total_train_pool = int(total_data * (1 - val_fraction))
+        total_val_pool = total_data - total_train_pool
+        
         if split == 'train':
             print(f"Using {len(self.data)} unique samples for training (LLaVA, ALL QA pairs).")
+            print(f"  ({subset_fraction*100:.0f}% of {total_train_pool} total training pool samples)")
         else:
             print(f"Using {len(self.data)} unique samples for validation (LLaVA, ALL QA pairs).")
+            print(f"  ({subset_fraction*100:.0f}% of {total_val_pool} total validation pool samples)")
     
     def _load_data(self) -> List[Dict[str, Any]]:
-        """Load JSON, create train/val split, apply subset fraction."""
+        """
+        Load JSON, create train/val split, apply subset fraction.
+        
+        CRITICAL: Uses "Split First, Subsample Second" approach to prevent validation leakage.
+        This ensures that when subset_fraction is increased for resumed training:
+        1. The train/val split boundary remains fixed (based on full dataset)
+        2. New training data is a superset of old training data
+        3. New validation data is a superset of old validation data
+        4. No validation samples ever appear in training data
+        """
         # Load JSON
         with open(self.annotations_file, 'r') as f:
             all_data = json.load(f)
@@ -68,24 +85,30 @@ class LLaVA_Loader(Dataset):
         # Set random seed for reproducibility
         random.seed(self.seed)
         
-        # Shuffle data with fixed seed
+        # Shuffle FULL dataset with fixed seed (this order is permanent)
         shuffled_data = all_data.copy()
         random.shuffle(shuffled_data)
         
-        # Split into train/val
+        # STEP 1: Split FULL dataset into train/val pools (this split is PERMANENT)
         total_samples = len(shuffled_data)
         val_size = int(total_samples * self.val_fraction)
         train_size = total_samples - val_size
         
-        if self.split == 'train':
-            split_data = shuffled_data[:train_size]
-        else:  # val
-            split_data = shuffled_data[train_size:]
+        train_pool = shuffled_data[:train_size]
+        val_pool = shuffled_data[train_size:]
         
-        # Apply subset fraction
+        # STEP 2: Select which pool to use based on split
+        if self.split == 'train':
+            split_pool = train_pool
+        else:  # val
+            split_pool = val_pool
+        
+        # STEP 3: NOW apply subset fraction to the selected pool (deterministic subsampling)
         if self.subset_fraction < 1.0:
-            subset_size = int(len(split_data) * self.subset_fraction)
-            split_data = split_data[:subset_size]
+            subset_size = int(len(split_pool) * self.subset_fraction)
+            split_data = split_pool[:subset_size]
+        else:
+            split_data = split_pool
         
         # Filter out samples without conversations or images
         valid_data = []

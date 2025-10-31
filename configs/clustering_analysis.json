@@ -1,0 +1,36 @@
+{
+  "checkpoint_path": "/data/gpfs/projects/COMP90055/aticinovic/outputs/stage3_checkpoints/llm_stage3_best.pth",
+  "data": {
+    "source": "coco",
+    "annotations_file": "/data/gpfs/projects/COMP90055/aticinovic/datasets/coco/annotations/captions_train2017.json",
+    "image_dir": "/data/gpfs/projects/COMP90055/aticinovic/datasets/coco/train2017",
+    "concepts": [
+      "person",   
+      "cat",        
+      "car",        
+      "airplane",   
+      "pizza",       
+      "apple",       
+      "chair",     
+      "laptop",      
+      "tree",       
+      "traffic light" 
+    ],
+    "samples_per_concept": 50,
+    "seed": 42
+  },
+  "analysis": {
+    "target_layers": [0, 1, 18, 24, 29],
+    "pooling": "mean",
+    "reduction_method": "tsne",
+    "expert_confidence_threshold": 0.55,
+    "reduction_params": {
+      "n_neighbors": 15,
+      "perplexity": 30
+    }
+  },
+  "output": {
+    "save_dir": "results/clustering_analysis",
+    "save_representations": true
+  }
+}

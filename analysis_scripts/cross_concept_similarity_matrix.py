@@ -20,14 +20,15 @@ Usage:
 
 Config file format (JSON):
     {
-      "image_text_pairs": [
-        {"image": "path/to/image1.jpg", "text": "description one"},
-        {"image": "path/to/image2.jpg", "text": "description two"}
-      ],
-      "layers": [31],
+      "concepts": ["cat", "dog", "car", "bus"],
+      "samples_per_concept": 20,
+      "annotations_file": "/path/to/coco/annotations/captions_train2017.json",
+      "image_dir": "/path/to/coco/train2017",
+      "layers": [0, 16, 31],
       "pooling": "mean",
       "output_dir": "results/similarity_matrix/",
-      "mode": "stage2"  // or "stage3"
+      "mode": "stage2",  // or "stage3"
+      "seed": 42
     }
 """
 
@@ -177,6 +178,84 @@ class CrossConceptSimilarityAnalyzer:
         print(f"      Temperature: {self.temperature} (lower = more deterministic routing)")
         print(f"      Random seed: 42 (for reproducibility)")
         print(f"      Validation loss: {checkpoint.get('val_loss', 'N/A')}")
+    
+    def extract_concept_samples(
+        self,
+        annotations_file: str,
+        concepts: List[str],
+        samples_per_concept: int,
+        seed: int = 42
+    ) -> Dict[str, List[Dict]]:
+        """
+        Extract balanced samples from COCO annotations for specified concepts.
+        
+        Args:
+            annotations_file: Path to COCO annotations JSON
+            concepts: List of concept keywords (e.g., ["cat", "dog", "car"])
+            samples_per_concept: Target number of samples per concept
+            seed: Random seed for reproducibility
+        
+        Returns:
+            Dict mapping concept -> list of sample dicts with keys:
+                - 'image_id': COCO image ID
+                - 'caption': Image caption
+                - 'image_path': Relative path to image file
+        """
+        print(f"\n📚 Extracting concept samples from COCO annotations...")
+        print(f"   Concepts: {concepts}")
+        print(f"   Target: {samples_per_concept} samples per concept")
+        
+        # Load COCO annotations
+        with open(annotations_file, 'r') as f:
+            coco_data = json.load(f)
+        
+        # Build image_id -> image_path mapping
+        image_id_to_path = {}
+        for img in coco_data['images']:
+            image_id_to_path[img['id']] = img['file_name']
+        
+        # Set random seed
+        np.random.seed(seed)
+        
+        # Extract samples for each concept
+        concept_samples = {concept: [] for concept in concepts}
+        
+        for annotation in coco_data['annotations']:
+            caption = annotation['caption'].lower()
+            image_id = annotation['image_id']
+            
+            # Check which concepts appear in this caption
+            matching_concepts = [c for c in concepts if c.lower() in caption.split()]
+            
+            # Skip if multiple specified concepts appear (ambiguous)
+            if len(matching_concepts) > 1:
+                continue
+            
+            # Skip if no concepts match
+            if len(matching_concepts) == 0:
+                continue
+            
+            # Add to the matching concept's sample list
+            concept = matching_concepts[0]
+            if len(concept_samples[concept]) < samples_per_concept:
+                concept_samples[concept].append({
+                    'image_id': image_id,
+                    'caption': annotation['caption'],
+                    'image_path': image_id_to_path[image_id],
+                    'concept': concept
+                })
+        
+        # Print statistics
+        print(f"\n   📊 Extracted samples:")
+        for concept, samples in concept_samples.items():
+            print(f"      {concept}: {len(samples)} samples")
+        
+        # Warn if any concept is under-sampled
+        for concept, samples in concept_samples.items():
+            if len(samples) < samples_per_concept:
+                print(f"   ⚠️  Warning: Only found {len(samples)} samples for '{concept}' (target: {samples_per_concept})")
+        
+        return concept_samples
     
     
     def _extract_representation(
@@ -360,15 +439,21 @@ class CrossConceptSimilarityAnalyzer:
     
     def compute_cross_concept_matrix(
         self,
-        image_text_pairs: List[Dict[str, str]],
+        concept_samples: Dict[str, List[Dict]],
+        image_dir: str,
         layer: int = 31,
         pooling: str = "mean"
     ) -> Tuple[np.ndarray, List[str]]:
         """
-        Compute 2N×2N cross-concept similarity matrix.
+        Compute 2N×2N cross-concept similarity matrix from COCO samples.
+        
+        For N concepts with S samples each, creates a 2N×2N matrix where:
+        - First N rows/cols are average image representations per concept
+        - Last N rows/cols are average text representations per concept
         
         Args:
-            image_text_pairs: List of dicts with "image" (path) and "text" (string) keys
+            concept_samples: Dict mapping concept -> list of sample dicts
+            image_dir: Base directory for COCO images
             layer: Layer to extract representations from (default: 31)
             pooling: Pooling strategy (default: "mean")
         
@@ -378,56 +463,85 @@ class CrossConceptSimilarityAnalyzer:
                 - labels: List of 2N labels for rows/columns
         
         Matrix structure:
-            [img1, img2, ..., imgN, txt1, txt2, ..., txtN]
+            [img:cat, img:dog, ..., txt:cat, txt:dog, ...]
         """
-        N = len(image_text_pairs)
+        N = len(concept_samples)
         print(f"\n🔬 Computing {2*N}×{2*N} similarity matrix at layer {layer}")
         print(f"   Pooling strategy: {pooling}")
-        print(f"   Number of image-text pairs: {N}")
+        print(f"   Number of concepts: {N}")
         
         representations = []
         labels = []
         
-        # Extract image representations (first N entries)
+        # Extract image representations (first N entries) - averaged per concept
         print(f"\n📸 Extracting image representations through vision expert...")
-        for idx, pair in enumerate(image_text_pairs):
-            image_path = pair["image"]
-            image_name = Path(image_path).stem
+        for concept, samples in concept_samples.items():
+            print(f"   Concept: {concept} ({len(samples)} samples)")
             
-            print(f"   [{idx+1}/{N}] Processing image: {image_name}")
+            concept_img_reps = []
             
-            img_rep = self._extract_representation(
-                concept=image_path,
-                expert="vision",
-                layer=layer,
-                modality="vision",
-                pooling=pooling
-            )
+            for idx, sample in enumerate(samples):
+                image_path = os.path.join(image_dir, sample['image_path'])
+                
+                if idx % 10 == 0 and idx > 0:
+                    print(f"      Progress: {idx}/{len(samples)} samples")
+                
+                try:
+                    img_rep = self._extract_representation(
+                        concept=image_path,
+                        expert="vision",
+                        layer=layer,
+                        modality="vision",
+                        pooling=pooling
+                    )
+                    concept_img_reps.append(img_rep)
+                except Exception as e:
+                    print(f"      ⚠️  Error processing {image_path}: {e}")
+                    continue
             
-            representations.append(img_rep)
-            labels.append(f"img:{image_name}")
-            
-            print(f"       ✓ Extracted representation: shape={img_rep.shape}, norm={np.linalg.norm(img_rep):.2f}")
+            # Average representations across samples
+            if len(concept_img_reps) > 0:
+                avg_img_rep = np.mean(np.stack(concept_img_reps), axis=0)
+                representations.append(avg_img_rep)
+                labels.append(f"img:{concept}")
+                print(f"       ✓ Averaged {len(concept_img_reps)} samples: norm={np.linalg.norm(avg_img_rep):.2f}")
+            else:
+                print(f"       ⚠️  No valid samples for {concept}, skipping")
         
-        # Extract text representations (next N entries)
+        # Extract text representations (next N entries) - averaged per concept
         print(f"\n💬 Extracting text representations through text expert...")
-        for idx, pair in enumerate(image_text_pairs):
-            text = pair["text"]
+        for concept, samples in concept_samples.items():
+            print(f"   Concept: {concept} ({len(samples)} samples)")
             
-            print(f"   [{idx+1}/{N}] Processing text: '{text}'")
+            concept_txt_reps = []
             
-            txt_rep = self._extract_representation(
-                concept=text,
-                expert="text",
-                layer=layer,
-                modality="text",
-                pooling=pooling
-            )
+            for idx, sample in enumerate(samples):
+                text = sample['caption']
+                
+                if idx % 10 == 0 and idx > 0:
+                    print(f"      Progress: {idx}/{len(samples)} samples")
+                
+                try:
+                    txt_rep = self._extract_representation(
+                        concept=text,
+                        expert="text",
+                        layer=layer,
+                        modality="text",
+                        pooling=pooling
+                    )
+                    concept_txt_reps.append(txt_rep)
+                except Exception as e:
+                    print(f"      ⚠️  Error processing text '{text}': {e}")
+                    continue
             
-            representations.append(txt_rep)
-            labels.append(f"txt:{text}")
-            
-            print(f"       ✓ Extracted representation: shape={txt_rep.shape}, norm={np.linalg.norm(txt_rep):.2f}")
+            # Average representations across samples
+            if len(concept_txt_reps) > 0:
+                avg_txt_rep = np.mean(np.stack(concept_txt_reps), axis=0)
+                representations.append(avg_txt_rep)
+                labels.append(f"txt:{concept}")
+                print(f"       ✓ Averaged {len(concept_txt_reps)} samples: norm={np.linalg.norm(avg_txt_rep):.2f}")
+            else:
+                print(f"       ⚠️  No valid samples for {concept}, skipping")
         
         # Compute pairwise similarity matrix
         print(f"\n📊 Computing {2*N}×{2*N} cosine similarity matrix...")
@@ -546,19 +660,27 @@ class CrossConceptSimilarityAnalyzer:
     
     def run_analysis(
         self,
-        image_text_pairs: List[Dict[str, str]],
+        concepts: List[str],
+        samples_per_concept: int,
+        annotations_file: str,
+        image_dir: str,
         layers: List[int] = [31],
         pooling: str = "mean",
-        output_dir: str = "results/similarity_matrix/"
+        output_dir: str = "results/similarity_matrix/",
+        seed: int = 42
     ) -> Dict:
         """
-        Run complete similarity matrix analysis for specified layers.
+        Run complete similarity matrix analysis for specified layers using COCO concept sampling.
         
         Args:
-            image_text_pairs: List of image-text pair dicts
+            concepts: List of concept keywords (e.g., ["cat", "dog", "car"])
+            samples_per_concept: Number of samples to extract per concept
+            annotations_file: Path to COCO annotations JSON
+            image_dir: Base directory for COCO images
             layers: List of layer indices to analyze
             pooling: Pooling strategy
             output_dir: Output directory for results
+            seed: Random seed for reproducibility
         
         Returns:
             Dictionary containing results for each layer
@@ -566,36 +688,75 @@ class CrossConceptSimilarityAnalyzer:
         print("=" * 80)
         print("Cross-Concept Similarity Matrix Analysis")
         print("=" * 80)
+        print(f"Concepts: {concepts}")
+        print(f"Samples per concept: {samples_per_concept}")
+        print(f"Layers to analyze: {layers}")
+        print(f"Total layers: {len(layers)}")
+        print("=" * 80)
+        
+        # Extract concept samples once (shared across all layers)
+        concept_samples = self.extract_concept_samples(
+            annotations_file=annotations_file,
+            concepts=concepts,
+            samples_per_concept=samples_per_concept,
+            seed=seed
+        )
         
         results = {}
         
-        for layer in layers:
+        # Process each layer
+        print(f"\n🔍 DEBUG: About to iterate through {len(layers)} layers: {layers}")
+        for layer_idx, layer in enumerate(layers):
             print(f"\n{'='*80}")
-            print(f"LAYER {layer}")
+            print(f"🔍 DEBUG: Starting iteration {layer_idx + 1}/{len(layers)}")
+            print(f"LAYER {layer} ({layer_idx + 1}/{len(layers)})")
             print(f"{'='*80}")
             
-            # Compute similarity matrix
-            matrix, labels = self.compute_cross_concept_matrix(
-                image_text_pairs=image_text_pairs,
-                layer=layer,
-                pooling=pooling
-            )
-            
-            # Save results
-            print(f"\n💾 Saving results...")
-            self.save_results(matrix, labels, output_dir, layer)
-            
-            # Visualize
-            print(f"\n📈 Generating visualization...")
-            self.visualize_matrix(matrix, labels, output_dir, layer)
-            
-            results[f"layer_{layer}"] = {
-                "matrix": matrix,
-                "labels": labels
-            }
+            try:
+                # Compute similarity matrix
+                print(f"\n🔄 Starting matrix computation for layer {layer}...")
+                print(f"🔍 DEBUG: Calling compute_cross_concept_matrix with layer={layer}")
+                matrix, labels = self.compute_cross_concept_matrix(
+                    concept_samples=concept_samples,
+                    image_dir=image_dir,
+                    layer=layer,
+                    pooling=pooling
+                )
+                print(f"✓ Matrix computation complete for layer {layer}")
+                print(f"🔍 DEBUG: Matrix shape: {matrix.shape}, Labels count: {len(labels)}")
+                
+                # Save results
+                print(f"\n💾 Saving results for layer {layer}...")
+                print(f"🔍 DEBUG: About to call save_results")
+                self.save_results(matrix, labels, output_dir, layer)
+                print(f"✓ Results saved for layer {layer}")
+                
+                # Visualize
+                print(f"\n📈 Generating visualization for layer {layer}...")
+                print(f"🔍 DEBUG: About to call visualize_matrix")
+                self.visualize_matrix(matrix, labels, output_dir, layer)
+                print(f"✓ Visualization complete for layer {layer}")
+                
+                results[f"layer_{layer}"] = {
+                    "matrix": matrix,
+                    "labels": labels
+                }
+                
+                print(f"\n✅ Layer {layer} processing complete!")
+                print(f"🔍 DEBUG: Finished iteration {layer_idx + 1}/{len(layers)}, moving to next layer")
+                
+            except Exception as e:
+                print(f"\n❌ ERROR processing layer {layer}: {e}")
+                print(f"   Continuing to next layer...")
+                import traceback
+                traceback.print_exc()
+                print(f"🔍 DEBUG: Exception caught, continuing to next layer")
+                continue
+        
+        print(f"\n🔍 DEBUG: Completed all {len(layers)} layer iterations")
         
         print(f"\n{'='*80}")
-        print("✅ Analysis complete!")
+        print(f"✅ Analysis complete! Processed {len(results)}/{len(layers)} layers successfully")
         print(f"📁 Results saved to: {output_dir}")
         print("=" * 80)
         
@@ -615,11 +776,15 @@ def load_config(config_file: str) -> Dict:
     with open(config_file, 'r') as f:
         config = json.load(f)
     
-    # Validate required fields
-    required_fields = ["image_text_pairs"]
+    # Validate required fields for new COCO-based format
+    required_fields = ["concepts", "samples_per_concept", "annotations_file", "image_dir"]
     for field in required_fields:
         if field not in config:
-            raise ValueError(f"Config file missing required field: {field}")
+            raise ValueError(
+                f"Config file missing required field: {field}\n"
+                f"Required fields: {required_fields}\n"
+                f"See SIMILARITY_MATRIX_UPDATES.md for new config format."
+            )
     
     # Set defaults for optional fields
     config.setdefault("layers", [31])
@@ -627,6 +792,7 @@ def load_config(config_file: str) -> Dict:
     config.setdefault("output_dir", "results/similarity_matrix/")
     config.setdefault("mode", "stage2")  # Default to stage2 for backward compatibility
     config.setdefault("temperature", 0.01)  # Low temperature for deterministic routing
+    config.setdefault("seed", 42)  # Random seed for reproducibility
     
     return config
 
@@ -657,12 +823,6 @@ def main():
         "--temperature",
         type=float,
         help="Routing temperature for Stage 3 (lower = more deterministic, default=0.01)"
-    )
-    parser.add_argument(
-        "--layers",
-        nargs="+",
-        type=int,
-        help="Layer indices to analyze (overrides config file)"
     )
     parser.add_argument(
         "--output-dir",
@@ -701,10 +861,6 @@ def main():
         config["temperature"] = args.temperature
         print(f"   ⚠️  Overriding temperature from command line: {args.temperature}")
     
-    if args.layers:
-        config["layers"] = args.layers
-        print(f"   ⚠️  Overriding layers from command line: {args.layers}")
-    
     if args.output_dir:
         config["output_dir"] = args.output_dir
         print(f"   ⚠️  Overriding output directory from command line: {args.output_dir}")
@@ -716,10 +872,13 @@ def main():
     # Print configuration
     print(f"\n📋 Configuration:")
     print(f"   Mode: {config['mode'].upper()}")
-    print(f"   Image-text pairs: {len(config['image_text_pairs'])}")
+    print(f"   Concepts: {config['concepts']}")
+    print(f"   Samples per concept: {config['samples_per_concept']}")
     print(f"   Layers: {config['layers']}")
     print(f"   Pooling: {config['pooling']}")
     print(f"   Output directory: {config['output_dir']}")
+    print(f"   Annotations file: {config['annotations_file']}")
+    print(f"   Image directory: {config['image_dir']}")
     if config["mode"] == "stage3":
         print(f"   Stage 3 checkpoint: {config.get('stage3_checkpoint', 'N/A')}")
         print(f"   Temperature: {config.get('temperature', 0.01)}")
@@ -738,10 +897,14 @@ def main():
     
     # Run analysis
     results = analyzer.run_analysis(
-        image_text_pairs=config["image_text_pairs"],
+        concepts=config["concepts"],
+        samples_per_concept=config["samples_per_concept"],
+        annotations_file=config["annotations_file"],
+        image_dir=config["image_dir"],
         layers=config["layers"],
         pooling=config["pooling"],
-        output_dir=config["output_dir"]
+        output_dir=config["output_dir"],
+        seed=config.get("seed", 42)
     )
 
 

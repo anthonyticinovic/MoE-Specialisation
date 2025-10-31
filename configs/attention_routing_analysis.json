@@ -1,0 +1,21 @@
+{
+  "checkpoint_path": "/data/gpfs/projects/COMP90055/aticinovic/outputs/stage3_checkpoints/llm_stage3_best.pth",
+  "data": {
+    "source": "coco",
+    "annotations_file": "/data/gpfs/projects/COMP90055/aticinovic/datasets/coco/annotations/captions_train2017.json",
+    "image_dir": "/data/gpfs/projects/COMP90055/aticinovic/datasets/coco/train2017",
+    "num_samples": 200,
+    "min_caption_length": 5,
+    "seed": 42
+  },
+  "analysis": {
+    "analyze_all_layers": true,
+    "num_vision_tokens": 257,
+    "exclude_self_attention": true,
+    "analyze_expert_correlation": true,
+    "expert_confidence_threshold": 0.55
+  },
+  "output": {
+    "save_dir": "results/attention_routing_analysis"
+  }
+}

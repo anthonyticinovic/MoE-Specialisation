@@ -13,7 +13,26 @@ Usage:
         --config configs/clustering_analysis.json
     
     # Override config parameters
-    python analysis_scripts/layer_clustering_analysis.py \
+    python analysis_scripts/layer_clu        ax.set_xlabel("Dimension 1", fontsize=12)
+        ax.set_ylabel("Dimension 2", fontsize=12)
+        ax.set_title(f"Layer {layer_idx} - Expert Selection with Routing Confidence", fontsize=14, fontweight='bold')
+        ax.legend(loc='upper left', framealpha=0.9, title="Expert Choice")
+        ax.grid(True, alpha=0.3)
+        
+        # Add colorbar for confidence
+        from matplotlib.colors import Normalize
+        from matplotlib.cm import ScalarMappable
+        # Colorbar is just a reference for the confidence gradient
+        
+        # Create a colormap that goes from white to gray (for visualization reference)
+        # This represents the confidence gradient
+        # Use the actual confidence threshold from the config
+        norm = Normalize(vmin=self.expert_confidence_threshold, vmax=1.0)
+        sm = ScalarMappable(cmap=plt.cm.Greys, norm=norm)
+        sm.set_array([])
+        
+        cbar = plt.colorbar(sm, ax=ax, pad=0.02, aspect=30)
+        cbar.set_label('Routing Confidence', rotation=270, labelpad=20, fontsize=11) \
         --config configs/clustering_analysis.json \
         --layers 31 \
         --reduction-method tsne
@@ -512,12 +531,15 @@ class MoEClusteringAnalyzer(CrossModalityPurityAnalyzer):
             confidences = df.loc[mask, 'routing_confidence'].values
             
             # Modulate color intensity by confidence
-            # Low confidence (0.6) -> lighter, High confidence (1.0) -> full color
+            # Low confidence (threshold) -> lighter, High confidence (1.0) -> full color
             colors = []
+            threshold = self.expert_confidence_threshold
+            conf_range = 1.0 - threshold
+            
             for conf in confidences:
                 # Blend between white (low confidence) and base color (high confidence)
-                # Scale confidence from [0.6, 1.0] to [0.0, 1.0] for better visual range
-                scaled_conf = (conf - 0.6) / 0.4 if conf >= 0.6 else 0.0
+                # Scale confidence from [threshold, 1.0] to [0.0, 1.0] for better visual range
+                scaled_conf = (conf - threshold) / conf_range if conf >= threshold else 0.0
                 scaled_conf = np.clip(scaled_conf, 0.0, 1.0)
                 
                 # Interpolate: (1-scaled_conf)*white + scaled_conf*base_color
@@ -547,7 +569,8 @@ class MoEClusteringAnalyzer(CrossModalityPurityAnalyzer):
         
         # Create a colormap that goes from white to gray (for visualization reference)
         # This represents the confidence gradient
-        norm = Normalize(vmin=0.6, vmax=1.0)
+        # Use the actual confidence threshold from the config
+        norm = Normalize(vmin=self.expert_confidence_threshold, vmax=1.0)
         sm = ScalarMappable(cmap=plt.cm.Greys, norm=norm)
         sm.set_array([])
         

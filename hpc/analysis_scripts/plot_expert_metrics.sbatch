@@ -71,7 +71,7 @@ python analysis_scripts/plot_expert_metrics.py \
     --metrics_dir "$METRICS_DIR" \
     --output_dir "$OUTPUT_DIR" \
     --layers all_layers \
-    --epochs 4
+    --epochs 8
 
 EXIT_CODE=$?
 

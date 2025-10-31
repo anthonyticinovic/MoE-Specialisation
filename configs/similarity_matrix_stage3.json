@@ -2,41 +2,21 @@
   "mode": "stage3",
   "stage3_checkpoint": "/data/gpfs/projects/COMP90055/aticinovic/outputs/stage3_checkpoints/llm_stage3_best.pth",
   "temperature": 0.01,
-  "image_text_pairs": [
-    {
-      "image": "data/images/cat.jpg",
-      "text": "cat"
-    },
-    {
-      "image": "data/images/bus.jpg",
-      "text": "bus"
-    },
-    {
-      "image": "data/images/car.jpg",
-      "text": "car"
-    },
-    {
-      "image": "data/images/computer_mouse.jpg",
-      "text": "mouse"
-    },
-    {
-      "image": "data/images/mouse.jpg",
-      "text": "mouse"
-    },
-    {
-      "image": "data/images/green_apple.jpg",
-      "text": "apple"
-    },
-    {
-      "image": "data/images/red_apple.jpg",
-      "text": "apple"
-    },
-    {
-      "image": "data/images/stop_sign.jpg",
-      "text": "stop sign"
-    }
+  "concepts": [
+    "cat",
+    "dog",
+    "car",
+    "bus",
+    "airplane",
+    "train",
+    "apple",
+    "banana"
   ],
-  "layers": [31],
+  "samples_per_concept": 20,
+  "annotations_file": "/data/gpfs/projects/COMP90055/aticinovic/datasets/coco/annotations/captions_train2017.json",
+  "image_dir": "/data/gpfs/projects/COMP90055/aticinovic/datasets/coco/train2017",
+  "layers": [0, 16, 31],
   "pooling": "mean",
-  "output_dir": "results/stage3_alignment/similarity_matrix/"
+  "output_dir": "results/stage3_alignment/similarity_matrix/",
+  "seed": 42
 }

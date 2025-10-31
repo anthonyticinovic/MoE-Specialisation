@@ -588,20 +588,23 @@ if local_rank == 0 and label_smoothing > 0:
     print(f"  ✅ Label smoothing: {label_smoothing}")
 
 # --- Resumption logic for Stage 3 ---
+# CHANGED: Always use portable checkpoint (model weights only) for clean resumption
+# This allows changing dataset size, learning rate, or GPU count without issues
 start_epoch = 0
 best_val_loss = float('inf')
-latest_checkpoint_path = os.path.join(STAGE3_CHECKPOINT_DIR, "llm_stage3_latest.pth")
+portable_checkpoint_path = os.path.join(STAGE3_CHECKPOINT_DIR, "llm_stage3_latest_portable.pth")
 
-should_resume = 1.0 if local_rank == 0 and os.path.exists(latest_checkpoint_path) else 0.0
+should_resume = 1.0 if local_rank == 0 and os.path.exists(portable_checkpoint_path) else 0.0
 resume_tensor = torch.tensor([should_resume], dtype=torch.float32).to(DEVICE)
 dist.broadcast(resume_tensor, src=0)
 
 if resume_tensor.item() == 1.0:
     if local_rank == 0:
-        print(f"💾 Resuming Stage 3 training from latest checkpoint: {latest_checkpoint_path}")
+        print(f"💾 Resuming Stage 3 training from portable checkpoint: {portable_checkpoint_path}")
+        print(f"   (Model weights only - optimizer/scheduler will use fresh config settings)")
 
     # All ranks load the checkpoint
-    checkpoint = torch.load(latest_checkpoint_path, map_location="cpu")
+    checkpoint = torch.load(portable_checkpoint_path, map_location="cpu")
     model_state_dict = checkpoint['model_state_dict']
 
     # Use rank0_only=True for GPU-count agnostic loading
@@ -612,20 +615,18 @@ if resume_tensor.item() == 1.0:
     # Load vision connector (not FSDP-wrapped, so normal load)
     vision_connector.load_state_dict(checkpoint['connector_state_dict'])
     
-    # Try to load optimizer and scheduler, but handle GPU count mismatch gracefully
-    try:
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        if local_rank == 0:
-            print("✅ Loaded optimizer and scheduler state (GPU count matches checkpoint)")
-    except Exception as e:
-        if local_rank == 0:
-            print(f"⚠️  Could not load optimizer/scheduler state (likely GPU count mismatch): {e}")
-            print("   Optimizer and scheduler will start fresh (model weights are preserved)")
-    
-    # Update epoch and best_val_loss from the checkpoint to continue correctly
+    # Update epoch tracking (but optimizer/scheduler start fresh with new config)
     start_epoch = checkpoint['epoch'] + 1
-    best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+    checkpoint_val_loss = checkpoint.get('val_loss', float('inf'))
+    
+    # Don't update best_val_loss - let the new training run establish its own best
+    # This prevents issues if validation set size changed
+    if local_rank == 0:
+        print(f"   📊 Checkpoint was at epoch {checkpoint['epoch']} with val_loss {checkpoint_val_loss:.4f}")
+        print(f"   🔄 Optimizer and scheduler initialized with NEW config:")
+        print(f"      - Learning rate: {train_params['learning_rate']:.2e}")
+        print(f"      - Total steps: {total_steps} (based on current dataset size)")
+        print(f"   ⚠️  Epoch counter continuing from {start_epoch}, but optimizer state is fresh")
 
     del checkpoint
     del model_state_dict
@@ -633,10 +634,10 @@ if resume_tensor.item() == 1.0:
     
     dist.barrier()
     if local_rank == 0:
-        print(f"✅ Resumed successfully. Starting from epoch {start_epoch}.")
+        print(f"✅ Resumed successfully with fresh optimizer. Starting from epoch {start_epoch}.")
 else:
     if local_rank == 0:
-        print("🏁 No 'latest' checkpoint found. Starting training from scratch.")
+        print("🏁 No portable checkpoint found. Starting training from scratch.")
 
 
 if local_rank == 0:
@@ -662,11 +663,17 @@ if local_rank == 0:
     expert_dropout = train_params.get("expert_dropout", 0.0)
     dataset_type = train_params.get("dataset", "coco")
     
+    # Check if we resumed from checkpoint
+    resumed_from_checkpoint = start_epoch > 0
+    
     print("\n" + "="*70)
     print("🚀 STAGE 3 TRAINING CONFIGURATION")
     print("="*70)
     print(f"Dataset:               {dataset_type.upper()}")
     print(f"Epochs:                {NUM_EPOCHS} (starting from epoch {start_epoch})")
+    if resumed_from_checkpoint:
+        print(f"Resume mode:           Portable checkpoint (model weights only)")
+        print(f"                       Optimizer/scheduler: FRESH with new config")
     print(f"Training samples:      {len(train_dataset)}")
     print(f"Validation samples:    {len(val_dataset)}")
     print(f"Batch size per GPU:    {train_params['batch_size']}")
@@ -686,6 +693,9 @@ if local_rank == 0:
     print(f"Gradient checkpointing: Disabled")
     print(f"FSDP robustness:       Dummy expert touching enabled")
     print("="*70 + "\n")
+    if resumed_from_checkpoint:
+        print(f"🔄 Continuing from model checkpoint with FRESH optimizer state")
+        print(f"   This allows dataset/LR changes without compatibility issues\n")
     print(f"🚀 Starting training...")
 
 start_time = time.time()
