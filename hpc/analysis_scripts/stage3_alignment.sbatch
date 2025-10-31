@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=stage3_alignment
-#SBATCH --partition=gpu-a100
+#SBATCH --partition=gpu-a100-preempt
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:1
 #SBATCH --mem=128G
-#SBATCH --time=00:20:00
+#SBATCH --time=00:10:00
 #SBATCH --output=%x_%j.out
 #SBATCH --error=%x_%j.err
 

@@ -549,6 +549,84 @@ class CrossModalityPurityAnalyzer:
         text_rep = self.analyze_representation(concept, "text", layer, "text", pooling)
         return float(np.linalg.norm(vision_rep - text_rep))
 
+    def extract_concept_samples(
+        self,
+        annotations_file: str,
+        concepts: List[str],
+        samples_per_concept: int,
+        seed: int = 42
+    ) -> Dict[str, List[Dict]]:
+        """
+        Extract balanced samples from COCO annotations for specified concepts.
+        
+        Args:
+            annotations_file: Path to COCO annotations JSON
+            concepts: List of concept keywords (e.g., ["cat", "dog", "car"])
+            samples_per_concept: Target number of samples per concept
+            seed: Random seed for reproducibility
+        
+        Returns:
+            Dict mapping concept -> list of sample dicts with keys:
+                - 'image_id': COCO image ID
+                - 'caption': Image caption
+                - 'image_path': Relative path to image file
+        """
+        print(f"📚 Extracting concept samples from COCO annotations...")
+        print(f"   Concepts: {concepts}")
+        print(f"   Target: {samples_per_concept} samples per concept")
+        
+        # Load COCO annotations
+        with open(annotations_file, 'r') as f:
+            coco_data = json.load(f)
+        
+        # Build image_id -> image_path mapping
+        image_id_to_path = {}
+        for img in coco_data['images']:
+            image_id_to_path[img['id']] = img['file_name']
+        
+        # Set random seed
+        np.random.seed(seed)
+        
+        # Extract samples for each concept
+        concept_samples = {concept: [] for concept in concepts}
+        
+        for annotation in coco_data['annotations']:
+            caption = annotation['caption'].lower()
+            image_id = annotation['image_id']
+            
+            # Check which concepts appear in this caption
+            matching_concepts = [c for c in concepts if c.lower() in caption.split()]
+            
+            # Skip if multiple specified concepts appear (ambiguous)
+            if len(matching_concepts) > 1:
+                continue
+            
+            # Skip if no concepts match
+            if len(matching_concepts) == 0:
+                continue
+            
+            # Add to the matching concept's sample list
+            concept = matching_concepts[0]
+            if len(concept_samples[concept]) < samples_per_concept:
+                concept_samples[concept].append({
+                    'image_id': image_id,
+                    'caption': annotation['caption'],
+                    'image_path': image_id_to_path[image_id],
+                    'concept': concept
+                })
+        
+        # Print statistics
+        print(f"\n   📊 Extracted samples:")
+        for concept, samples in concept_samples.items():
+            print(f"      {concept}: {len(samples)} samples")
+        
+        # Warn if any concept is under-sampled
+        for concept, samples in concept_samples.items():
+            if len(samples) < samples_per_concept:
+                print(f"   ⚠️  Warning: Only found {len(samples)} samples for '{concept}' (target: {samples_per_concept})")
+        
+        return concept_samples
+
     def compute_alignment_curve(
         self,
         image_path: str,
@@ -1303,7 +1381,7 @@ class CrossModalityPurityAnalyzer:
         self,
         config_path: str = "configs/stage3_alignment.json"
     ) -> Dict:
-        """Run comprehensive Stage 3 layer-by-layer alignment analysis.
+        """Run comprehensive Stage 3 layer-by-layer alignment analysis using COCO sampling.
         
         Args:
             config_path: Path to Stage 3 alignment config file
@@ -1322,10 +1400,14 @@ class CrossModalityPurityAnalyzer:
         
         checkpoint_path = config["checkpoint_path"]
         temperature = config["temperature"]
-        concept_pairs = config["concept_pairs"]
+        concepts = config["concepts"]
+        samples_per_concept = config["samples_per_concept"]
+        annotations_file = config["annotations_file"]
+        image_dir = config["image_dir"]
         pooling = config["pooling"]
         routing_mode = config["routing_mode"]
         output_dir = config["output_dir"]
+        seed = config.get("seed", 42)
         
         os.makedirs(output_dir, exist_ok=True)
         
@@ -1333,38 +1415,66 @@ class CrossModalityPurityAnalyzer:
         print(f"  ✓ Temperature: {temperature}")
         print(f"  ✓ Pooling: {pooling}")
         print(f"  ✓ Routing: {routing_mode}")
-        print(f"  ✓ Concepts: {len(concept_pairs)} pairs")
+        print(f"  ✓ Concepts: {concepts}")
+        print(f"  ✓ Samples per concept: {samples_per_concept}")
         
         # Load Stage 3 models
         self.load_stage3_models(checkpoint_path, temperature)
         
-        # Compute alignment curves for each concept pair
-        print(f"\n🔬 Computing alignment curves...")
+        # Extract concept samples from COCO
+        concept_samples = self.extract_concept_samples(
+            annotations_file=annotations_file,
+            concepts=concepts,
+            samples_per_concept=samples_per_concept,
+            seed=seed
+        )
+        
+        # Compute alignment curves for each concept
+        print(f"\n🔬 Computing alignment curves (averaging {samples_per_concept} samples per concept)...")
         alignment_curves = {}
         
-        for idx, pair in enumerate(concept_pairs, 1):
-            name = pair["name"]
-            image_path = pair["image_path"]
-            text = pair["text"]
+        for idx, concept in enumerate(concepts, 1):
+            samples = concept_samples[concept]
+            if len(samples) == 0:
+                print(f"  [{idx}/{len(concepts)}] ⚠️  Skipping '{concept}' (no samples found)")
+                continue
             
-            print(f"  [{idx}/{len(concept_pairs)}] Processing '{name}' (image: {image_path}, text: '{text}')...", end=" ")
+            print(f"  [{idx}/{len(concepts)}] Processing '{concept}' ({len(samples)} samples)...", end=" ")
             
             try:
-                curve = self.compute_alignment_curve(
-                    image_path=image_path,
-                    text=text,
-                    pooling=pooling,
-                    routing_mode=routing_mode
-                )
-                alignment_curves[name] = curve
+                # Compute alignment curve for each sample and average
+                sample_curves = []
+                
+                for sample in samples:
+                    image_path = os.path.join(image_dir, sample['image_path'])
+                    text = sample['caption']
+                    
+                    curve = self.compute_alignment_curve(
+                        image_path=image_path,
+                        text=text,
+                        pooling=pooling,
+                        routing_mode=routing_mode
+                    )
+                    sample_curves.append(curve)
+                
+                # Average curves across all samples for this concept
+                # All curves should have same keys (layer indices)
+                avg_curve = {}
+                all_layers = sample_curves[0].keys()
+                for layer in all_layers:
+                    avg_curve[layer] = np.mean([curve[layer] for curve in sample_curves])
+                
+                alignment_curves[concept] = avg_curve
                 
                 # Print key layer similarities
-                emb_sim = curve[-1]
-                final_sim = curve[31]
-                print(f"✓ (emb={emb_sim:.3f}, L0={curve[0]:.3f}, L31={final_sim:.3f})")
+                emb_sim = avg_curve[-1]
+                final_sim = avg_curve[31]
+                print(f"✓ (emb={emb_sim:.3f}, L0={avg_curve[0]:.3f}, L31={final_sim:.3f})")
                 
             except Exception as e:
                 print(f"✗ Error: {e}")
+                import traceback
+                traceback.print_exc()
                 continue
         
         # Save results
@@ -1376,7 +1486,8 @@ class CrossModalityPurityAnalyzer:
                 "temperature": temperature,
                 "pooling": pooling,
                 "routing_mode": routing_mode,
-                "num_concepts": len(alignment_curves)
+                "num_concepts": len(alignment_curves),
+                "samples_per_concept": samples_per_concept
             }
         }
         
@@ -1390,7 +1501,7 @@ class CrossModalityPurityAnalyzer:
         self.plot_alignment_curves(
             alignment_curves, 
             output_dir,
-            title_suffix=f"Stage 3, {routing_mode.capitalize()} Routing, {pooling.capitalize()} Pooling"
+            title_suffix=f"Stage 3, {routing_mode.capitalize()} Routing, {pooling.capitalize()} Pooling, {samples_per_concept} samples/concept"
         )
         
         print("\n" + "=" * 80)
