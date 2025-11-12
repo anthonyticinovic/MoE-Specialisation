@@ -1361,8 +1361,7 @@ class CrossModalityPurityAnalyzer:
         
         plt.xlabel("Layer", fontsize=13, fontweight='bold')
         plt.ylabel("Cosine Similarity (Vision ↔ Text)", fontsize=13, fontweight='bold')
-        
-        title = "Layer-by-Layer Cross-Modal Alignment"
+        title = "Cross-Modal Concept Alignment by Layer"
         if title_suffix:
             title += f" ({title_suffix})"
         plt.title(title, fontsize=15, fontweight='bold')
@@ -1501,7 +1500,7 @@ class CrossModalityPurityAnalyzer:
         self.plot_alignment_curves(
             alignment_curves, 
             output_dir,
-            title_suffix=f"Stage 3, {routing_mode.capitalize()} Routing, {pooling.capitalize()} Pooling, {samples_per_concept} samples/concept"
+            title_suffix=f"Stage 3"
         )
         
         print("\n" + "=" * 80)

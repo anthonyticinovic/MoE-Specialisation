@@ -3,7 +3,7 @@
 #SBATCH --output=../out_slurm/attention_routing/attention_routing_%j.out
 #SBATCH --error=../err_slurm/attention_routing/attention_routing_%j.err
 #SBATCH --time=00:10:00
-#SBATCH --partition=gpu-a100
+#SBATCH --partition=gpu-h100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8

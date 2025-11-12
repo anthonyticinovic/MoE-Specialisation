@@ -1,15 +1,13 @@
 {
   "concepts": [
-    "cat",
-    "dog",
-    "car",
-    "bus",
-    "airplane",
-    "laptop",
-    "apple",
-    "banana"
+    "person",          
+    "dog",           
+    "cat",               
+    "horse",          
+    "elephant",          
+    "bear"
   ],
-  "samples_per_concept": 20,
+  "samples_per_concept": 50,
   "annotations_file": "/data/gpfs/projects/COMP90055/aticinovic/datasets/coco/annotations/captions_train2017.json",
   "image_dir": "/data/gpfs/projects/COMP90055/aticinovic/datasets/coco/train2017",
   "layers": [0, 16, 31],

@@ -53,50 +53,103 @@ def extract_epoch_number(filename):
         return int(match.group(1))
     return None
 
-def plot_expert_load_distribution(all_metrics, output_dir, selected_layers=None):
+def plot_expert_load_distribution(all_metrics, output_dir, selected_layers=None, selected_epochs=None):
     """
     Plot expert load distribution for specific layers across all epochs.
     Shows how work is distributed between expert_0 and expert_1 at selected layers.
-    
+
     Args:
         selected_layers: List of layer indices to plot. If None, plots all layers.
+        selected_epochs: Optional list of epochs to plot. If None, all epochs are used.
     """
-    # Updated signature: add selected_epochs
-def plot_expert_load_distribution(all_metrics, output_dir, selected_layers=None, selected_epochs=None):
     if selected_layers is None:
         selected_layers = [0, 7, 15, 23, 31]
     if selected_epochs is None:
         epochs = sorted(all_metrics.keys())
     else:
         epochs = selected_epochs
+
+    # If only one epoch is requested, draw a compact grouped bar chart with a
+    # small legend that only shows Expert 0 and Expert 1 (not per-epoch entries).
     fig, ax = plt.subplots(figsize=(12, 6))
     x_positions = np.arange(len(selected_layers))
-    width = 0.35 / len(epochs)
-    colors = plt.cm.viridis(np.linspace(0, 1, len(epochs)))
-    for epoch_idx, (epoch, color) in enumerate(zip(epochs, colors)):
+
+    if len(epochs) == 1:
+        epoch = epochs[0]
         metrics = all_metrics[epoch]
         expert_0_loads = []
         expert_1_loads = []
-        
         for layer_idx in selected_layers:
             layer_data = metrics['per_layer'][layer_idx]
             load_dist = layer_data['expert_load_distribution']
             expert_0_loads.append(load_dist.get('expert_0', 0))
             expert_1_loads.append(load_dist.get('expert_1', 0))
-        
-        # Offset bars for each epoch
-        offset = width * (epoch_idx - len(epochs)/2 + 0.5)
-        ax.bar(x_positions + offset, expert_0_loads, width, 
-               label=f'Epoch {epoch} - Expert 0', color=color, alpha=0.7)
-        ax.bar(x_positions + offset, expert_1_loads, width, 
-               label=f'Epoch {epoch} - Expert 1', color=color, alpha=0.4, hatch='//')
+
+        # Overlapping bars: draw Expert 1 (behind) then Expert 0 (front).
+        # Make front bar slightly narrower so the behind bar remains visible.
+        width_back = 0.62
+        width_front = 0.48
+        bar_back = ax.bar(x_positions, expert_1_loads, width_back,
+                          label='Expert 1', color='#ff7f0e', alpha=0.75, hatch='//',
+                          edgecolor='k', linewidth=0.6, zorder=2)
+        bar_front = ax.bar(x_positions, expert_0_loads, width_front,
+                           label='Expert 0', color='#1f77b4', alpha=0.8,
+                           edgecolor='k', linewidth=0.8, zorder=3)
+
+        # Compact, vertically stacked legend for single-epoch view (inside axes)
+        # Use representative patches to ensure compact layout
+        p0 = mpatches.Patch(facecolor='#1f77b4', edgecolor='k', label='Expert 0', alpha=0.8)
+        p1 = mpatches.Patch(facecolor='#ff7f0e', edgecolor='k', hatch='//', label='Expert 1', alpha=0.75)
+        ax.legend(handles=[p0, p1], loc='upper right', bbox_to_anchor=(0.98, 0.95),
+                  ncol=1, fontsize=10, frameon=True, framealpha=0.9, handlelength=1.6,
+                  handletextpad=0.6, borderaxespad=0.5)
+
+    else:
+        # Multi-epoch plotting -- keep behaviour but produce compact deduped legend
+        width = 0.35 / max(1, len(epochs))
+        colors = plt.cm.viridis(np.linspace(0, 1, len(epochs)))
+        handles = []
+        labels = []
+        for epoch_idx, (epoch, color) in enumerate(zip(epochs, colors)):
+            metrics = all_metrics[epoch]
+            expert_0_loads = []
+            expert_1_loads = []
+
+            for layer_idx in selected_layers:
+                layer_data = metrics['per_layer'][layer_idx]
+                load_dist = layer_data['expert_load_distribution']
+                expert_0_loads.append(load_dist.get('expert_0', 0))
+                expert_1_loads.append(load_dist.get('expert_1', 0))
+
+            # Offset bars for each epoch
+            offset = width * (epoch_idx - len(epochs)/2 + 0.5)
+            h0 = ax.bar(x_positions + offset, expert_0_loads, width,
+                        color=color, alpha=0.7)
+            h1 = ax.bar(x_positions + offset, expert_1_loads, width,
+                        color=color, alpha=0.4, hatch='//')
+            # Keep only a single handle per expert to avoid a huge legend
+            if epoch_idx == 0:
+                handles.append(mpatches.Patch(color=color, label='Expert 0', alpha=0.7))
+                handles.append(mpatches.Patch(color=color, label='Expert 1', alpha=0.4))
+
+        # Deduplicate labels and present a compact legend
+        # Use a small font and single column to keep legend compact
+        if handles:
+            # Use vertical stacked legend and only two items (Expert 0 / Expert 1)
+            # Construct two representative patches with standard colours and place
+            # the legend inside the axes (upper-right) as a single column.
+            p0 = mpatches.Patch(color='#1f77b4', label='Expert 0', alpha=0.7)
+            p1 = mpatches.Patch(color='#ff7f0e', label='Expert 1', alpha=0.7, hatch='//')
+            ax.legend(handles=[p0, p1], loc='upper right', bbox_to_anchor=(0.98, 0.95),
+                      ncol=1, fontsize=9, handlelength=1.6, frameon=True, framealpha=0.9)
     
     ax.set_xlabel('Layer')
     ax.set_ylabel('Expert Load (%)')
-    ax.set_title(f'Expert Load Distribution at Selected Layers')
+    ax.set_title(f'Expert Load Distribution Across Layers (Stage 3)')
     ax.set_xticks(x_positions)
     ax.set_xticklabels([f'L{l}' for l in selected_layers], rotation=45, ha='right')
-    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', ncol=2)
+    # Note: legend is created per-branch above (single-epoch or multi-epoch).
+    # Do not call a generic legend() here which would override branch-specific layout.
     ax.set_ylim(0, 100)
     
     plt.tight_layout()
@@ -363,7 +416,7 @@ def plot_aggregate_summary(all_metrics, output_dir):
             ax3.text(i, load + 3, f'{load:.1f}%', ha='center', va='bottom', fontweight='bold', fontsize=11)
         ax3.grid(True, alpha=0.3, axis='y')
     
-    fig.suptitle(f'Aggregate Expert Metrics Summary (Epoch {latest_epoch})', fontsize=16, fontweight='bold')
+    fig.suptitle(f'Aggregate Expert Metrics Summary (Stage 3)', fontsize=16, fontweight='bold')
     plt.tight_layout(rect=[0, 0, 1, 0.96])  # Leave space for suptitle
     plt.savefig(os.path.join(output_dir, 'aggregate_summary.png'))
     plt.close()
@@ -422,6 +475,201 @@ def generate_report(all_metrics, output_dir):
             f.write("\n" + "="*80 + "\n")
     
     print(f"  ✅ Saved: expert_metrics_report.txt")
+
+def plot_modality_specialization_divergence(all_metrics, output_dir, selected_epochs=None):
+    """
+    Plot modality specialization divergence over epochs.
+    Shows |Visual_Expert0% - Text_Expert0%| to quantify how differently
+    experts handle visual vs text tokens.
+    
+    This is THE KEY METRIC for understanding modality-specific specialization.
+    """
+    if selected_epochs is None:
+        epochs = sorted(all_metrics.keys())
+    else:
+        epochs = selected_epochs
+    
+    divergence_values = []
+    
+    for epoch in epochs:
+        metrics = all_metrics[epoch]
+        agg = metrics['aggregate']
+        
+        if 'visual_routing' in agg and 'text_routing' in agg:
+            visual_e0 = agg['visual_routing'].get('expert_0', 50)
+            text_e0 = agg['text_routing'].get('expert_0', 50)
+            divergence = abs(visual_e0 - text_e0)
+            divergence_values.append(divergence)
+        else:
+            divergence_values.append(0)
+    
+    fig, ax = plt.subplots(figsize=(12, 6))
+    
+    ax.plot(epochs, divergence_values, label='Specialization Divergence', 
+            marker='o', linewidth=3, color='#e74c3c', markersize=10)
+    
+    # Add horizontal reference lines
+    ax.axhline(y=30, color='green', linestyle='--', alpha=0.5, linewidth=2, label='Strong Specialization (>30%)')
+    ax.axhline(y=15, color='orange', linestyle='--', alpha=0.5, linewidth=2, label='Moderate Specialization (>15%)')
+    
+    ax.set_xlabel('Epoch', fontsize=12)
+    ax.set_ylabel('Specialization Divergence (%)', fontsize=12)
+    ax.set_title('Modality Specialization Divergence Over Training\n|Visual Expert 0% - Text Expert 0%|', 
+                 fontsize=14, fontweight='bold')
+    ax.legend(loc='best', fontsize=10)
+    ax.set_xticks(epochs)
+    ax.set_ylim(0, max(divergence_values) * 1.1 if divergence_values else 50)
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'specialization_divergence.png'))
+    plt.close()
+    print(f"  ✅ Saved: specialization_divergence.png")
+
+def plot_routing_confidence_evolution(all_metrics, output_dir, selected_epochs=None):
+    """
+    Plot routing entropy evolution over epochs.
+    Shows average routing entropy (lower = more decisive routing).
+    
+    Shows that the model is learning meaningful routing patterns.
+    """
+    if selected_epochs is None:
+        epochs = sorted(all_metrics.keys())
+    else:
+        epochs = selected_epochs
+    
+    entropy_values = []
+    
+    for epoch in epochs:
+        metrics = all_metrics[epoch]
+        agg = metrics['aggregate']
+        
+        entropy_values.append(agg.get('avg_routing_entropy', 0))
+    
+    fig, ax = plt.subplots(figsize=(12, 7))
+    
+    # Routing Entropy plot
+    ax.plot(epochs, entropy_values, label='Routing Entropy', 
+            marker='s', linewidth=3, color='#3498db', markersize=10)
+    ax.set_xlabel('Epoch', fontsize=13)
+    ax.set_ylabel('Average Routing Entropy', fontsize=13)
+    ax.set_title('Routing Entropy Evolution\n(Lower = More Decisive Routing)', 
+                 fontsize=14, fontweight='bold')
+    ax.set_xticks(epochs)
+    ax.set_ylim(0, max(entropy_values) * 1.1 if entropy_values else 1)
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc='best', fontsize=11)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'routing_confidence_evolution.png'))
+    plt.close()
+    print(f"  ✅ Saved: routing_confidence_evolution.png")
+
+def plot_loss_and_specialization(all_metrics, output_dir, metrics_json_path, selected_epochs=None):
+    """
+    Dual-axis plot showing training/validation loss and specialization divergence.
+    
+    THE GOLD PLOT for papers: Shows that specialization emerges during training
+    and correlates with loss improvement.
+    
+    Args:
+        all_metrics: Expert metrics dict
+        output_dir: Output directory
+        metrics_json_path: Path to training_metrics_stage3.json
+        selected_epochs: Optional list of epochs to plot
+    """
+    if selected_epochs is None:
+        epochs = sorted(all_metrics.keys())
+    else:
+        epochs = selected_epochs
+    
+    # Load training metrics
+    if not os.path.exists(metrics_json_path):
+        print(f"  ⚠️  Warning: Training metrics not found at {metrics_json_path}")
+        print(f"     Skipping loss_and_specialization plot")
+        return
+    
+    with open(metrics_json_path, 'r') as f:
+        training_metrics = json.load(f)
+    
+    # Extract loss values for selected epochs
+    train_loss = []
+    val_loss = []
+    divergence_values = []
+    
+    for epoch in epochs:
+        # Find corresponding epoch in training metrics
+        if epoch in training_metrics['epoch']:
+            idx = training_metrics['epoch'].index(epoch)
+            train_loss.append(training_metrics['train_loss'][idx])
+            val_loss.append(training_metrics['val_loss'][idx])
+        else:
+            train_loss.append(None)
+            val_loss.append(None)
+        
+        # Compute specialization divergence
+        metrics = all_metrics[epoch]
+        agg = metrics['aggregate']
+        
+        if 'visual_routing' in agg and 'text_routing' in agg:
+            visual_e0 = agg['visual_routing'].get('expert_0', 50)
+            text_e0 = agg['text_routing'].get('expert_0', 50)
+            divergence = abs(visual_e0 - text_e0)
+            divergence_values.append(divergence)
+        else:
+            divergence_values.append(None)
+    
+    # Filter out None values for plotting
+    valid_epochs = [e for i, e in enumerate(epochs) if train_loss[i] is not None and divergence_values[i] is not None]
+    valid_train_loss = [l for l in train_loss if l is not None]
+    valid_val_loss = [l for l in val_loss if l is not None]
+    valid_divergence = [d for d in divergence_values if d is not None]
+    
+    if not valid_epochs:
+        print(f"  ⚠️  Warning: No valid data for loss_and_specialization plot")
+        return
+    
+    fig, ax1 = plt.subplots(figsize=(14, 7))
+    
+    # Left Y-axis: Loss
+    color_train = '#3498db'
+    color_val = '#e74c3c'
+    ax1.set_xlabel('Epoch', fontsize=13)
+    ax1.set_ylabel('Loss', fontsize=13, color='black')
+    
+    line1 = ax1.plot(valid_epochs, valid_train_loss, label='Training Loss', 
+                     marker='o', linewidth=3, color=color_train, markersize=8)
+    line2 = ax1.plot(valid_epochs, valid_val_loss, label='Validation Loss', 
+                     marker='s', linewidth=3, color=color_val, markersize=8)
+    
+    ax1.tick_params(axis='y', labelcolor='black')
+    ax1.set_xticks(valid_epochs)
+    ax1.grid(True, alpha=0.3, axis='y')
+    
+    # Right Y-axis: Specialization Divergence
+    ax2 = ax1.twinx()
+    color_spec = '#2ecc71'
+    ax2.set_ylabel('Specialization Divergence (%)', fontsize=13, color=color_spec)
+    
+    line3 = ax2.plot(valid_epochs, valid_divergence, label='Specialization Divergence', 
+                     marker='D', linewidth=3, color=color_spec, markersize=8, linestyle='--')
+    
+    ax2.tick_params(axis='y', labelcolor=color_spec)
+    ax2.set_ylim(0, max(valid_divergence) * 1.2 if valid_divergence else 50)
+    
+    # Combined legend
+    lines = line1 + line2 + line3
+    labels = [l.get_label() for l in lines]
+    ax1.legend(lines, labels, loc='upper right', fontsize=11, framealpha=0.95)
+    
+    ax1.set_title('Training Progress: Loss vs Modality Specialization\n' + 
+                  'Does specialization emerge during training?', 
+                  fontsize=14, fontweight='bold', pad=20)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'loss_and_specialization.png'))
+    plt.close()
+    print(f"  ✅ Saved: loss_and_specialization.png")
 
 def main():
     parser = argparse.ArgumentParser(description='Visualize expert utilization metrics from Stage 3 training')
@@ -512,7 +760,20 @@ def main():
     print("\n📈 Generating aggregate summary...")
     plot_aggregate_summary(all_metrics, args.output_dir)
 
-    print("\n📝 Generating text report...")
+    print("\n� Generating KEY RESEARCH PLOTS...")
+    print("   (Modality specialization, routing confidence, loss correlation)")
+    
+    # NEW: Top 3 recommended plots for research analysis
+    plot_modality_specialization_divergence(all_metrics, args.output_dir, selected_epochs)
+    plot_routing_confidence_evolution(all_metrics, args.output_dir, selected_epochs)
+    
+    # Try to find training metrics JSON for the combined loss plot
+    # Look in parent directory of metrics_dir (typically OUTPUT_DIR)
+    metrics_parent = os.path.dirname(args.metrics_dir)
+    training_metrics_path = os.path.join(metrics_parent, "training_metrics_stage3.json")
+    plot_loss_and_specialization(all_metrics, args.output_dir, training_metrics_path, selected_epochs)
+
+    print("\n�📝 Generating text report...")
     generate_report(all_metrics, args.output_dir)
 
     print(f"\n{'='*80}")
@@ -520,13 +781,20 @@ def main():
     print("="*80)
     print(f"\n📁 All plots saved to: {args.output_dir}/")
     print("\nGenerated files:")
-    print("  • expert_load_distribution.png")
-    print("  • routing_entropy.png")
-    print("  • high_confidence_fraction.png")
-    print("  • visual_vs_text_routing.png")
-    print("  • specialization_evolution.png")
-    print("  • aggregate_summary.png")
-    print("  • expert_metrics_report.txt")
+    print("  Per-layer analysis:")
+    print("    • expert_load_distribution.png")
+    print("    • routing_entropy.png")
+    print("    • high_confidence_fraction.png")
+    print("    • visual_vs_text_routing.png")
+    print("\n  Epoch-wise evolution:")
+    print("    • specialization_evolution.png")
+    print("    • aggregate_summary.png")
+    print("\n  🌟 KEY RESEARCH PLOTS:")
+    print("    • specialization_divergence.png        (Modality specialization over time)")
+    print("    • routing_confidence_evolution.png     (Confidence & entropy trends)")
+    print("    • loss_and_specialization.png          (Loss vs specialization dual-axis)")
+    print("\n  Text report:")
+    print("    • expert_metrics_report.txt")
     print()
 
 if __name__ == "__main__":

@@ -36,9 +36,9 @@ echo ""
 
 # Run Stage 3 cross-concept similarity analysis
 python -u analysis_scripts/cross_concept_similarity_matrix.py \
-    --config-file configs/similarity_matrix_stage3.json \
+    --config-file configs/similarity_matrix.json \
     --mode stage3 \
-    --stage3-checkpoint /data/gpfs/projects/COMP90055/aticinovic/outputs/stage3_checkpoints/llm_stage3_best.pth \
+    --stage3-checkpoint /data/gpfs/projects/COMP90055/aticinovic/outputs/stage3_checkpoints/llm_stage3_best_portable.pth \
     --temperature 0.01 \
     --output-dir results/stage3_alignment/similarity_matrix/ \
     --training-config configs/training_config.yaml \

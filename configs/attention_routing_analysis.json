@@ -1,5 +1,5 @@
 {
-  "checkpoint_path": "/data/gpfs/projects/COMP90055/aticinovic/outputs/stage3_checkpoints/llm_stage3_best.pth",
+  "checkpoint_path": "/data/gpfs/projects/COMP90055/aticinovic/outputs/stage3_checkpoints/llm_stage3_best_portable.pth",
   "data": {
     "source": "coco",
     "annotations_file": "/data/gpfs/projects/COMP90055/aticinovic/datasets/coco/annotations/captions_train2017.json",

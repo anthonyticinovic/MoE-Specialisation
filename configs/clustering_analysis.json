@@ -1,5 +1,5 @@
 {
-  "checkpoint_path": "/data/gpfs/projects/COMP90055/aticinovic/outputs/stage3_checkpoints/llm_stage3_best.pth",
+  "checkpoint_path": "/data/gpfs/projects/COMP90055/aticinovic/outputs/stage3_checkpoints/llm_stage3_best_portable.pth",
   "data": {
     "source": "coco",
     "annotations_file": "/data/gpfs/projects/COMP90055/aticinovic/datasets/coco/annotations/captions_train2017.json",
@@ -20,10 +20,10 @@
     "seed": 42
   },
   "analysis": {
-    "target_layers": [0, 1, 18, 24, 29],
+    "target_layers": [0, 1, 29, 30],
     "pooling": "mean",
     "reduction_method": "tsne",
-    "expert_confidence_threshold": 0.55,
+    "expert_confidence_threshold": 0.6,
     "reduction_params": {
       "n_neighbors": 15,
       "perplexity": 30

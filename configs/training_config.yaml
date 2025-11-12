@@ -41,11 +41,11 @@ training_stage2.5:
   load_balancing_coeff: 0.0
 
 training_stage3:
-  num_epochs: 20
+  num_epochs: 25
   batch_size: 2
-  learning_rate: 0.0001  # Bumped from 4.47e-5, but lower than initial 1e-4 (continuing from checkpoint)
+  learning_rate: 0.00005  # Bumped from 4.47e-5, but lower than initial 1e-4 (continuing from checkpoint)
   weight_decay: 0.03
-  subset_fraction: 0.6  # Increased from 0.3 (2x more training data)
+  subset_fraction: 0.5  # Increased from 0.3 (2x more training data)
   val_subset_fraction: 0.5  # Increased from 0.1 (more thorough validation with more data)
   gradient_accumulation_steps: 4
   load_balancing_coeff: 0.00

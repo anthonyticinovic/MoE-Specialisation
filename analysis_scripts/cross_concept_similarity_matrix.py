@@ -63,6 +63,7 @@ class CrossConceptSimilarityAnalyzer:
         config_path: str = "configs/training_config.yaml",
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         mode: str = "stage2",
+        stage2_checkpoint: Optional[str] = None,
         stage3_checkpoint: Optional[str] = None,
         temperature: float = 0.01,
     ):
@@ -73,6 +74,7 @@ class CrossConceptSimilarityAnalyzer:
             config_path: Path to training configuration
             device: Device to run on (cuda/cpu)
             mode: "stage2" or "stage3"
+            stage2_checkpoint: Path to Stage 2 checkpoint (optional, defaults to best from training_config)
             stage3_checkpoint: Path to Stage 3 portable checkpoint (required if mode="stage3")
             temperature: Routing temperature for Stage 3 (lower = more deterministic)
         """
@@ -83,6 +85,7 @@ class CrossConceptSimilarityAnalyzer:
         self.mode = mode
         self.device = device
         self.temperature = temperature
+        self.stage2_checkpoint = stage2_checkpoint
         self.stage3_checkpoint = stage3_checkpoint
         
         if mode == "stage3" and stage3_checkpoint is None:
@@ -91,6 +94,8 @@ class CrossConceptSimilarityAnalyzer:
         if mode == "stage2":
             # Initialize base analyzer for Stage 2 forced routing
             print("   Using Stage 2 forced expert routing")
+            if stage2_checkpoint:
+                print(f"   Stage 2 checkpoint: {stage2_checkpoint}")
             self.base_analyzer = CrossModalityPurityAnalyzer(
                 config_path=config_path,
                 device=device
@@ -108,9 +113,83 @@ class CrossConceptSimilarityAnalyzer:
     def load_models(self):
         """Load all required models (delegates to appropriate method based on mode)."""
         if self.mode == "stage2":
-            self.base_analyzer.load_models()
+            self._load_stage2_models()
         elif self.mode == "stage3":
             self._load_stage3_models()
+    
+    def _load_stage2_models(self):
+        """Load Stage 2 models with forced expert routing.
+        
+        Uses base analyzer's load_models() which loads:
+        1. Stage 1 vision connector (vision_connector_stage1_best.pth)
+        2. Stage 2 LLM checkpoint (llm_stage2_best.pth) with trained experts
+        3. Hard routing mode enabled
+        
+        Optionally overrides the Stage 2 checkpoint path if provided.
+        """
+        print("\n📦 Loading Stage 2 models...")
+        
+        # If custom checkpoint path provided, load models with custom checkpoint
+        if self.stage2_checkpoint:
+            print(f"   Using custom Stage 2 checkpoint: {self.stage2_checkpoint}")
+            
+            # Import required classes
+            from transformers import AutoTokenizer, AutoProcessor, AutoModelForCausalLM, CLIPVisionModel
+            from models import VisionLanguageConnector
+            
+            # Load base models (tokenizer, CLIP, MoE architecture, vision connector)
+            paths = self.base_analyzer.config["paths"]
+            output_dir = paths["output_dir"]
+            
+            # Load tokenizer
+            print(f"  - Loading tokenizer from {paths['mistral_local_path']}")
+            self.base_analyzer.tokenizer = AutoTokenizer.from_pretrained(paths["mistral_local_path"])
+            self.base_analyzer.tokenizer.pad_token = self.base_analyzer.tokenizer.eos_token
+            
+            # Load CLIP processor and vision encoder
+            print(f"  - Loading CLIP from {paths['clip_local_path']}")
+            self.base_analyzer.clip_processor = AutoProcessor.from_pretrained(paths["clip_local_path"])
+            self.base_analyzer.vision_encoder = CLIPVisionModel.from_pretrained(
+                paths["clip_local_path"]
+            ).to(self.device)
+            self.base_analyzer.vision_encoder.eval()
+            
+            # Load base MoE model
+            moe_model_path = "/data/gpfs/projects/COMP90055/aticinovic/models/Mistral-7B-MoE"
+            print(f"  - Loading base MoE model from {moe_model_path}")
+            self.base_analyzer.llm = AutoModelForCausalLM.from_pretrained(
+                moe_model_path,
+                trust_remote_code=True,
+                local_files_only=True,
+                torch_dtype=torch.bfloat16,
+                attn_implementation="eager",
+            ).to(self.device)
+            
+            # Load custom Stage 2 checkpoint (load to CPU first to avoid OOM)
+            print(f"  - Loading Stage 2 expert weights from {self.stage2_checkpoint}")
+            expert_weights = torch.load(self.stage2_checkpoint, map_location='cpu')
+            self.base_analyzer.llm.load_state_dict(expert_weights, strict=False)
+            self.base_analyzer.llm.eval()
+            
+            # Force hard routing mode
+            for layer in self.base_analyzer.llm.model.layers:
+                if hasattr(layer.mlp, "routing_mode"):
+                    layer.mlp.routing_mode = "hard"
+            
+            # Load vision connector
+            print("  - Loading vision connector")
+            self.base_analyzer.vision_connector = VisionLanguageConnector().to(self.device)
+            connector_path = os.path.join(output_dir, "vision_connector_stage1_best.pth")
+            self.base_analyzer.vision_connector.load_state_dict(
+                torch.load(connector_path, map_location=self.device)
+            )
+            self.base_analyzer.vision_connector.eval()
+            
+            print("✅ All Stage 2 models loaded successfully (custom checkpoint)")
+        else:
+            # Use default Stage 2 checkpoint path from base analyzer
+            print("   Using default Stage 2 checkpoint from training_config.yaml")
+            self.base_analyzer.load_models()
     
     def _load_stage3_models(self):
         """Load Stage 3 end-to-end trained model with learned soft routing.
@@ -223,9 +302,24 @@ class CrossConceptSimilarityAnalyzer:
         for annotation in coco_data['annotations']:
             caption = annotation['caption'].lower()
             image_id = annotation['image_id']
+            words = set(caption.split())
             
             # Check which concepts appear in this caption
-            matching_concepts = [c for c in concepts if c.lower() in caption.split()]
+            # Support both single words (e.g., "cat") and compound concepts (e.g., "red_apple")
+            matching_concepts = []
+            for concept in concepts:
+                concept_lower = concept.lower()
+                
+                # Check if it's a compound concept (contains underscore)
+                if '_' in concept_lower:
+                    # For compound concepts like "red_apple", check if all parts are present
+                    parts = concept_lower.split('_')
+                    if all(part in words for part in parts):
+                        matching_concepts.append(concept)
+                else:
+                    # For single-word concepts, check if word is in caption
+                    if concept_lower in words:
+                        matching_concepts.append(concept)
             
             # Skip if multiple specified concepts appear (ambiguous)
             if len(matching_concepts) > 1:
@@ -552,6 +646,117 @@ class CrossConceptSimilarityAnalyzer:
         
         return matrix, labels
     
+    def compute_color_coherence_score(
+        self,
+        matrix: np.ndarray,
+        labels: List[str]
+    ) -> dict:
+        """
+        Compute Color Coherence Score (CCS) to measure color-object binding.
+        
+        CCS = mean(same_color_diff_object) / mean(diff_color_same_object)
+        
+        CCS > 1.0: Strong color binding (color is disentangled from object)
+        CCS ≈ 1.0: No color binding (color and object are entangled)
+        CCS < 1.0: Anti-binding (objects dominate over color)
+        
+        Args:
+            matrix: 2N×2N similarity matrix
+            labels: List of row/column labels (format: "modality:concept")
+        
+        Returns:
+            Dictionary containing CCS scores and component similarities
+        """
+        # Parse labels to extract concepts
+        # Format: "img:red_apple", "txt:blue_car", etc.
+        concepts = []
+        for label in labels:
+            if ':' in label:
+                modality, concept = label.split(':', 1)
+                concepts.append({'modality': modality, 'concept': concept})
+            else:
+                concepts.append({'modality': 'unknown', 'concept': label})
+        
+        # Extract color and object from concept names (assumes format: color_object or just object)
+        def parse_concept(concept_str):
+            """Parse 'red_apple' -> ('red', 'apple'), 'banana' -> (None, 'banana')"""
+            parts = concept_str.split('_', 1)
+            if len(parts) == 2:
+                color, obj = parts
+                # Check if first part is actually a color (heuristic)
+                color_words = ['red', 'green', 'blue', 'yellow', 'white', 'black', 'pink', 'orange', 'purple']
+                if color.lower() in color_words:
+                    return (color, obj)
+            return (None, concept_str)
+        
+        parsed_concepts = [parse_concept(c['concept']) for c in concepts]
+        
+        # Check if we have colored concepts
+        has_colors = any(color is not None for color, _ in parsed_concepts)
+        
+        if not has_colors:
+            print("\n   ⚠️  No colored concepts detected (format should be 'color_object')")
+            return {
+                'color_coherence_score': None,
+                'same_color_diff_object_mean': None,
+                'diff_color_same_object_mean': None,
+                'note': 'No colored concepts found'
+            }
+        
+        # Extract cross-modal similarities (txt rows × img columns)
+        n = len(labels)
+        n_concepts = n // 2
+        
+        # Indices: first half are images, second half are text
+        img_indices = list(range(n_concepts))
+        txt_indices = list(range(n_concepts, n))
+        
+        same_color_diff_object = []
+        diff_color_same_object = []
+        
+        # Compare all txt-img pairs
+        for txt_idx in txt_indices:
+            txt_color, txt_obj = parsed_concepts[txt_idx]
+            if txt_color is None:
+                continue
+                
+            for img_idx in img_indices:
+                img_color, img_obj = parsed_concepts[img_idx]
+                if img_color is None:
+                    continue
+                
+                similarity = matrix[txt_idx, img_idx]
+                
+                # Same color, different object (e.g., red_apple text vs red_car image)
+                if txt_color == img_color and txt_obj != img_obj:
+                    same_color_diff_object.append(similarity)
+                
+                # Different color, same object (e.g., red_apple text vs green_apple image)
+                elif txt_color != img_color and txt_obj == img_obj:
+                    diff_color_same_object.append(similarity)
+        
+        # Compute metrics
+        if len(same_color_diff_object) == 0 or len(diff_color_same_object) == 0:
+            print("\n   ⚠️  Insufficient color-object pairs for CCS computation")
+            return {
+                'color_coherence_score': None,
+                'same_color_diff_object_mean': None,
+                'diff_color_same_object_mean': None,
+                'note': 'Insufficient pairs'
+            }
+        
+        same_color_mean = np.mean(same_color_diff_object)
+        diff_color_mean = np.mean(diff_color_same_object)
+        ccs = same_color_mean / diff_color_mean if diff_color_mean != 0 else None
+        
+        return {
+            'color_coherence_score': ccs,
+            'same_color_diff_object_mean': same_color_mean,
+            'diff_color_same_object_mean': diff_color_mean,
+            'same_color_diff_object_count': len(same_color_diff_object),
+            'diff_color_same_object_count': len(diff_color_same_object)
+        }
+    
     def save_results(
         self,
         matrix: np.ndarray,
@@ -570,13 +775,35 @@ class CrossConceptSimilarityAnalyzer:
         """
         os.makedirs(output_dir, exist_ok=True)
         
+        # Compute color coherence score
+        print(f"\n   🎨 Computing Color Coherence Score (CCS)...")
+        ccs_results = self.compute_color_coherence_score(matrix, labels)
+        
+        if ccs_results['color_coherence_score'] is not None:
+            print(f"   📊 Color Coherence Score: {ccs_results['color_coherence_score']:.3f}")
+            print(f"      • Same color, diff object: {ccs_results['same_color_diff_object_mean']:.3f} "
+                  f"(n={ccs_results['same_color_diff_object_count']} pairs)")
+            print(f"      • Diff color, same object: {ccs_results['diff_color_same_object_mean']:.3f} "
+                  f"(n={ccs_results['diff_color_same_object_count']} pairs)")
+            
+            # Interpret the score
+            ccs = ccs_results['color_coherence_score']
+            if ccs > 1.05:
+                interpretation = "✅ Strong color binding (color disentangled from object)"
+            elif ccs > 0.95:
+                interpretation = "⚠️  Weak/no color binding (color-object entangled)"
+            else:
+                interpretation = "❌ Category dominance (object identity dominates over color)"
+            print(f"      • Interpretation: {interpretation}")
+        
         # Save matrix as JSON (convert to list for JSON serialization)
         matrix_path = os.path.join(output_dir, f"similarity_matrix_layer{layer}.json")
         with open(matrix_path, "w") as f:
             json.dump({
                 "matrix": matrix.tolist(),
                 "layer": layer,
-                "shape": list(matrix.shape)
+                "shape": list(matrix.shape),
+                "color_coherence_score": ccs_results
             }, f, indent=2)
         print(f"   ✓ Saved matrix to: {matrix_path}")
         
@@ -598,7 +825,11 @@ class CrossConceptSimilarityAnalyzer:
         layer: int
     ):
         """
-        Create and save heatmap visualization of similarity matrix.
+        Create and save heatmap visualizations of similarity matrix.
+        
+        Generates two plots:
+        1. Standard: Single color scale for all values
+        2. Dual-scale: Separate color scales for within-modality vs cross-modality
         
         Args:
             matrix: 2N×2N similarity matrix
@@ -611,7 +842,11 @@ class CrossConceptSimilarityAnalyzer:
         # Determine figure size based on matrix size
         n = matrix.shape[0]
         figsize = max(10, n * 0.6)
+        mode_str = "Forced Routing" if self.mode == "stage2" else f"Learned Soft Routing (T={self.temperature})"
         
+        # ============================================================
+        # PLOT 1: Standard single color scale (original)
+        # ============================================================
         fig, ax = plt.subplots(figsize=(figsize, figsize))
         
         # Create mask for upper triangle (exclude diagonal)
@@ -640,10 +875,9 @@ class CrossConceptSimilarityAnalyzer:
         ax.set_yticklabels(labels, rotation=0, fontsize=9)
         
         # Add title
-        mode_str = "Forced Routing" if self.mode == "stage2" else f"Learned Soft Routing (T={self.temperature})"
         ax.set_title(
             f'Cross-Concept Similarity Matrix (Layer {layer})\n'
-            f'{n//2} Image-Text Pairs | Mean-Pooled Representations | {mode_str}',
+            f'{n//2} Concepts | Stage 3 | Soft Routing',
             fontsize=14,
             fontweight='bold',
             pad=20
@@ -656,7 +890,94 @@ class CrossConceptSimilarityAnalyzer:
         plt.savefig(plot_path, dpi=300, bbox_inches='tight')
         plt.close()
         
-        print(f"   ✓ Saved heatmap to: {plot_path}")
+        print(f"   ✓ Saved standard heatmap to: {plot_path}")
+        
+        # ============================================================
+        # PLOT 2: Cross-modal only (txt vs img)
+        # ============================================================
+        self._visualize_cross_modal_only(matrix, labels, output_dir, layer, mode_str)
+    
+    def _visualize_cross_modal_only(
+        self,
+        matrix: np.ndarray,
+        labels: List[str],
+        output_dir: str,
+        layer: int,
+        mode_str: str
+    ):
+        """
+        Create focused heatmap showing only cross-modal (txt↔img) similarities.
+        
+        Extracts the bottom-left quadrant (txt rows × img columns) and displays
+        it with an optimized color scale for maximum sensitivity.
+        
+        Args:
+            matrix: 2N×2N similarity matrix
+            labels: List of row/column labels
+            output_dir: Directory to save plot
+            layer: Layer number
+            mode_str: Mode description string for title
+        """
+        n = matrix.shape[0]
+        half_n = n // 2  # Split point between img and txt
+        
+        # Extract cross-modal submatrix (txt rows × img columns)
+        cross_modal_matrix = matrix[half_n:, :half_n]
+        
+        # Extract corresponding labels
+        img_labels = [l.replace('img:', '') for l in labels[:half_n]]
+        txt_labels = [l.replace('txt:', '') for l in labels[half_n:]]
+        
+        # Compute statistics
+        print(f"\n   📊 Cross-modal only statistics:")
+        print(f"      Shape: {cross_modal_matrix.shape} (txt × img)")
+        print(f"      Range: [{cross_modal_matrix.min():.3f}, {cross_modal_matrix.max():.3f}]")
+        print(f"      Mean: {cross_modal_matrix.mean():.3f}")
+        print(f"      Std: {cross_modal_matrix.std():.3f}")
+        
+        # Create figure
+        fig, ax = plt.subplots(figsize=(10, 10))
+        
+        # Create heatmap with optimized color scale
+        sns.heatmap(
+            cross_modal_matrix,
+            annot=True,
+            fmt=".3f",
+            cmap="RdYlGn",
+            vmin=cross_modal_matrix.min() - 0.005,  # Add small margin
+            vmax=cross_modal_matrix.max() + 0.005,
+            xticklabels=img_labels,
+            yticklabels=txt_labels,
+            ax=ax,
+            cbar_kws={'label': 'Cosine Similarity (Cross-Modal)'},
+            square=True,
+            linewidths=0.5,
+            linecolor='lightgray'
+        )
+        
+        # Customize labels
+        ax.set_xlabel('Image Concepts', fontsize=12, fontweight='bold')
+        ax.set_ylabel('Text Concepts', fontsize=12, fontweight='bold')
+        ax.set_xticklabels(img_labels, rotation=45, ha='right', fontsize=10)
+        ax.set_yticklabels(txt_labels, rotation=0, fontsize=10)
+        
+        # Add title
+        ax.set_title(
+            f'Cross-Modal Similarity Matrix (Layer {layer})\n'
+            f'Text ↔ Image Alignment | {half_n} Concepts | {mode_str}',
+            fontsize=14,
+            fontweight='bold',
+            pad=20
+        )
+        
+        plt.tight_layout()
+        
+        # Save plot
+        plot_path = os.path.join(output_dir, f"similarity_matrix_layer{layer}_cross_modal.png")
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"   ✓ Saved cross-modal heatmap to: {plot_path}")
     
     def run_analysis(
         self,
@@ -789,10 +1110,8 @@ def load_config(config_file: str) -> Dict:
     # Set defaults for optional fields
     config.setdefault("layers", [31])
     config.setdefault("pooling", "mean")
-    config.setdefault("output_dir", "results/similarity_matrix/")
-    config.setdefault("mode", "stage2")  # Default to stage2 for backward compatibility
-    config.setdefault("temperature", 0.01)  # Low temperature for deterministic routing
     config.setdefault("seed", 42)  # Random seed for reproducibility
+    # Note: mode, output_dir, temperature, checkpoints now come from CLI args
     
     return config
 
@@ -813,6 +1132,11 @@ def main():
         type=str,
         choices=["stage2", "stage3"],
         help="Analysis mode: 'stage2' (forced routing) or 'stage3' (learned routing). Overrides config file."
+    )
+    parser.add_argument(
+        "--stage2-checkpoint",
+        type=str,
+        help="Path to Stage 2 checkpoint (optional, defaults to llm_stage2_best.pth from training_config)"
     )
     parser.add_argument(
         "--stage3-checkpoint",
@@ -853,6 +1177,10 @@ def main():
         config["mode"] = args.mode
         print(f"   ⚠️  Overriding mode from command line: {args.mode}")
     
+    if args.stage2_checkpoint:
+        config["stage2_checkpoint"] = args.stage2_checkpoint
+        print(f"   ⚠️  Overriding Stage 2 checkpoint from command line")
+    
     if args.stage3_checkpoint:
         config["stage3_checkpoint"] = args.stage3_checkpoint
         print(f"   ⚠️  Overriding Stage 3 checkpoint from command line")
@@ -866,20 +1194,22 @@ def main():
         print(f"   ⚠️  Overriding output directory from command line: {args.output_dir}")
     
     # Validate Stage 3 requirements
-    if config["mode"] == "stage3" and "stage3_checkpoint" not in config:
+    if config.get("mode", "stage2") == "stage3" and "stage3_checkpoint" not in config:
         raise ValueError("--stage3-checkpoint required when mode='stage3'")
     
     # Print configuration
     print(f"\n📋 Configuration:")
-    print(f"   Mode: {config['mode'].upper()}")
+    print(f"   Mode: {config.get('mode', 'stage2').upper()}")
     print(f"   Concepts: {config['concepts']}")
     print(f"   Samples per concept: {config['samples_per_concept']}")
     print(f"   Layers: {config['layers']}")
     print(f"   Pooling: {config['pooling']}")
-    print(f"   Output directory: {config['output_dir']}")
+    print(f"   Output directory: {config.get('output_dir', 'results/similarity_matrix/')}")
     print(f"   Annotations file: {config['annotations_file']}")
     print(f"   Image directory: {config['image_dir']}")
-    if config["mode"] == "stage3":
+    if config.get("mode", "stage2") == "stage2":
+        print(f"   Stage 2 checkpoint: {config.get('stage2_checkpoint', 'default (from training_config.yaml)')}")
+    elif config.get("mode", "stage2") == "stage3":
         print(f"   Stage 3 checkpoint: {config.get('stage3_checkpoint', 'N/A')}")
         print(f"   Temperature: {config.get('temperature', 0.01)}")
     
@@ -887,7 +1217,8 @@ def main():
     analyzer = CrossConceptSimilarityAnalyzer(
         config_path=args.training_config,
         device=args.device,
-        mode=config["mode"],
+        mode=config.get("mode", "stage2"),
+        stage2_checkpoint=config.get("stage2_checkpoint"),
         stage3_checkpoint=config.get("stage3_checkpoint"),
         temperature=config.get("temperature", 0.01),
     )
@@ -903,7 +1234,7 @@ def main():
         image_dir=config["image_dir"],
         layers=config["layers"],
         pooling=config["pooling"],
-        output_dir=config["output_dir"],
+        output_dir=config.get("output_dir", "results/similarity_matrix/"),
         seed=config.get("seed", 42)
     )
 

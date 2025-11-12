@@ -1,6 +1,6 @@
 {
   "stage3_alignment_analysis": {
-    "checkpoint_path": "/data/gpfs/projects/COMP90055/aticinovic/outputs/stage3_checkpoints/llm_stage3_best.pth",
+    "checkpoint_path": "/data/gpfs/projects/COMP90055/aticinovic/outputs/stage3_checkpoints/llm_stage3_best_portable.pth",
     "temperature": 0.01,
     "concepts": [
       "cat",
@@ -8,7 +8,7 @@
       "car",
       "bus",
       "airplane",
-      "train",
+      "laptop",
       "apple",
       "banana"
     ],

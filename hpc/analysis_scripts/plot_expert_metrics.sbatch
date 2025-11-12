@@ -19,13 +19,21 @@
 #   sbatch hpc/analysis_scripts/plot_expert_metrics.sbatch
 #
 # Outputs:
-#   - results/expert_metrics/expert_load_distribution.png
-#   - results/expert_metrics/routing_entropy.png
-#   - results/expert_metrics/high_confidence_fraction.png
-#   - results/expert_metrics/visual_vs_text_routing.png
-#   - results/expert_metrics/specialization_evolution.png
-#   - results/expert_metrics/aggregate_summary.png
-#   - results/expert_metrics/expert_metrics_report.txt
+#   Per-layer analysis:
+#     - results/expert_metrics/expert_load_distribution.png
+#     - results/expert_metrics/routing_entropy.png
+#     - results/expert_metrics/high_confidence_fraction.png
+#     - results/expert_metrics/visual_vs_text_routing.png
+#   Epoch-wise evolution:
+#     - results/expert_metrics/specialization_evolution.png
+#     - results/expert_metrics/aggregate_summary.png
+#   KEY RESEARCH PLOTS (NEW):
+#     - results/expert_metrics/specialization_divergence.png
+#     - results/expert_metrics/routing_confidence_evolution.png
+#     - results/expert_metrics/loss_and_specialization.png
+#   Text report:
+#     - results/expert_metrics/expert_metrics_report.txt
+#     - results/expert_metrics/KEY_RESEARCH_PLOTS_README.md
 # ============================================================================
 
 echo "========================================"
@@ -71,7 +79,7 @@ python analysis_scripts/plot_expert_metrics.py \
     --metrics_dir "$METRICS_DIR" \
     --output_dir "$OUTPUT_DIR" \
     --layers all_layers \
-    --epochs 8
+    --epochs 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18 \
 
 EXIT_CODE=$?
 
