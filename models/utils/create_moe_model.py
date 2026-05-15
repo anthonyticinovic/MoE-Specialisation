@@ -1,93 +1,69 @@
-import torch
+"""
+Create the custom MoE model from a base Mistral-7B checkpoint.
+
+Replaces every FFN layer with a two-expert MoELayer. Both experts are
+initialised with identical copies of the original FFN weights so the model
+starts from a known-good, pretrained state.
+
+Run from the repo root:
+    python -m models.utils.create_moe_model \
+        --base-model YOUR_PATH_HERE/Mistral-7B-v0.3 \
+        --output    YOUR_PATH_HERE/Mistral-7B-MoE
+"""
+
+import argparse
 import json
 import os
-from transformers import MistralForCausalLM, AutoConfig, AutoTokenizer
-
-# Import your custom model class and the replacement utility
-# Make sure these files are accessible (e.g., in models/ and utils/ folders)
-from models.custom_mistral import MistralMoEForCausalLM
-from models.utils.create_n_experts import replace_ffn_with_moe
-
-# --- Configuration ---
-base_model_path = "/data/gpfs/projects/COMP90055/aticinovic/models/Mistral-7B-v0.3" 
-output_path = "/data/gpfs/projects/COMP90055/aticinovic/models/Mistral-7B-MoE"
-
-# 1. Load the full-precision base model
-print(f"Loading base model from {base_model_path}...")
-llm_base = MistralForCausalLM.from_pretrained(base_model_path)
-
-# 2. Create an instance of your custom MoE model class
-print("Creating new MistralMoEForCausalLM model instance...")
-llm_moe = MistralMoEForCausalLM(llm_base.config)
-
-# 3. Manually copy weights
-print("Manually copying weights...")
-# Copy all non-MLP weights (e.g., embeddings, attention layers)
-llm_moe.load_state_dict(llm_base.state_dict(), strict=False)
-# Manually copy the original FFN weights into BOTH experts in each layer
-for layer_base, layer_moe in zip(llm_base.model.layers, llm_moe.model.layers):
-    layer_moe.mlp.experts[0].load_state_dict(layer_base.mlp.state_dict())
-    layer_moe.mlp.experts[1].load_state_dict(layer_base.mlp.state_dict())
-print("✅ Weights successfully copied.")
-
-# 4. Update the model's config to reflect the new architecture
-llm_moe.config.model_type = "mistral_moe"
-llm_moe.config.architectures = ["MistralMoEForCausalLM"]
-
-# 5. Save the new, custom MoE model
-print(f"Saving new MoE model to {output_path}...")
-llm_moe.save_pretrained(output_path)
-
-# 6. **KEY FIX**: Add auto_map to config.json for proper loading
-print("Updating config.json with auto_map...")
-config_path = os.path.join(output_path, "config.json")
-with open(config_path, "r") as f:
-    config_dict = json.load(f)
-
-# Add auto_map to tell transformers where to find your custom classes
-config_dict["auto_map"] = {
-    "AutoConfig": "custom_mistral.MistralMoEConfig",
-    "AutoModelForCausalLM": "custom_mistral.MistralMoEForCausalLM"
-}
-
-with open(config_path, "w") as f:
-    json.dump(config_dict, f, indent=2)
-
-# 7. Copy ALL necessary Python files to the output directory
-print("Copying custom model files...")
 import shutil
-import glob
 
-# Find all Python files that might be dependencies
-files_to_copy = []
+from transformers import MistralForCausalLM
 
-# Direct dependencies
-files_to_copy.extend([
-    "models/custom_mistral.py",
-    "models/moe_layer.py", 
-    "models/__init__.py"
-])
+from models.custom_mistral import MistralMoEForCausalLM
 
-# Utils dependencies
-files_to_copy.extend([
-    "models/utils/create_n_experts.py",
-    "models/utils/__init__.py"
-])
 
-# Also check for any other Python files in models/
-for py_file in glob.glob("models/*.py"):
-    if py_file not in files_to_copy:
-        files_to_copy.append(py_file)
+def create_moe_model(base_model_path: str, output_path: str):
+    print(f"Loading base model from {base_model_path}...")
+    llm_base = MistralForCausalLM.from_pretrained(base_model_path)
 
-print(f"Files to copy: {files_to_copy}")
+    print("Creating MistralMoEForCausalLM...")
+    llm_moe = MistralMoEForCausalLM(llm_base.config)
 
-for file_path in files_to_copy:
-    if os.path.exists(file_path):
-        filename = os.path.basename(file_path)
-        dest_path = os.path.join(output_path, filename)
-        shutil.copy2(file_path, dest_path)
-        print(f"✅ Copied {file_path} -> {dest_path}")
-    else:
-        print(f"⚠️  Warning: {file_path} not found!")
+    print("Copying weights...")
+    llm_moe.load_state_dict(llm_base.state_dict(), strict=False)
+    for layer_base, layer_moe in zip(llm_base.model.layers, llm_moe.model.layers):
+        layer_moe.mlp.experts[0].load_state_dict(layer_base.mlp.state_dict())
+        layer_moe.mlp.experts[1].load_state_dict(layer_base.mlp.state_dict())
+    print("Weights copied.")
 
-print("✅ MoE model successfully created with proper loading configuration.")
+    llm_moe.config.model_type = "mistral_moe"
+    llm_moe.config.architectures = ["MistralMoEForCausalLM"]
+
+    print(f"Saving MoE model to {output_path}...")
+    llm_moe.save_pretrained(output_path)
+
+    # Patch config.json so AutoModel can locate the custom classes
+    config_path = os.path.join(output_path, "config.json")
+    with open(config_path) as f:
+        config_dict = json.load(f)
+    config_dict["auto_map"] = {
+        "AutoConfig": "custom_mistral.MistralMoEConfig",
+        "AutoModelForCausalLM": "custom_mistral.MistralMoEForCausalLM",
+    }
+    with open(config_path, "w") as f:
+        json.dump(config_dict, f, indent=2)
+
+    # Copy custom model files into the saved directory so trust_remote_code works
+    for src in ["models/custom_mistral.py", "models/moe_layer.py", "models/__init__.py"]:
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(output_path, os.path.basename(src)))
+            print(f"Copied {src}")
+
+    print("Done.")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--base-model", required=True, help="Path to Mistral-7B-v0.3")
+    parser.add_argument("--output", required=True, help="Output path for MoE model")
+    args = parser.parse_args()
+    create_moe_model(args.base_model, args.output)

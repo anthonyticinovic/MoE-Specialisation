@@ -4,6 +4,6 @@
   "pooling": "mean",
   "temperature": 0.01,
   "output_dir": "results/compositional_case_study/",
-  "stage2_checkpoint": "/data/gpfs/projects/COMP90055/aticinovic/outputs/stage2_checkpoints/llm_stage2_best.pth",
-  "stage3_checkpoint": "/data/gpfs/projects/COMP90055/aticinovic/outputs/stage3_checkpoints/llm_stage3_best_portable.pth"
+  "stage2_checkpoint": "YOUR_PATH_HERE/outputs/stage2_checkpoints/llm_stage2_best.pth",
+  "stage3_checkpoint": "YOUR_PATH_HERE/outputs/stage3_checkpoints/llm_stage3_best_portable.pth"
 }

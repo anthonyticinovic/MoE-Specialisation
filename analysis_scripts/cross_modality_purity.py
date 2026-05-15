@@ -154,9 +154,7 @@ class CrossModalityPurityAnalyzer:
         self.vision_encoder.eval()
 
         # Load base MoE model
-        moe_model_path = (
-            "/data/gpfs/projects/COMP90055/aticinovic/models/Mistral-7B-MoE"
-        )
+        moe_model_path = paths["moe_model_path"]
         print(f"  - Loading base MoE model from {moe_model_path}")
         self.llm = AutoModelForCausalLM.from_pretrained(
             moe_model_path,

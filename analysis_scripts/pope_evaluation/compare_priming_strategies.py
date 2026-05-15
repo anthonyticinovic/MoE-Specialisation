@@ -80,7 +80,7 @@ def compute_metrics(results):
 
 
 def main():
-    results_dir = Path("/home/aticinovic/MoE-Specialisation/results/pope_evaluation")
+    results_dir = Path("YOUR_PATH_HERE/results/pope_evaluation")
     answers_dir = results_dir / "answers_primed"
     
     if not answers_dir.exists():

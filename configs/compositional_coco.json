@@ -8,8 +8,8 @@
     "bear"
   ],
   "samples_per_concept": 50,
-  "annotations_file": "/data/gpfs/projects/COMP90055/aticinovic/datasets/coco/annotations/captions_train2017.json",
-  "image_dir": "/data/gpfs/projects/COMP90055/aticinovic/datasets/coco/train2017",
+  "annotations_file": "YOUR_PATH_HERE/datasets/coco/annotations/captions_train2017.json",
+  "image_dir": "YOUR_PATH_HERE/datasets/coco/train2017",
   "layers": [0, 16, 31],
   "pooling": "mean",
   "seed": 42

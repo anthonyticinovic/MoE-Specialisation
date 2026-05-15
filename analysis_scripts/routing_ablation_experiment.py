@@ -16,9 +16,6 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import numpy as np
 
-# Import your model classes
-import sys
-sys.path.append('/home/aticinovic/MoE-Specialisation')
 from models.custom_mistral import MistralMoEForCausalLM
 from models.vl_connector import VisionLanguageConnector
 from transformers import AutoTokenizer, CLIPImageProcessor, CLIPVisionModel
@@ -30,13 +27,13 @@ def load_stage2_model(checkpoint_path, device='cuda'):
     
     # Load CLIP vision encoder
     clip_model = CLIPVisionModel.from_pretrained(
-        "/data/gpfs/projects/COMP90055/aticinovic/models/clip-vit-large-patch14"
+        "YOUR_PATH_HERE/models/clip-vit-large-patch14"
     ).to(device)
     
     # Load vision connector
     vision_connector = VisionLanguageConnector()
     connector_state = torch.load(
-        "/data/gpfs/projects/COMP90055/aticinovic/outputs/vision_connector_stage1_best.pth",
+        "YOUR_PATH_HERE/outputs/vision_connector_stage1_best.pth",
         map_location='cpu'
     )
     vision_connector.load_state_dict(connector_state)
@@ -44,7 +41,7 @@ def load_stage2_model(checkpoint_path, device='cuda'):
     
     # Load LLM
     llm = MistralMoEForCausalLM.from_pretrained(
-        "/data/gpfs/projects/COMP90055/aticinovic/models/Mistral-7B-MoE",
+        "YOUR_PATH_HERE/models/Mistral-7B-MoE",
         torch_dtype=torch.bfloat16,
         device_map=device
     )
@@ -74,13 +71,13 @@ def load_stage2_model(checkpoint_path, device='cuda'):
     
     # Load tokenizer and processor
     tokenizer = AutoTokenizer.from_pretrained(
-        "/data/gpfs/projects/COMP90055/aticinovic/models/Mistral-7B-v0.3",
+        "YOUR_PATH_HERE/models/Mistral-7B-v0.3",
         use_fast=False
     )
     tokenizer.pad_token = tokenizer.eos_token  # Set pad token for COCO_Loader
     
     processor = CLIPImageProcessor.from_pretrained(
-        "/data/gpfs/projects/COMP90055/aticinovic/models/clip-vit-large-patch14"
+        "YOUR_PATH_HERE/models/clip-vit-large-patch14"
     )
     
     return clip_model, vision_connector, llm, tokenizer, processor
@@ -203,8 +200,8 @@ def run_routing_ablation(
     from torch.utils.data import DataLoader
     
     val_dataset = COCO_Loader(
-        image_dir="/data/gpfs/projects/COMP90055/aticinovic/datasets/coco/val2017",
-        annotations_file="/data/gpfs/projects/COMP90055/aticinovic/datasets/coco/annotations/captions_val2017.json",
+        image_dir="YOUR_PATH_HERE/datasets/coco/val2017",
+        annotations_file="YOUR_PATH_HERE/datasets/coco/annotations/captions_val2017.json",
         clip_processor=processor,
         tokenizer=tokenizer,
         subset_fraction=1.0,
@@ -367,10 +364,10 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description='Expert routing ablation study')
     parser.add_argument('--checkpoint', type=str, 
-                       default='/data/gpfs/projects/COMP90055/aticinovic/outputs/stage2_checkpoints/llm_stage2_best.pth',
+                       default='YOUR_PATH_HERE/outputs/stage2_checkpoints/llm_stage2_best.pth',
                        help='Path to Stage 2 checkpoint')
     parser.add_argument('--data', type=str,
-                       default='/data/gpfs/projects/COMP90055/aticinovic/datasets/coco',
+                       default='YOUR_PATH_HERE/datasets/coco',
                        help='Path to COCO data directory')
     parser.add_argument('--num_samples', type=int, default=100,
                        help='Number of samples to evaluate')

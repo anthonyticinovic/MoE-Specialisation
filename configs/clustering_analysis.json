@@ -1,9 +1,9 @@
 {
-  "checkpoint_path": "/data/gpfs/projects/COMP90055/aticinovic/outputs/stage3_checkpoints/llm_stage3_best_portable.pth",
+  "checkpoint_path": "YOUR_PATH_HERE/outputs/stage3_checkpoints/llm_stage3_best_portable.pth",
   "data": {
     "source": "coco",
-    "annotations_file": "/data/gpfs/projects/COMP90055/aticinovic/datasets/coco/annotations/captions_train2017.json",
-    "image_dir": "/data/gpfs/projects/COMP90055/aticinovic/datasets/coco/train2017",
+    "annotations_file": "YOUR_PATH_HERE/datasets/coco/annotations/captions_train2017.json",
+    "image_dir": "YOUR_PATH_HERE/datasets/coco/train2017",
     "concepts": [
       "person",   
       "cat",        

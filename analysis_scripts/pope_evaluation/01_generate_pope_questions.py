@@ -324,7 +324,7 @@ def main():
     parser.add_argument(
         '--annotations_file',
         type=str,
-        default='/data/gpfs/projects/COMP90055/aticinovic/datasets/coco/annotations/instances_val2017.json',
+        default='YOUR_PATH_HERE/datasets/coco/annotations/instances_val2017.json',
         help='Path to COCO instances annotations (val2017)'
     )
     parser.add_argument(

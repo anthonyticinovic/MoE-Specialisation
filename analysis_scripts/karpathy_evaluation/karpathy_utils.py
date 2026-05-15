@@ -6,6 +6,7 @@ Shared code for model loading, preprocessing, etc.
 
 import torch
 import torch.nn as nn
+import yaml
 from torchvision import transforms
 from PIL import Image
 import json
@@ -17,6 +18,13 @@ import numpy as np
 # Add project root to path
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
+
+
+def _load_paths() -> dict:
+    """Load model/data paths from training_config.yaml."""
+    config_path = project_root / "configs" / "training_config.yaml"
+    with open(config_path) as f:
+        return yaml.safe_load(f)["paths"]
 
 
 def load_model_checkpoint(checkpoint_path: str, device: str = 'cuda'):
@@ -52,11 +60,11 @@ def load_model_checkpoint(checkpoint_path: str, device: str = 'cuda'):
     # Load checkpoint
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     
-    # Define paths (same as training scripts - must match training_config.yaml)
-    moe_model_path = "/data/gpfs/projects/COMP90055/aticinovic/models/Mistral-7B-MoE"
-    clip_path = "/data/gpfs/projects/COMP90055/aticinovic/models/clip-vit-large-patch14"
-    mistral_path = "/data/gpfs/projects/COMP90055/aticinovic/models/Mistral-7B-v0.3"
-    connector_path = "/data/gpfs/projects/COMP90055/aticinovic/outputs/vision_connector_stage1_best.pth"
+    paths = _load_paths()
+    moe_model_path = paths["moe_model_path"]
+    clip_path = paths["clip_local_path"]
+    mistral_path = paths["mistral_local_path"]
+    connector_path = str(Path(paths["output_dir"]) / "vision_connector_stage1_best.pth")
     
     # Load vision encoder
     print(f"📦 Loading CLIP vision encoder from {clip_path}...")

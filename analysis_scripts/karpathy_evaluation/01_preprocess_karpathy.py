@@ -155,7 +155,7 @@ def main():
     parser.add_argument(
         '--karpathy_json',
         type=str,
-        default='/data/gpfs/projects/COMP90055/aticinovic/datasets/coco/karpathy_split/dataset_coco.json',
+        default='YOUR_PATH_HERE/datasets/coco/karpathy_split/dataset_coco.json',
         help='Path to dataset_coco.json'
     )
     parser.add_argument(

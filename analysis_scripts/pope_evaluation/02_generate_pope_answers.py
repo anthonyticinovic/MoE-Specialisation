@@ -385,7 +385,7 @@ def main():
     parser.add_argument(
         '--image_dir',
         type=str,
-        default='/data/gpfs/projects/COMP90055/aticinovic/datasets/coco/val2017',
+        default='YOUR_PATH_HERE/datasets/coco/val2017',
         help='Directory containing COCO val2017 images'
     )
     parser.add_argument(

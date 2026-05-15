@@ -4,8 +4,6 @@ import yaml
 import torch
 import os
 import gc
-import sys
-import re
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
@@ -22,7 +20,6 @@ from torch.amp import GradScaler, autocast
 from torch.distributed.fsdp import CPUOffload
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-# Para GPU imports
 import torch.distributed as dist
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
@@ -34,17 +31,8 @@ from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from functools import partial
 
 from transformers.models.mistral.modeling_mistral import MistralMLP
+from models.custom_mistral import MistralMoEConfig, MistralMoEForCausalLM, MistralMoEDecoderLayer
 
-# Import your custom MoE classes
-from models.custom_mistral import (
-    MistralMoEConfig,
-    MistralMoEForCausalLM,
-    MistralMoEDecoderLayer,
-)
-
-from models.moe_layer import MoELayer
-
-# --- 1. Register Your Custom Architecture ---
 AutoConfig.register("mistral_moe", MistralMoEConfig)
 AutoModelForCausalLM.register(MistralMoEConfig, MistralMoEForCausalLM)
 
@@ -82,10 +70,10 @@ clip_processor = AutoProcessor.from_pretrained(paths["clip_local_path"])
 tokenizer = AutoTokenizer.from_pretrained(paths["mistral_local_path"])
 tokenizer.pad_token = tokenizer.eos_token
 
-moe_model_path = "/data/gpfs/projects/COMP90055/aticinovic/models/Mistral-7B-MoE"
+moe_model_path = paths["moe_model_path"]
 
 if local_rank == 0:
-    print(f"Loading custom MoE model from {moe_model_path} onto CPU...")
+    print(f"Loading custom MoE model from {moe_model_path}...")
 
 llm = AutoModelForCausalLM.from_pretrained(
     moe_model_path,

@@ -4,8 +4,6 @@ import yaml
 import torch
 import os
 import gc
-import sys
-import re
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
@@ -263,7 +261,7 @@ clip_processor = AutoProcessor.from_pretrained(paths["clip_local_path"])
 tokenizer = AutoTokenizer.from_pretrained(paths["mistral_local_path"])
 tokenizer.pad_token = tokenizer.eos_token
 
-moe_model_path = "/data/gpfs/projects/COMP90055/aticinovic/models/Mistral-7B-MoE"
+moe_model_path = paths["moe_model_path"]
 
 llm = AutoModelForCausalLM.from_pretrained(
     moe_model_path,

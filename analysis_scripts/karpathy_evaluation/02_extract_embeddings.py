@@ -211,7 +211,7 @@ def main():
     parser.add_argument(
         '--image_base_dir',
         type=str,
-        default='/data/gpfs/projects/COMP90055/aticinovic/datasets/coco',
+        default='YOUR_PATH_HERE/datasets/coco',
         help='Base directory for COCO images'
     )
     parser.add_argument(

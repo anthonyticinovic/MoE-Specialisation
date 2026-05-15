@@ -4,8 +4,6 @@ import yaml
 import torch
 import os
 import gc
-import sys
-import re
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
@@ -75,7 +73,7 @@ vision_encoder = CLIPVisionModel.from_pretrained(paths["clip_local_path"]).to(DE
 clip_processor = AutoProcessor.from_pretrained(paths["clip_local_path"])
 tokenizer = AutoTokenizer.from_pretrained(paths["mistral_local_path"])
 tokenizer.pad_token = tokenizer.eos_token
-moe_model_path = "/data/gpfs/projects/COMP90055/aticinovic/models/Mistral-7B-MoE"
+moe_model_path = paths["moe_model_path"]
 
 llm = AutoModelForCausalLM.from_pretrained(
     moe_model_path,
@@ -417,28 +415,6 @@ for epoch in range(start_epoch, NUM_EPOCHS):
                     router_params, 
                     max_norm=10.0  # Increased from 1.0 to 10.0
                 )
-                
-                    # Debug logging every 100 batches
-                if local_rank == 0 and (i + 1) % 100 == 0:
-                    print(f"--- Gradient Check ---")
-                    print(f"  Router grad norm BEFORE clip: {total_norm:.2f}")
-                    print(f"  Router grad norm AFTER clip: {clipped_norm:.2f}")
-                    max_norm = 10.0  # Updated to match new clipping threshold
-                    was_clipped = total_norm > max_norm
-                    actual_norm_after_clip = min(total_norm, max_norm)
-                    print(f"  Clipping applied: {'YES' if was_clipped else 'NO'}")
-                    print(f"  Actual norm after clip: {actual_norm_after_clip:.2f}")                    # Sample a few layers to check individual norms
-                    sample_layers = [0, 1, 15, 31]  # First, second, middle, last
-                    for name, param in llm.named_parameters():
-                        if 'mlp.gate' in name and param.grad is not None:
-                            # Extract layer number from name (e.g., "model.layers.15.mlp.gate.weight")
-                            match = re.search(r'layers\.(\d+)\.mlp\.gate', name)
-                            if match:
-                                layer_idx = int(match.group(1))
-                                if layer_idx in sample_layers:
-                                    layer_norm = param.grad.detach().data.norm(2).item()
-                                    print(f"    Layer {layer_idx} gate: {layer_norm:.2e}")
-                    print("----------------------")
 
             # Step 3: Update optimizer
             scaler.step(optimizer)

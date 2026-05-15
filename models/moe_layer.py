@@ -3,53 +3,52 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.models.mistral.modeling_mistral import MistralMLP
 
+
 class MoELayer(nn.Module):
+    """
+    Two-expert MoE layer replacing the standard FFN in each Mistral decoder layer.
+
+    Supports two routing modes:
+    - 'hard': deterministic routing via an externally-set `routing_mask` (0=vision, 1=text).
+      Used in Stage 2 where the mask is derived from token position (visual vs. text).
+    - 'soft': differentiable routing via a learned gate with Gumbel-Softmax +
+      Straight-Through Estimator. Used in Stages 2.5 and 3.
+    """
+
     def __init__(self, config, d_model: int, num_experts: int = 2, routing_mode: str = 'hard'):
         super().__init__()
         self.d_model = d_model
         self.num_experts = num_experts
         self.routing_mode = routing_mode
-        # The router is not needed for this hard-coded routing logic
         self.experts = nn.ModuleList([MistralMLP(config) for _ in range(num_experts)])
 
-        # The gate is only used for 'soft' routing, but we initialize it
-        # to ensure the model structure is consistent when loading weights.
+        # Gate is only active in 'soft' mode but initialised in both to keep the
+        # model structure consistent when loading checkpoints across stages.
         self.gate = nn.Linear(self.d_model, self.num_experts, bias=False)
-        # CRITICAL: Use std=0.02 (not 0.01) to prevent routing collapse
-        # With only 2 experts, small initialization variance causes one expert to dominate
         nn.init.normal_(self.gate.weight, std=0.05)
-        
-        #I am hard coding this for now
-        self.router_dropout = nn.Dropout(0.1) 
+
+        self.router_dropout = nn.Dropout(0.1)
 
     def initialize_gate(self):
-        """
-        Explicitly initializes or re-initializes the gate weights.
-        This ensures the gate has the correct shape and a fresh start.
-        """
+        """Re-initialise gate weights (called in Stage 2.5 to break symmetry)."""
         self.gate = nn.Linear(self.d_model, self.num_experts, bias=False)
         nn.init.normal_(self.gate.weight, std=0.05)
 
     def forward(self, hidden_states: torch.Tensor, temperature: float = 1.0):
-        """
-        Main forward pass that dispatches to the correct routing logic.
-        """
-        # Check if temperature was set externally (e.g., during training)
         if hasattr(self, '_forward_temperature'):
             temperature = self._forward_temperature
-        
+
         if self.routing_mode == 'hard':
             return self._hard_routing_forward(hidden_states)
         elif self.routing_mode == 'soft':
-            # Pass the temperature argument to the soft routing function
             return self._soft_routing_forward(hidden_states, temperature)
         else:
             raise ValueError(f"Invalid routing mode: {self.routing_mode}. Must be 'hard' or 'soft'.")
 
     def _hard_routing_forward(self, hidden_states: torch.Tensor):
         """
-        Original hard-coded routing logic from Stage 2.
-        Relies on `self.routing_mask` being set externally.
+        Route tokens based on an externally-set `self.routing_mask`.
+        Mask values: 0 → Expert 0 (vision), 1 → Expert 1 (text).
         """
         routing_mask = self.routing_mask
         final_output = torch.zeros_like(hidden_states)
@@ -58,100 +57,66 @@ class MoELayer(nn.Module):
         text_indices = torch.where(routing_mask == 1)
 
         if vision_indices[0].numel() > 0:
-            vision_tokens = hidden_states[vision_indices]
-            vision_output = self.experts[0](vision_tokens)
-            final_output[vision_indices] = vision_output
+            final_output[vision_indices] = self.experts[0](hidden_states[vision_indices])
 
         if text_indices[0].numel() > 0:
-            text_tokens = hidden_states[text_indices]
-            text_output = self.experts[1](text_tokens)
-            final_output[text_indices] = text_output
+            final_output[text_indices] = self.experts[1](hidden_states[text_indices])
 
         return final_output
 
     def _soft_routing_forward(self, hidden_states: torch.Tensor, temperature: float = 1.0):
         """
-        Differentiable and sparse soft routing using Straight-Through Gumbel-Softmax.
-    
-        In the forward pass, this behaves like hard routing (only one expert is
-        computed per token). In the backward pass, gradients flow back to all
-        router logits as if it were a soft, probabilistic choice. This provides
-        a rich learning signal while maintaining computational efficiency.
+        Differentiable routing via Straight-Through Gumbel-Softmax.
+
+        Forward pass: hard (one expert per token, computed sparsely).
+        Backward pass: gradients flow through soft probabilities to the gate.
+
+        FSDP note: every expert must be called on every rank to keep collective
+        operations in sync. When no tokens route to an expert, a zero-weighted
+        dummy forward pass is performed to satisfy this requirement.
         """
-        # Get initial logits from the gate
         batch_size, sequence_length, hidden_dim = hidden_states.shape
-        hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
-        router_logits = self.gate(hidden_states_reshaped)
+        hidden_flat = hidden_states.view(-1, hidden_dim)
+
+        router_logits = self.gate(hidden_flat)
         router_logits = self.router_dropout(router_logits)
-        
-        # Store router logits for optional return (used for metrics collection)
-        # Reshape to [batch_size, sequence_length, num_experts] for consistency
+
+        # Store for metric collection during validation
         self._last_router_logits = router_logits.view(batch_size, sequence_length, self.num_experts)
 
-        # 1. Gumbel-Softmax for stochastic, differentiable sampling
-        # Gumbel noise is added for exploration during TRAINING only
-        # During eval/inference, use deterministic routing for reproducibility
         if self.training:
             gumbels = -torch.empty_like(router_logits).exponential_().log()
             y = (router_logits + gumbels) / temperature
         else:
-            # Eval mode: no Gumbel noise for deterministic routing
             y = router_logits / temperature
-        
-        # router_probs contains the "soft" probabilities used for the backward pass
+
         router_probs = F.softmax(y, dim=-1)
 
-        # 2. Straight-Through Estimator Trick
-        # Get a "hard" one-hot vector for the forward pass
+        # Straight-Through Estimator: hard selection in forward, soft probs in backward
         hard_idx = router_probs.argmax(dim=-1, keepdim=True)
         hard_onehot = torch.zeros_like(router_probs).scatter_(1, hard_idx, 1.0)
-        # This line is the core of the trick:
-        # Forward pass uses `hard_onehot`, backward pass uses `router_probs`
         router_onehot = hard_onehot - router_probs.detach() + router_probs
 
-        # Initialize a final output tensor of zeros
-        final_hidden_states = torch.zeros_like(hidden_states_reshaped)
+        final_hidden_states = torch.zeros_like(hidden_flat)
 
-        # 3. Sparse Dispatch with FSDP-safe expert touching
-        # CRITICAL: To maintain FSDP execution order consistency across ranks,
-        # we MUST call every expert on every rank, even if no tokens are routed to it.
-        # When an expert has no tokens, we pass a dummy input to trigger the FSDP
-        # all-gather, then discard the output. This ensures all ranks perform the
-        # same collective operations in the same order.
         for expert_idx, expert in enumerate(self.experts):
-            # Find the indices of all tokens that should be routed to this expert
             token_indices = torch.where(router_onehot[:, expert_idx] == 1)[0]
-            
+
             if token_indices.numel() > 0:
-                # Normal case: select the hidden states for routed tokens
-                tokens_for_expert = hidden_states_reshaped[token_indices]
-                
-                # Compute the expert's output for its assigned tokens
+                tokens_for_expert = hidden_flat[token_indices]
                 expert_output = expert(tokens_for_expert)
-                
-                # Apply expert dropout if configured (Stage 3 regularization)
+
                 if hasattr(self, 'expert_dropout') and self.training:
                     expert_output = self.expert_dropout(expert_output)
-                
-                # Get the weights from the straight-through estimator for these tokens
-                weights_for_expert = router_onehot[token_indices, expert_idx].unsqueeze(-1)
-                
-                # Scale the output by the weights (this carries the gradient)
-                weighted_output = expert_output * weights_for_expert
-                
-                # Add the weighted output back to the final tensor at the correct positions
-                final_hidden_states.index_add_(0, token_indices, weighted_output.to(final_hidden_states.dtype))
-            else:
-                # FSDP safety: No tokens routed to this expert on this rank.
-                # CRITICAL: We must still call the expert and connect it to the autograd graph
-                # to ensure backward pass visits this expert on all ranks (FSDP requirement).
-                # Pass a single token through the expert, multiply output by 0.0 (zero contribution),
-                # and add to final output. This forces backward to reduce_scatter gradients (which
-                # will be zero) on all ranks, maintaining identical collective operation sequences.
-                dummy_input = hidden_states_reshaped[:1]  # First token, KEEP gradient
-                dummy_output = expert(dummy_input)
-                # Add zero-weighted contribution to force this expert into backward graph
-                final_hidden_states[:1] += dummy_output.to(final_hidden_states.dtype) * 0.0
 
-        # Reshape to the original dimensions and return
+                weights = router_onehot[token_indices, expert_idx].unsqueeze(-1)
+                final_hidden_states.index_add_(
+                    0, token_indices, (expert_output * weights).to(final_hidden_states.dtype)
+                )
+            else:
+                # FSDP: call expert with a dummy input so all ranks trigger the same
+                # all-gather collective. The zero weight ensures no contribution to output.
+                dummy_out = expert(hidden_flat[:1])
+                final_hidden_states[:1] += dummy_out.to(final_hidden_states.dtype) * 0.0
+
         return final_hidden_states.view(batch_size, sequence_length, hidden_dim)
