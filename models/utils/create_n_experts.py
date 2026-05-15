@@ -1,6 +1,7 @@
-
 from transformers import MistralForCausalLM
+
 from models import MoELayer
+
 
 def replace_ffn_with_moe(model: MistralForCausalLM) -> MistralForCausalLM:
     """Surgically replaces the FFN in each Mistral layer with our MoELayer."""

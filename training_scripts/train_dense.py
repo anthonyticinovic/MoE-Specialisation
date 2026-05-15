@@ -1,44 +1,39 @@
-import time
-import json
-import yaml
-import torch
-import os
 import gc
-import sys
-import re
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
-from transformers import (
-    AutoProcessor,
-    AutoTokenizer,
-    AutoConfig,
-    AutoModelForCausalLM,
-    CLIPVisionModel,
-    MistralForCausalLM,
-    MistralConfig,
-)
-from models import VisionLanguageConnector
-from data import COCO_Loader
-from torch.amp import GradScaler, autocast
-from torch.distributed.fsdp import CPUOffload
-from torch.optim.lr_scheduler import CosineAnnealingLR
+import json
+import os
+import time
+from functools import partial
+
+import torch
 
 # Para GPU imports
 import torch.distributed as dist
+import torch.nn as nn
+import torch.optim as optim
+import yaml
+from torch.amp import GradScaler, autocast
+from torch.distributed.fsdp import (
+    CPUOffload,
+    FullStateDictConfig,
+    StateDictType,
+)
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
-    StateDictType,
-    FullStateDictConfig,
 )
-
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from transformers import (
+    AutoModelForCausalLM,
+    AutoProcessor,
+    AutoTokenizer,
+    CLIPVisionModel,
+)
 from transformers.models.mistral.modeling_mistral import MistralMLP
 
-from torch.utils.data.distributed import DistributedSampler
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-from functools import partial
-from transformers.models.mistral.modeling_mistral import MistralDecoderLayer
-
+from data import COCO_Loader
+from models import VisionLanguageConnector
 
 # ====================================================================================
 # 2. SETUP AND CONFIGURATION
@@ -76,7 +71,7 @@ tokenizer = AutoTokenizer.from_pretrained(paths["mistral_local_path"])
 tokenizer.pad_token = tokenizer.eos_token
 
 # CHANGED: Load the standard dense Mistral-7B model
-dense_model_path = paths["mistral_local_path"] 
+dense_model_path = paths["mistral_local_path"]
 llm = AutoModelForCausalLM.from_pretrained(
     dense_model_path,
     torch_dtype=torch.bfloat16,
@@ -168,19 +163,30 @@ train_sampler = DistributedSampler(train_dataset)
 val_sampler = DistributedSampler(val_dataset, shuffle=False)
 
 train_loader = DataLoader(
-    train_dataset, batch_size=train_params["batch_size"], sampler=train_sampler,
-    num_workers=loader_params["num_workers"], pin_memory=True,
+    train_dataset,
+    batch_size=train_params["batch_size"],
+    sampler=train_sampler,
+    num_workers=loader_params["num_workers"],
+    pin_memory=True,
 )
 val_loader = DataLoader(
-    val_dataset, batch_size=train_params["batch_size"], sampler=val_sampler,
-    num_workers=loader_params["num_workers"], pin_memory=True,
+    val_dataset,
+    batch_size=train_params["batch_size"],
+    sampler=val_sampler,
+    num_workers=loader_params["num_workers"],
+    pin_memory=True,
 )
 
 accumulation_steps = train_params.get("gradient_accumulation_steps", 1)
 
 # Get only the parameters that are unfrozen
 trainable_params = [p for p in llm.parameters() if p.requires_grad]
-optimizer = optim.AdamW(trainable_params, lr=train_params["learning_rate"], weight_decay=train_params["weight_decay"], fused=True)
+optimizer = optim.AdamW(
+    trainable_params,
+    lr=train_params["learning_rate"],
+    weight_decay=train_params["weight_decay"],
+    fused=True,
+)
 scaler = GradScaler()
 total_steps = (len(train_loader) // accumulation_steps) * NUM_EPOCHS
 scheduler = CosineAnnealingLR(optimizer, T_max=total_steps)
@@ -188,7 +194,7 @@ loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
 
 # --- Resumption logic for Dense Model ---
 start_epoch = 0
-best_val_loss = float('inf')
+best_val_loss = float("inf")
 latest_checkpoint_path = os.path.join(DENSE_CHECKPOINT_DIR, "dense_latest.pth")
 
 should_resume = 1.0 if local_rank == 0 and os.path.exists(latest_checkpoint_path) else 0.0
@@ -198,22 +204,22 @@ dist.broadcast(resume_tensor, src=0)
 if resume_tensor.item() == 1.0:
     if local_rank == 0:
         print(f"💾 Resuming dense training from latest checkpoint: {latest_checkpoint_path}")
-    
+
     load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
     checkpoint = torch.load(latest_checkpoint_path, map_location="cpu")
-    
+
     with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
-        llm.load_state_dict(checkpoint['model_state_dict'])
-    
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-    
-    start_epoch = checkpoint['epoch'] + 1
-    best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+        llm.load_state_dict(checkpoint["model_state_dict"])
+
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+
+    start_epoch = checkpoint["epoch"] + 1
+    best_val_loss = checkpoint.get("best_val_loss", float("inf"))
 
     del checkpoint
     gc.collect()
-    
+
     dist.barrier()
     if local_rank == 0:
         print(f"✅ Resumed successfully. Starting from epoch {start_epoch}.")
@@ -225,7 +231,7 @@ if local_rank == 0:
     print(f"Optimizing {sum(p.numel() for p in trainable_params)} trainable parameters.")
 
 metrics_path = os.path.join(OUTPUT_DIR, "training_metrics_dense.json")
-metrics_history = {"epoch": [], "train_loss": [], "val_loss": [], "learning_rate":[]}
+metrics_history = {"epoch": [], "train_loss": [], "val_loss": [], "learning_rate": []}
 if local_rank == 0 and start_epoch > 0 and os.path.exists(metrics_path):
     with open(metrics_path, "r") as f:
         metrics_history = json.load(f)
@@ -243,7 +249,9 @@ for epoch in range(start_epoch, NUM_EPOCHS):
     optimizer.zero_grad()
     for i, (images, input_ids, attention_mask) in enumerate(train_loader):
         images, input_ids, attention_mask = (
-            images.to(DEVICE), input_ids.to(DEVICE), attention_mask.to(DEVICE),
+            images.to(DEVICE),
+            input_ids.to(DEVICE),
+            attention_mask.to(DEVICE),
         )
 
         with autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -252,35 +260,35 @@ for epoch in range(start_epoch, NUM_EPOCHS):
                 patch_embeddings = vision_encoder(images).last_hidden_state
                 visual_soft_tokens = vision_connector(patch_embeddings)
                 text_embeddings = llm.model.embed_tokens(input_ids)
-            
+
             combined_embeddings = torch.cat([visual_soft_tokens, text_embeddings], dim=1)
             combined_attention_mask = torch.cat(
                 [torch.ones(visual_soft_tokens.shape[:2], device=DEVICE), attention_mask],
                 dim=1,
             )
-            
+
             outputs = llm(
                 inputs_embeds=combined_embeddings,
                 attention_mask=combined_attention_mask,
             )
             logits = outputs.logits
-            
+
             num_visual_tokens = visual_soft_tokens.shape[1]
             text_logits = logits[..., num_visual_tokens:-1, :].contiguous()
             text_labels = input_ids[..., 1:].contiguous()
-            
+
             loss = loss_fn(text_logits.view(-1, llm.config.vocab_size), text_labels.view(-1))
             loss = loss / accumulation_steps
 
         scaler.scale(loss).backward()
-        
+
         if loss.item() > 0:
             total_train_loss += loss.item() * accumulation_steps
 
         if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
-            
+
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
@@ -288,7 +296,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
 
     avg_train_loss = total_train_loss / len(train_loader)
     if local_rank == 0:
-        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] - Training Loss: {avg_train_loss:.4f}")
+        print(f"Epoch [{epoch + 1}/{NUM_EPOCHS}] - Training Loss: {avg_train_loss:.4f}")
 
     # --- Validation Phase ---
     llm.eval()
@@ -296,7 +304,9 @@ for epoch in range(start_epoch, NUM_EPOCHS):
     with torch.no_grad():
         for i, (images, input_ids, attention_mask) in enumerate(val_loader):
             images, input_ids, attention_mask = (
-                images.to(DEVICE), input_ids.to(DEVICE), attention_mask.to(DEVICE),
+                images.to(DEVICE),
+                input_ids.to(DEVICE),
+                attention_mask.to(DEVICE),
             )
             with autocast(device_type="cuda", dtype=torch.bfloat16):
                 patch_embeddings = vision_encoder(images).last_hidden_state
@@ -308,26 +318,25 @@ for epoch in range(start_epoch, NUM_EPOCHS):
                     dim=1,
                 )
                 outputs = llm(
-                    inputs_embeds=combined_embeddings, attention_mask=combined_attention_mask,
+                    inputs_embeds=combined_embeddings,
+                    attention_mask=combined_attention_mask,
                 )
                 logits = outputs.logits
                 num_visual_tokens = visual_soft_tokens.shape[1]
                 text_logits = logits[..., num_visual_tokens:-1, :].contiguous()
                 text_labels = input_ids[..., 1:].contiguous()
-                
-                loss = loss_fn(
-                    text_logits.view(-1, llm.config.vocab_size), text_labels.view(-1)
-                )
+
+                loss = loss_fn(text_logits.view(-1, llm.config.vocab_size), text_labels.view(-1))
                 total_val_loss += loss.item()
 
     avg_val_loss = total_val_loss / len(val_loader)
-    
+
     val_loss_tensor = torch.tensor(avg_val_loss).to(DEVICE)
     dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
     avg_val_loss = val_loss_tensor.item()
-    
+
     if local_rank == 0:
-        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] - Validation Loss: {avg_val_loss:.4f}")
+        print(f"Epoch [{epoch + 1}/{NUM_EPOCHS}] - Validation Loss: {avg_val_loss:.4f}")
 
     # --- Metrics and Checkpoint Saving ---
     if local_rank == 0:
@@ -342,30 +351,32 @@ for epoch in range(start_epoch, NUM_EPOCHS):
     save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
     with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, save_policy):
         llm_state_dict = llm.state_dict()
-    
+
     if local_rank == 0:
         consolidated_checkpoint = {
-            'model_state_dict': llm_state_dict,
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
-            'epoch': epoch,
-            'best_val_loss': best_val_loss,
-            'current_val_loss': avg_val_loss,
+            "model_state_dict": llm_state_dict,
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "epoch": epoch,
+            "best_val_loss": best_val_loss,
+            "current_val_loss": avg_val_loss,
         }
 
         os.makedirs(DENSE_CHECKPOINT_DIR, exist_ok=True)
-        
+
         latest_checkpoint_path = os.path.join(DENSE_CHECKPOINT_DIR, "dense_latest.pth")
         torch.save(consolidated_checkpoint, latest_checkpoint_path)
         print(f"💾 Saved latest checkpoint to {latest_checkpoint_path}")
 
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            consolidated_checkpoint['best_val_loss'] = best_val_loss 
-            
+            consolidated_checkpoint["best_val_loss"] = best_val_loss
+
             best_checkpoint_path = os.path.join(DENSE_CHECKPOINT_DIR, "dense_best.pth")
             torch.save(consolidated_checkpoint, best_checkpoint_path)
-            print(f"🏆 New best model! Val loss: {avg_val_loss:.4f}. Saved to {best_checkpoint_path}")
+            print(
+                f"🏆 New best model! Val loss: {avg_val_loss:.4f}. Saved to {best_checkpoint_path}"
+            )
 
     dist.barrier()
 

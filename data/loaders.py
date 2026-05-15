@@ -3,9 +3,9 @@ Dataset utilities and collate functions.
 """
 
 import torch
-from transformers import AutoTokenizer
 from datasets import load_dataset
 from torch.utils.data import DataLoader
+from transformers import AutoTokenizer
 
 
 def get_ag_news_data():

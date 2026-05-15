@@ -1,40 +1,41 @@
-import time
-import json
-import yaml
-import torch
-import os
 import gc
+import json
+import os
+from functools import partial
+
+import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
-from transformers import (
-    AutoProcessor,
-    AutoTokenizer,
-    AutoConfig,
-    AutoModelForCausalLM,
-    CLIPVisionModel,
-)
-from models import VisionLanguageConnector
-from data import COCO_Loader
+import yaml
 from torch.amp import GradScaler, autocast
-from torch.distributed.fsdp import CPUOffload
-import torch.distributed as dist
+from torch.distributed.fsdp import (
+    CPUOffload,
+    FullStateDictConfig,
+    StateDictType,
+)
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
-    StateDictType,
-    FullStateDictConfig,
 )
-from torch.utils.data.distributed import DistributedSampler
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-from functools import partial
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoProcessor,
+    AutoTokenizer,
+    CLIPVisionModel,
+)
+from transformers.models.mistral.modeling_mistral import MistralMLP
+
+from data import COCO_Loader
+from models import VisionLanguageConnector
 from models.custom_mistral import (
     MistralMoEConfig,
     MistralMoEForCausalLM,
-    MistralMoEDecoderLayer,
 )
-
-from transformers.models.mistral.modeling_mistral import MistralMLP
 
 # --- 1. Register Custom Architecture ---
 AutoConfig.register("mistral_moe", MistralMoEConfig)
@@ -91,7 +92,7 @@ if local_rank == 0:
     print("Setting MoE layers to 'soft' routing mode for Stage 2.5.")
 for layer in llm.model.layers:
     if hasattr(layer.mlp, "routing_mode"):
-        layer.mlp.routing_mode = 'soft'
+        layer.mlp.routing_mode = "soft"
 
 if local_rank == 0:
     print("Preparing model for Stage 2.5: Freezing experts, unfreezing routers.")
@@ -113,7 +114,9 @@ llm = FSDP(
     auto_wrap_policy=my_auto_wrap_policy,
     cpu_offload=CPUOffload(offload_params=None),
     mixed_precision=torch.distributed.fsdp.MixedPrecision(
-        param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16, buffer_dtype=torch.bfloat16,
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.bfloat16,
+        buffer_dtype=torch.bfloat16,
     ),
     use_orig_params=True,
     ignored_modules=ignored_modules,
@@ -143,10 +146,10 @@ if should_load:
     load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
     with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
         llm.load_state_dict(state_dict, strict=False)
-    
+
     del state_dict
     gc.collect()
-    
+
     # Barrier to ensure all processes have loaded before continuing
     dist.barrier()
 
@@ -154,9 +157,11 @@ if should_load:
         print("✅ Stage 2 'best' state loaded successfully.")
 else:
     if local_rank == 0:
-        print(f"🚨 WARNING: Stage 2 best checkpoint not found at '{checkpoint_path}'. Starting from base weights.")
+        print(
+            f"🚨 WARNING: Stage 2 best checkpoint not found at '{checkpoint_path}'. Starting from base weights."
+        )
 
-#ROBUST FIX: Manually re-initialize gates AFTER all loading is done
+# ROBUST FIX: Manually re-initialize gates AFTER all loading is done
 if local_rank == 0:
     print("--- Forcing re-initialization of router gates to fix corruption ---")
 
@@ -178,16 +183,16 @@ if local_rank == 0:
     expert_0_requires_grad = any(p.requires_grad for p in sample_layer.mlp.experts[0].parameters())
     expert_1_requires_grad = any(p.requires_grad for p in sample_layer.mlp.experts[1].parameters())
     gate_requires_grad = sample_layer.mlp.gate.weight.requires_grad
-    
+
     print(f"Expert 0 trainable: {expert_0_requires_grad} (should be False)")
     print(f"Expert 1 trainable: {expert_1_requires_grad} (should be False)")
     print(f"Gate trainable: {gate_requires_grad} (should be True)")
-    
+
     if expert_0_requires_grad or expert_1_requires_grad:
         raise RuntimeError("❌ Experts are not frozen! This will corrupt training.")
     if not gate_requires_grad:
         raise RuntimeError("❌ Router gate is frozen! Cannot train routers.")
-    
+
     print("✅ All weight freeze states correct")
     print("==================================\n")
 
@@ -197,35 +202,50 @@ if local_rank == 0:
 if local_rank == 0:
     print("Creating datasets and dataloaders...")
 train_dataset = COCO_Loader(
-    image_dir=paths["image_dir"], annotations_file=paths["annotations_file"],
-    clip_processor=clip_processor, tokenizer=tokenizer,
-    subset_fraction=train_params["subset_fraction"], split="train",
+    image_dir=paths["image_dir"],
+    annotations_file=paths["annotations_file"],
+    clip_processor=clip_processor,
+    tokenizer=tokenizer,
+    subset_fraction=train_params["subset_fraction"],
+    split="train",
     seed=loader_params.get("data_seed", 42),  # Fixed seed for reproducibility
 )
 val_dataset = COCO_Loader(
-    image_dir=paths["image_dir"], annotations_file=paths["annotations_file"],
-    clip_processor=clip_processor, tokenizer=tokenizer,
-    subset_fraction=train_params["subset_fraction"], split="val",
+    image_dir=paths["image_dir"],
+    annotations_file=paths["annotations_file"],
+    clip_processor=clip_processor,
+    tokenizer=tokenizer,
+    subset_fraction=train_params["subset_fraction"],
+    split="val",
     seed=loader_params.get("data_seed", 42),  # Same seed ensures consistent splits
 )
 train_sampler = DistributedSampler(train_dataset)
 val_sampler = DistributedSampler(val_dataset, shuffle=False)
 train_loader = DataLoader(
-    train_dataset, batch_size=train_params["batch_size"], sampler=train_sampler,
-    num_workers=loader_params["num_workers"], pin_memory=True,
+    train_dataset,
+    batch_size=train_params["batch_size"],
+    sampler=train_sampler,
+    num_workers=loader_params["num_workers"],
+    pin_memory=True,
 )
 val_loader = DataLoader(
-    val_dataset, batch_size=train_params["batch_size"], sampler=val_sampler,
-    num_workers=loader_params["num_workers"], pin_memory=True,
+    val_dataset,
+    batch_size=train_params["batch_size"],
+    sampler=val_sampler,
+    num_workers=loader_params["num_workers"],
+    pin_memory=True,
 )
 
-# Create optimizer AFTER gates are fixed 
+# Create optimizer AFTER gates are fixed
 if local_rank == 0:
     print("Creating optimizer and scheduler with refreshed trainable parameters...")
 accumulation_steps = train_params.get("gradient_accumulation_steps", 1)
 trainable_params = [p for p in llm.parameters() if p.requires_grad]
 optimizer = optim.AdamW(
-    trainable_params, lr=train_params["learning_rate"], weight_decay=train_params["weight_decay"], fused=True,
+    trainable_params,
+    lr=train_params["learning_rate"],
+    weight_decay=train_params["weight_decay"],
+    fused=True,
 )
 scaler = GradScaler()
 total_steps = (len(train_loader) // accumulation_steps) * NUM_EPOCHS
@@ -234,7 +254,7 @@ loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
 
 # --- 5.2. Resume from Stage 2.5 Checkpoint ---
 start_epoch = 0
-best_val_loss = float('inf')
+best_val_loss = float("inf")
 latest_checkpoint_path = os.path.join(STAGE2_5_CHECKPOINT_DIR, "llm_stage2_5_latest.pth")
 
 # Have rank 0 check if the 'latest' checkpoint exists
@@ -248,23 +268,23 @@ if resume_tensor.item() == 1.0:
 
     # All ranks load the checkpoint
     checkpoint = torch.load(latest_checkpoint_path, map_location="cpu")
-    model_state_dict = checkpoint['model_state_dict']
+    model_state_dict = checkpoint["model_state_dict"]
 
     load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
     with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
         llm.load_state_dict(model_state_dict, strict=False)
 
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-    
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+
     # Update epoch and best_val_loss from the checkpoint to continue correctly
-    start_epoch = checkpoint['epoch'] + 1
-    best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+    start_epoch = checkpoint["epoch"] + 1
+    best_val_loss = checkpoint.get("best_val_loss", float("inf"))
 
     del checkpoint
     del model_state_dict
     gc.collect()
-    
+
     dist.barrier()
     if local_rank == 0:
         print(f"✅ Resumed successfully. Starting from epoch {start_epoch}.")
@@ -274,10 +294,13 @@ else:
 
 # --- 5.3. Finalize Model Setup ---
 llm.model.embed_tokens.to(DEVICE)
-#llm.gradient_checkpointing_enable()
+# llm.gradient_checkpointing_enable()
 vision_connector = VisionLanguageConnector().to(DEVICE)
 vision_connector.load_state_dict(
-    torch.load(os.path.join(OUTPUT_DIR, "vision_connector_stage1_best.pth"), map_location=DEVICE,)
+    torch.load(
+        os.path.join(OUTPUT_DIR, "vision_connector_stage1_best.pth"),
+        map_location=DEVICE,
+    )
 )
 for param in vision_encoder.parameters():
     param.requires_grad = False
@@ -288,8 +311,14 @@ if local_rank == 0:
     print(f"Optimizing {sum(p.numel() for p in trainable_params)} trainable router parameters.")
 
 metrics_history = {
-    "epoch": [], "train_loss": [], "train_ce_loss": [], "train_lb_loss": [],
-    "val_loss": [], "learning_rate": [], "entropy": [], "temperature": [],
+    "epoch": [],
+    "train_loss": [],
+    "train_ce_loss": [],
+    "train_lb_loss": [],
+    "val_loss": [],
+    "learning_rate": [],
+    "entropy": [],
+    "temperature": [],
 }
 metrics_path = os.path.join(OUTPUT_DIR, "training_metrics_stage2.5.json")
 if local_rank == 0 and start_epoch > 0 and os.path.exists(metrics_path):
@@ -315,22 +344,24 @@ for epoch in range(start_epoch, NUM_EPOCHS):
 
     # Temperature annealing: Start high (exploration) -> decay to 1.0 (exploitation)
     # High temperature = softer probabilities = more exploration
-    temperature = max(1.0, 2.0 * (0.9 ** epoch))  # Starts at 2.0, decays to 1.0
-    
+    temperature = max(1.0, 2.0 * (0.9**epoch))  # Starts at 2.0, decays to 1.0
+
     # Set temperature for all MoE layers
     for layer in llm.module.model.layers:
         if hasattr(layer.mlp, "temperature"):
             layer.mlp.temperature = temperature
-    
+
     if local_rank == 0 and epoch == start_epoch:
-        print(f"  Router temperature for epoch {epoch+1}: {temperature:.3f}")
+        print(f"  Router temperature for epoch {epoch + 1}: {temperature:.3f}")
 
     total_train_loss, total_ce_loss, total_lb_loss = 0, 0, 0
     optimizer.zero_grad()
-    
+
     for i, (images, input_ids, attention_mask) in enumerate(train_loader):
         images, input_ids, attention_mask = (
-            images.to(DEVICE), input_ids.to(DEVICE), attention_mask.to(DEVICE),
+            images.to(DEVICE),
+            input_ids.to(DEVICE),
+            attention_mask.to(DEVICE),
         )
 
         with autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -341,35 +372,37 @@ for epoch in range(start_epoch, NUM_EPOCHS):
 
             combined_embeddings = torch.cat([visual_soft_tokens, text_embeddings], dim=1)
             combined_attention_mask = torch.cat(
-                [torch.ones(visual_soft_tokens.shape[:2], device=DEVICE), attention_mask,],
+                [
+                    torch.ones(visual_soft_tokens.shape[:2], device=DEVICE),
+                    attention_mask,
+                ],
                 dim=1,
             )
 
             # Pass temperature to MoE layers through forward hooks
             # Note: LLM doesn't directly accept temperature, so we set it as layer attribute
             for layer in llm.module.model.layers:
-                if hasattr(layer.mlp, "routing_mode") and layer.mlp.routing_mode == 'soft':
+                if hasattr(layer.mlp, "routing_mode") and layer.mlp.routing_mode == "soft":
                     # Store temperature for this forward pass
                     layer.mlp._forward_temperature = temperature
-            
+
             outputs = llm(
-                inputs_embeds=combined_embeddings, attention_mask=combined_attention_mask,
+                inputs_embeds=combined_embeddings,
+                attention_mask=combined_attention_mask,
             )
             logits = outputs.logits
 
             num_visual_tokens = visual_soft_tokens.shape[1]
             text_logits = logits[..., num_visual_tokens:-1, :].contiguous()
             text_labels = input_ids[..., 1:].contiguous()
-            ce_loss = loss_fn(
-                text_logits.view(-1, llm.config.vocab_size), text_labels.view(-1)
-            )
+            ce_loss = loss_fn(text_logits.view(-1, llm.config.vocab_size), text_labels.view(-1))
 
             total_load_balancing_loss = 0
             total_entropy_bonus = 0
             for layer in llm.module.model.layers:
                 if hasattr(layer.mlp, "load_balancing_loss"):
                     total_load_balancing_loss += layer.mlp.load_balancing_loss
-                
+
                 # Add entropy bonus to encourage exploration
                 if hasattr(layer.mlp, "gate"):
                     # Get routing logits for current batch
@@ -381,16 +414,16 @@ for epoch in range(start_epoch, NUM_EPOCHS):
 
             # Entropy coefficient: negative because we want to MAXIMIZE entropy (minimize negative entropy)
             # Start with small coefficient and decay over time to allow specialization later
-            entropy_coeff = 0.001 * (0.95 ** epoch)  # Decays from 0.001 to ~0.0003 over 20 epochs
-            
+            entropy_coeff = 0.001 * (0.95**epoch)  # Decays from 0.001 to ~0.0003 over 20 epochs
+
             loss = (
-                ce_loss 
+                ce_loss
                 + LOAD_BALANCING_COEFF * total_load_balancing_loss
                 - entropy_coeff * total_entropy_bonus  # Negative = maximize entropy
             ) / accumulation_steps
 
         scaler.scale(loss).backward()
-        
+
         if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):
             # Step 1: Unscale gradients
             scaler.unscale_(optimizer)
@@ -398,7 +431,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             # Step 2: Collect all router parameters and compute their norm BEFORE clipping
             router_params = []
             for name, param in llm.named_parameters():
-                if 'mlp.gate' in name and param.requires_grad:  # ← Remove grad check
+                if "mlp.gate" in name and param.requires_grad:  # ← Remove grad check
                     router_params.append(param)
 
             if router_params:
@@ -408,12 +441,12 @@ for epoch in range(start_epoch, NUM_EPOCHS):
                     if p.grad is not None:  # ← Add this check
                         param_norm = p.grad.detach().data.norm(2)
                         total_norm += param_norm.item() ** 2
-                total_norm = total_norm ** 0.5
-                
+                total_norm = total_norm**0.5
+
                 # Now clip the gradients - use MUCH higher threshold
                 clipped_norm = torch.nn.utils.clip_grad_norm_(
-                    router_params, 
-                    max_norm=10.0  # Increased from 1.0 to 10.0
+                    router_params,
+                    max_norm=10.0,  # Increased from 1.0 to 10.0
                 )
 
             # Step 3: Update optimizer
@@ -429,7 +462,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
                 total_lb_loss += total_load_balancing_loss.item()
             if isinstance(total_entropy_bonus, torch.Tensor):
                 # Track average entropy (will be added to metrics later)
-                if not hasattr(torch.cuda, '_total_entropy'):
+                if not hasattr(torch.cuda, "_total_entropy"):
                     torch.cuda._total_entropy = 0
                     torch.cuda._entropy_count = 0
                 torch.cuda._total_entropy += total_entropy_bonus.item()
@@ -442,54 +475,60 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             # Monitor routing decisions for first layer
             with torch.no_grad():
                 num_visual = visual_soft_tokens.shape[1]
-                
+
                 # Sample visual token (middle of visual sequence)
                 visual_idx = num_visual // 2
-                visual_hidden = combined_embeddings[0:1, visual_idx:visual_idx+1, :]
-                
+                visual_hidden = combined_embeddings[0:1, visual_idx : visual_idx + 1, :]
+
                 # Sample text token (middle of text sequence)
                 text_idx = num_visual + (input_ids.shape[1] // 2)
-                text_hidden = combined_embeddings[0:1, text_idx:text_idx+1, :]
-                
-                print(f"\n{'='*60}")
-                print(f"Router Analysis - Batch {i+1} | Epoch {epoch+1}")
-                print(f"{'='*60}")
-                
+                text_hidden = combined_embeddings[0:1, text_idx : text_idx + 1, :]
+
+                print(f"\n{'=' * 60}")
+                print(f"Router Analysis - Batch {i + 1} | Epoch {epoch + 1}")
+                print(f"{'=' * 60}")
+
                 for layer_idx in [0, 15, 31]:  # First, middle, last
                     check_layer = llm.module.model.layers[layer_idx]
-                    if hasattr(check_layer.mlp, 'gate'):
+                    if hasattr(check_layer.mlp, "gate"):
                         # Convert to float32 to match gate weights dtype
                         visual_hidden_fp32 = visual_hidden.float()
                         text_hidden_fp32 = text_hidden.float()
-                        
+
                         # Visual token routing
                         visual_logits = check_layer.mlp.gate(visual_hidden_fp32.view(-1, 4096))
                         visual_probs = torch.softmax(visual_logits, dim=-1)
-                        
+
                         # Text token routing
                         text_logits = check_layer.mlp.gate(text_hidden_fp32.view(-1, 4096))
                         text_probs = torch.softmax(text_logits, dim=-1)
-                        
+
                         print(f"\nLayer {layer_idx:2d}:")
-                        print(f"  Visual Token -> E0: {visual_probs[0,0]:.3f}, E1: {visual_probs[0,1]:.3f} ({'✓E0' if visual_probs[0,0] > 0.6 else '✓E1' if visual_probs[0,1] > 0.6 else 'MIXED'})")
-                        print(f"  Text   Token -> E0: {text_probs[0,0]:.3f}, E1: {text_probs[0,1]:.3f} ({'✓E0' if text_probs[0,0] > 0.6 else '✓E1' if text_probs[0,1] > 0.6 else 'MIXED'})")
-                        
+                        print(
+                            f"  Visual Token -> E0: {visual_probs[0, 0]:.3f}, E1: {visual_probs[0, 1]:.3f} ({'✓E0' if visual_probs[0, 0] > 0.6 else '✓E1' if visual_probs[0, 1] > 0.6 else 'MIXED'})"
+                        )
+                        print(
+                            f"  Text   Token -> E0: {text_probs[0, 0]:.3f}, E1: {text_probs[0, 1]:.3f} ({'✓E0' if text_probs[0, 0] > 0.6 else '✓E1' if text_probs[0, 1] > 0.6 else 'MIXED'})"
+                        )
+
                         # Calculate specialization score (how different are the routings?)
-                        specialization = abs(visual_probs[0,0] - text_probs[0,0]).item()
-                        print(f"  Specialization score: {specialization:.3f} ({'GOOD' if specialization > 0.3 else 'WEAK'})")
-                
-                print(f"{'='*60}\n")
+                        specialization = abs(visual_probs[0, 0] - text_probs[0, 0]).item()
+                        print(
+                            f"  Specialization score: {specialization:.3f} ({'GOOD' if specialization > 0.3 else 'WEAK'})"
+                        )
+
+                print(f"{'=' * 60}\n")
 
         if local_rank == 0 and (i + 1) % 100 == 0:
-            print(f"  Epoch {epoch+1}, Batch [{i+1}/{len(train_loader)}]")
+            print(f"  Epoch {epoch + 1}, Batch [{i + 1}/{len(train_loader)}]")
 
     avg_train_loss = total_train_loss / len(train_loader)
     avg_ce_loss = total_ce_loss / len(train_loader)
     avg_lb_loss = total_lb_loss / len(train_loader)
-    
+
     # Calculate average entropy
     avg_entropy = 0
-    if hasattr(torch.cuda, '_total_entropy') and torch.cuda._entropy_count > 0:
+    if hasattr(torch.cuda, "_total_entropy") and torch.cuda._entropy_count > 0:
         avg_entropy = torch.cuda._total_entropy / torch.cuda._entropy_count
         # Reset for next epoch
         torch.cuda._total_entropy = 0
@@ -497,7 +536,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
 
     if local_rank == 0:
         print(
-            f"Epoch [{epoch+1}/{NUM_EPOCHS}] - Training Loss: {avg_train_loss:.4f} | CE Loss: {avg_ce_loss:.4f} | "
+            f"Epoch [{epoch + 1}/{NUM_EPOCHS}] - Training Loss: {avg_train_loss:.4f} | CE Loss: {avg_ce_loss:.4f} | "
             f"LB Loss: {avg_lb_loss:.4f} | Entropy: {avg_entropy:.4f} | Temp: {temperature:.3f}"
         )
 
@@ -506,34 +545,38 @@ for epoch in range(start_epoch, NUM_EPOCHS):
     total_val_loss = 0
     val_steps = 0
     MAX_VAL_BATCHES = 75  # DRASTICALLY reduced to prevent timeout
-    
+
     if local_rank == 0:
         print(f"  Starting validation (max {MAX_VAL_BATCHES} batches per GPU)...")
-    
+
     with torch.no_grad():
         for i, (images, input_ids, attention_mask) in enumerate(val_loader):
             # Early stop after MAX_VAL_BATCHES
             if i >= MAX_VAL_BATCHES:
                 break
-                
+
             images, input_ids, attention_mask = (
-                images.to(DEVICE), input_ids.to(DEVICE), attention_mask.to(DEVICE),
+                images.to(DEVICE),
+                input_ids.to(DEVICE),
+                attention_mask.to(DEVICE),
             )
-            
+
             try:
                 with autocast(device_type="cuda", dtype=torch.bfloat16):
                     patch_embeddings = vision_encoder(images).last_hidden_state
                     visual_soft_tokens = vision_connector(patch_embeddings)
                     text_embeddings = llm.model.embed_tokens(input_ids)
-                    combined_embeddings = torch.cat(
-                        [visual_soft_tokens, text_embeddings], dim=1
-                    )
+                    combined_embeddings = torch.cat([visual_soft_tokens, text_embeddings], dim=1)
                     combined_attention_mask = torch.cat(
-                        [torch.ones(visual_soft_tokens.shape[:2], device=DEVICE), attention_mask,],
+                        [
+                            torch.ones(visual_soft_tokens.shape[:2], device=DEVICE),
+                            attention_mask,
+                        ],
                         dim=1,
                     )
                     outputs = llm(
-                        inputs_embeds=combined_embeddings, attention_mask=combined_attention_mask,
+                        inputs_embeds=combined_embeddings,
+                        attention_mask=combined_attention_mask,
                     )
                     logits = outputs.logits
                     num_visual_tokens = visual_soft_tokens.shape[1]
@@ -550,10 +593,12 @@ for epoch in range(start_epoch, NUM_EPOCHS):
                 break
 
     # Each rank computed its own average - just use local average (no distributed aggregation)
-    avg_val_loss = total_val_loss / val_steps if val_steps > 0 else float('inf')
+    avg_val_loss = total_val_loss / val_steps if val_steps > 0 else float("inf")
 
     if local_rank == 0:
-        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] - Validation Loss: {avg_val_loss:.4f} (rank 0, {val_steps} batches)")
+        print(
+            f"Epoch [{epoch + 1}/{NUM_EPOCHS}] - Validation Loss: {avg_val_loss:.4f} (rank 0, {val_steps} batches)"
+        )
 
     # --- Metrics and Checkpoint Saving ---
     if local_rank == 0:
@@ -580,19 +625,19 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             param = llm.get_parameter(name)
             if param.requires_grad:
                 router_weights[name] = weight
-        
+
         # Create a single consolidated checkpoint for this epoch
         consolidated_checkpoint = {
-            'model_state_dict': router_weights,
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
-            'epoch': epoch,
-            'best_val_loss': best_val_loss,
-            'current_val_loss': avg_val_loss,
+            "model_state_dict": router_weights,
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "epoch": epoch,
+            "best_val_loss": best_val_loss,
+            "current_val_loss": avg_val_loss,
         }
 
         os.makedirs(STAGE2_5_CHECKPOINT_DIR, exist_ok=True)
-        
+
         # 1. Save this as the 'latest' checkpoint, overwriting the previous one
         latest_checkpoint_path = os.path.join(STAGE2_5_CHECKPOINT_DIR, "llm_stage2_5_latest.pth")
         torch.save(consolidated_checkpoint, latest_checkpoint_path)
@@ -602,11 +647,13 @@ for epoch in range(start_epoch, NUM_EPOCHS):
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             # Update the best_val_loss in the checkpoint before saving as 'best'
-            consolidated_checkpoint['best_val_loss'] = best_val_loss 
-            
+            consolidated_checkpoint["best_val_loss"] = best_val_loss
+
             best_checkpoint_path = os.path.join(STAGE2_5_CHECKPOINT_DIR, "llm_stage2_5_best.pth")
             torch.save(consolidated_checkpoint, best_checkpoint_path)
-            print(f"🏆 New best model! Val loss: {avg_val_loss:.4f}. Saved to {best_checkpoint_path}")
+            print(
+                f"🏆 New best model! Val loss: {avg_val_loss:.4f}. Saved to {best_checkpoint_path}"
+            )
 
     # Removed barrier - not needed since only rank 0 saves checkpoints
 

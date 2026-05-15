@@ -15,7 +15,7 @@ class MoELayer(nn.Module):
       Straight-Through Estimator. Used in Stages 2.5 and 3.
     """
 
-    def __init__(self, config, d_model: int, num_experts: int = 2, routing_mode: str = 'hard'):
+    def __init__(self, config, d_model: int, num_experts: int = 2, routing_mode: str = "hard"):
         super().__init__()
         self.d_model = d_model
         self.num_experts = num_experts
@@ -35,15 +35,17 @@ class MoELayer(nn.Module):
         nn.init.normal_(self.gate.weight, std=0.05)
 
     def forward(self, hidden_states: torch.Tensor, temperature: float = 1.0):
-        if hasattr(self, '_forward_temperature'):
+        if hasattr(self, "_forward_temperature"):
             temperature = self._forward_temperature
 
-        if self.routing_mode == 'hard':
+        if self.routing_mode == "hard":
             return self._hard_routing_forward(hidden_states)
-        elif self.routing_mode == 'soft':
+        elif self.routing_mode == "soft":
             return self._soft_routing_forward(hidden_states, temperature)
         else:
-            raise ValueError(f"Invalid routing mode: {self.routing_mode}. Must be 'hard' or 'soft'.")
+            raise ValueError(
+                f"Invalid routing mode: {self.routing_mode}. Must be 'hard' or 'soft'."
+            )
 
     def _hard_routing_forward(self, hidden_states: torch.Tensor):
         """
@@ -106,7 +108,7 @@ class MoELayer(nn.Module):
                 tokens_for_expert = hidden_flat[token_indices]
                 expert_output = expert(tokens_for_expert)
 
-                if hasattr(self, 'expert_dropout') and self.training:
+                if hasattr(self, "expert_dropout") and self.training:
                     expert_output = self.expert_dropout(expert_output)
 
                 weights = router_onehot[token_indices, expert_idx].unsqueeze(-1)

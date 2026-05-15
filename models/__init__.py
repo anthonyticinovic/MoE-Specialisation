@@ -4,6 +4,6 @@ MoE Specialisation Research Package
 
 __version__ = "0.1.0"
 
-from .vl_connector import VisionLanguageConnector
+from .custom_mistral import MistralMoEConfig, MistralMoEForCausalLM
 from .moe_layer import MoELayer
-from .custom_mistral import MistralMoEForCausalLM, MistralMoEConfig
+from .vl_connector import VisionLanguageConnector

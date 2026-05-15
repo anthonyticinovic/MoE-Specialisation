@@ -1,7 +1,7 @@
 import torch.nn as nn
-
-from transformers import MistralForCausalLM, MistralConfig
+from transformers import MistralConfig, MistralForCausalLM
 from transformers.models.mistral.modeling_mistral import MistralDecoderLayer
+
 from .moe_layer import MoELayer
 
 

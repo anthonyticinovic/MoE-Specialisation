@@ -1,37 +1,39 @@
-import time
-import json
-import yaml
-import torch
-import os
 import gc
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
-from transformers import (
-    AutoProcessor,
-    AutoTokenizer,
-    AutoConfig,
-    AutoModelForCausalLM,
-    CLIPVisionModel,
-)
-from models import VisionLanguageConnector
-from data import COCO_Loader
-from torch.amp import GradScaler, autocast
-from torch.distributed.fsdp import CPUOffload
-from torch.optim.lr_scheduler import CosineAnnealingLR
-
-import torch.distributed as dist
-from torch.distributed.fsdp import (
-    FullyShardedDataParallel as FSDP,
-    StateDictType,
-    FullStateDictConfig,
-)
-from torch.utils.data.distributed import DistributedSampler
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+import json
+import os
+import time
 from functools import partial
 
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+import torch.optim as optim
+import yaml
+from torch.amp import GradScaler, autocast
+from torch.distributed.fsdp import (
+    CPUOffload,
+    FullStateDictConfig,
+    StateDictType,
+)
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+)
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoProcessor,
+    AutoTokenizer,
+    CLIPVisionModel,
+)
 from transformers.models.mistral.modeling_mistral import MistralMLP
-from models.custom_mistral import MistralMoEConfig, MistralMoEForCausalLM, MistralMoEDecoderLayer
+
+from data import COCO_Loader
+from models import VisionLanguageConnector
+from models.custom_mistral import MistralMoEConfig, MistralMoEForCausalLM
 
 AutoConfig.register("mistral_moe", MistralMoEConfig)
 AutoModelForCausalLM.register(MistralMoEConfig, MistralMoEForCausalLM)
@@ -134,7 +136,7 @@ print(f"--- Rank {local_rank} --- ✅ Model wrapped with FSDP.")
 
 # --- MODIFIED: Robust 'best' and 'latest' checkpoint loading ---
 latest_epoch = 0
-best_val_loss = float('inf')
+best_val_loss = float("inf")
 checkpoint_found = torch.tensor(0.0, device=DEVICE)
 
 latest_checkpoint_path = os.path.join(STAGE2_CHECKPOINT_DIR, "llm_stage2_latest.pth")
@@ -150,25 +152,27 @@ dist.broadcast(checkpoint_found, src=0)
 if checkpoint_found.item() == 1.0:
     if local_rank == 0:
         print(f"💾 Found latest checkpoint. Resuming training...")
-    
+
     load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
     with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
         if local_rank == 0:
             checkpoint = torch.load(latest_checkpoint_path, map_location="cpu", weights_only=False)
-            state_dict_to_load = checkpoint['model_state_dict']
-            latest_epoch = checkpoint['epoch']
-            best_val_loss = checkpoint['best_val_loss']
-            
-            print(f"✅ Resumed from epoch {latest_epoch}. Previous best validation loss: {best_val_loss:.4f}")
-            
+            state_dict_to_load = checkpoint["model_state_dict"]
+            latest_epoch = checkpoint["epoch"]
+            best_val_loss = checkpoint["best_val_loss"]
+
+            print(
+                f"✅ Resumed from epoch {latest_epoch}. Previous best validation loss: {best_val_loss:.4f}"
+            )
+
             del checkpoint
             gc.collect()
         else:
             state_dict_to_load = {}
-        
+
         # Use strict=False for FSDP rank0_only loading
         llm.load_state_dict(state_dict_to_load, strict=False)
-        
+
         if local_rank == 0:
             print(f"✅ Checkpoint loaded successfully!")
 
@@ -250,42 +254,53 @@ val_loader = DataLoader(
 accumulation_steps = train_params.get("gradient_accumulation_steps", 1)
 if local_rank == 0:
     print(f"Using gradient accumulation with {accumulation_steps} steps.")
-    print(f"Effective batch size: {train_params['batch_size'] * accumulation_steps * dist.get_world_size()}")
+    print(
+        f"Effective batch size: {train_params['batch_size'] * accumulation_steps * dist.get_world_size()}"
+    )
 
 trainable_params = [p for p in llm.parameters() if p.requires_grad]
-optimizer = optim.AdamW(trainable_params, lr=train_params["learning_rate"], weight_decay=train_params["weight_decay"], fused=True)
+optimizer = optim.AdamW(
+    trainable_params,
+    lr=train_params["learning_rate"],
+    weight_decay=train_params["weight_decay"],
+    fused=True,
+)
 scaler = GradScaler()
 total_steps = (len(train_loader) // accumulation_steps) * NUM_EPOCHS
 scheduler = CosineAnnealingLR(optimizer, T_max=total_steps)
 loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
 
 if local_rank == 0:
-    print(f"Optimizing {sum(p.numel() for p in llm.parameters() if p.requires_grad)} trainable parameters.")
+    print(
+        f"Optimizing {sum(p.numel() for p in llm.parameters() if p.requires_grad)} trainable parameters."
+    )
 
 # --- Load optimizer & scheduler state if resuming ---
 if checkpoint_found.item() == 1.0:
     if local_rank == 0:
         print(f"💾 Loading optimizer and scheduler states from checkpoint...")
         checkpoint = torch.load(latest_checkpoint_path, map_location="cpu", weights_only=False)
-        
-        if 'optimizer_state_dict' in checkpoint:
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            print(f"  ✅ Loaded optimizer state (learning_rate: {optimizer.param_groups[0]['lr']:.2e})")
+
+        if "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            print(
+                f"  ✅ Loaded optimizer state (learning_rate: {optimizer.param_groups[0]['lr']:.2e})"
+            )
         else:
             print(f"  ⚠️ No optimizer state found in checkpoint (old format)")
-        
-        if 'scheduler_state_dict' in checkpoint:
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+        if "scheduler_state_dict" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
             print(f"  ✅ Loaded scheduler state (last_epoch: {scheduler.last_epoch})")
         else:
             print(f"  ⚠️ No scheduler state found in checkpoint (old format)")
-        
+
         del checkpoint
         gc.collect()
-    
+
     dist.barrier()
 
-metrics_history = {"epoch": [], "train_loss": [], "val_loss": [], "learning_rate":[]}
+metrics_history = {"epoch": [], "train_loss": [], "val_loss": [], "learning_rate": []}
 metrics_path = os.path.join(OUTPUT_DIR, "training_metrics_stage2.json")
 if local_rank == 0 and latest_epoch > 0 and os.path.exists(metrics_path):
     with open(metrics_path, "r") as f:
@@ -295,7 +310,9 @@ if local_rank == 0 and latest_epoch > 0 and os.path.exists(metrics_path):
 # 8. TRAINING LOOP
 # ====================================================================================
 if local_rank == 0:
-    print(f"🚀 Starting Stage 2 training from epoch {latest_epoch} for {NUM_EPOCHS} total epochs...")
+    print(
+        f"🚀 Starting Stage 2 training from epoch {latest_epoch} for {NUM_EPOCHS} total epochs..."
+    )
 start_time = time.time()
 for epoch in range(latest_epoch, NUM_EPOCHS):
     train_sampler.set_epoch(epoch)
@@ -304,7 +321,9 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
     optimizer.zero_grad()
     for i, (images, input_ids, attention_mask) in enumerate(train_loader):
         images, input_ids, attention_mask = (
-            images.to(DEVICE), input_ids.to(DEVICE), attention_mask.to(DEVICE),
+            images.to(DEVICE),
+            input_ids.to(DEVICE),
+            attention_mask.to(DEVICE),
         )
 
         with autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -359,11 +378,11 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
             scheduler.step()
 
         if local_rank == 0 and (i + 1) % 100 == 0:
-            print(f"  Epoch {epoch+1}, Batch [{i+1}/{len(train_loader)}]")
+            print(f"  Epoch {epoch + 1}, Batch [{i + 1}/{len(train_loader)}]")
 
     avg_train_loss = total_train_loss / len(train_loader)
     if local_rank == 0:
-        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] - Training Loss: {avg_train_loss:.4f}")
+        print(f"Epoch [{epoch + 1}/{NUM_EPOCHS}] - Training Loss: {avg_train_loss:.4f}")
 
     # --- Validation Phase ---
     llm.eval()
@@ -371,7 +390,9 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
     with torch.no_grad():
         for i, (images, input_ids, attention_mask) in enumerate(val_loader):
             images, input_ids, attention_mask = (
-                images.to(DEVICE), input_ids.to(DEVICE), attention_mask.to(DEVICE),
+                images.to(DEVICE),
+                input_ids.to(DEVICE),
+                attention_mask.to(DEVICE),
             )
             with autocast(device_type="cuda", dtype=torch.bfloat16):
                 patch_embeddings = vision_encoder(images).last_hidden_state
@@ -416,17 +437,17 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
                 total_val_loss += loss.item()
 
     avg_val_loss = total_val_loss / len(val_loader)
-    
+
     # --- MODIFIED: Synchronize avg_val_loss across all GPUs ---
     val_loss_tensor = torch.tensor(avg_val_loss).to(DEVICE)
     dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
     avg_val_loss = val_loss_tensor.item()
-    
-    if local_rank == 0:
-        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] - Validation Loss: {avg_val_loss:.4f}")
 
     if local_rank == 0:
-        current_lr = optimizer.param_groups[0]['lr']
+        print(f"Epoch [{epoch + 1}/{NUM_EPOCHS}] - Validation Loss: {avg_val_loss:.4f}")
+
+    if local_rank == 0:
+        current_lr = optimizer.param_groups[0]["lr"]
         metrics_history["epoch"].append(epoch + 1)
         metrics_history["train_loss"].append(avg_train_loss)
         metrics_history["val_loss"].append(avg_val_loss)
@@ -443,16 +464,19 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
     if local_rank == 0:
         os.makedirs(STAGE2_CHECKPOINT_DIR, exist_ok=True)
         latest_model_path = os.path.join(STAGE2_CHECKPOINT_DIR, "llm_stage2_latest.pth")
-        
+
         # Save the 'latest' model for resuming (with optimizer & scheduler)
-        torch.save({
-            'epoch': epoch + 1,
-            'model_state_dict': cpu_state_dict,
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
-            'best_val_loss': best_val_loss,
-            'current_val_loss': avg_val_loss,
-        }, latest_model_path)
+        torch.save(
+            {
+                "epoch": epoch + 1,
+                "model_state_dict": cpu_state_dict,
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "best_val_loss": best_val_loss,
+                "current_val_loss": avg_val_loss,
+            },
+            latest_model_path,
+        )
         print(f"💾 Saved latest model checkpoint to {latest_model_path}")
 
         # Save the 'best' model if validation loss has improved
@@ -460,15 +484,20 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
             best_val_loss = avg_val_loss
             best_model_path = os.path.join(STAGE2_CHECKPOINT_DIR, "llm_stage2_best.pth")
             # Save best checkpoint with full state for proper resumption
-            torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': cpu_state_dict,
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'best_val_loss': best_val_loss,
-                'current_val_loss': avg_val_loss,
-            }, best_model_path)
-            print(f"🏆 New best model found! Validation loss: {avg_val_loss:.4f}. Saved to {best_model_path}")
+            torch.save(
+                {
+                    "epoch": epoch + 1,
+                    "model_state_dict": cpu_state_dict,
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "best_val_loss": best_val_loss,
+                    "current_val_loss": avg_val_loss,
+                },
+                best_model_path,
+            )
+            print(
+                f"🏆 New best model found! Validation loss: {avg_val_loss:.4f}. Saved to {best_model_path}"
+            )
 
     dist.barrier()
 

@@ -1,9 +1,10 @@
 import os
-import json
-from PIL import Image
-from torch.utils.data import Dataset
 import random
+
+from PIL import Image
 from pycocotools.coco import COCO
+from torch.utils.data import Dataset
+
 
 class COCO_Loader(Dataset):
     def __init__(
@@ -13,7 +14,7 @@ class COCO_Loader(Dataset):
         clip_processor,
         tokenizer,
         subset_fraction=1.0,
-        split="train", 
+        split="train",
         val_split_fraction=0.1,
         val_subset_fraction=1.0,  # Additional subsampling for validation set
         seed=42,  # Fixed seed for reproducible splits across all stages
@@ -25,7 +26,7 @@ class COCO_Loader(Dataset):
 
         # --- MODIFIED: Subset based on unique image IDs with fixed seed ---
         all_img_ids = list(sorted(self.coco.imgs.keys()))
-        
+
         # Use a separate Random instance with fixed seed for reproducibility
         rng = random.Random(seed)
         rng.shuffle(all_img_ids)
@@ -45,11 +46,13 @@ class COCO_Loader(Dataset):
             if val_subset_fraction < 1.0:
                 val_subset_size = int(len(val_img_ids) * val_subset_fraction)
                 final_img_ids = val_img_ids[:val_subset_size]
-                print(f"Using {len(final_img_ids)} unique images for validation (subsampled from {len(val_img_ids)}).")
+                print(
+                    f"Using {len(final_img_ids)} unique images for validation (subsampled from {len(val_img_ids)})."
+                )
             else:
                 final_img_ids = val_img_ids
                 print(f"Using {len(final_img_ids)} unique images for validation.")
-        
+
         # 3. Load annotations ONLY for the final set of image IDs
         ann_ids = self.coco.getAnnIds(imgIds=final_img_ids)
         self.annotations = self.coco.loadAnns(ann_ids)
