@@ -3,6 +3,10 @@ moe_env/
 venv/
 env/
 ENV/
+.venv/
+
+# uv
+.uv-cache/
 
 # Python cache
 __pycache__/
