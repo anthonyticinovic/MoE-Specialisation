@@ -22,7 +22,10 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
       - name: Sync dev environment
-        run: uv sync --group dev --no-group hpc
+        # hpc is an optional-dependency extra (flash-attn/bitsandbytes), not a
+        # dependency-group — uv sync omits extras by default, so nothing extra
+        # to exclude here.
+        run: uv sync --group dev
       # Fail-fast: any step below failing fails the run.
       # Strict lint on the maintained core; research scripts are held to
       # formatting-only (same scoping rationale as mypy below).
