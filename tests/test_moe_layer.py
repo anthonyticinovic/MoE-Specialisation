@@ -1,9 +1,9 @@
 """Tests for MoELayer hard and soft routing."""
 
-import torch
 import pytest
+import torch
 
-from models import MoELayer, MistralMoEConfig
+from models import MistralMoEConfig, MoELayer
 
 
 @pytest.fixture

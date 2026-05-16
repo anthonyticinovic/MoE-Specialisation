@@ -5,15 +5,12 @@ no network, no GPU.
 """
 
 import json
-import os
-import tempfile
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 import torch
 from PIL import Image
-
 
 # ---------------------------------------------------------------------------
 # Shared fakes
@@ -26,8 +23,8 @@ class _ProcessorOutput(dict):
     def __getattr__(self, name):
         try:
             return self[name]
-        except KeyError:
-            raise AttributeError(name)
+        except KeyError as err:
+            raise AttributeError(name) from err
 
 
 class FakeProcessor:
@@ -43,7 +40,15 @@ class FakeTokenizer:
     pad_token_id = 0
     eos_token_id = 2
 
-    def __call__(self, text, return_tensors="pt", padding=None, truncation=None, max_length=None, add_special_tokens=True):
+    def __call__(
+        self,
+        text,
+        return_tensors="pt",
+        padding=None,
+        truncation=None,
+        max_length=None,
+        add_special_tokens=True,
+    ):
         # Encode each character as its ord % 100 + 3 (avoids 0,1,2 special ids)
         ids = [ord(c) % 100 + 3 for c in text[:10]]  # cap at 10 to keep tests tiny
         if add_special_tokens:
@@ -54,9 +59,7 @@ class FakeTokenizer:
         if padding == "max_length" and max_length is not None:
             pad_len = max_length - input_ids.shape[1]
             if pad_len > 0:
-                input_ids = torch.cat(
-                    [input_ids, torch.zeros(1, pad_len, dtype=torch.long)], dim=1
-                )
+                input_ids = torch.cat([input_ids, torch.zeros(1, pad_len, dtype=torch.long)], dim=1)
                 attention_mask = torch.cat(
                     [attention_mask, torch.zeros(1, pad_len, dtype=torch.long)], dim=1
                 )
@@ -145,18 +148,20 @@ class TestLLaVALabelMasking:
     def test_padding_tokens_masked(self, llava_json_path, llava_image_dir):
         ds = self._load(llava_json_path, llava_image_dir)
         _, input_ids, attention_mask, labels = ds[0]
-        padding_positions = (attention_mask == 0)
+        padding_positions = attention_mask == 0
         if padding_positions.any():
-            assert (labels[padding_positions] == -100).all(), "Padding tokens must be -100 in labels"
+            assert (labels[padding_positions] == -100).all(), (
+                "Padding tokens must be -100 in labels"
+            )
 
     def test_label_values_match_input_ids_for_answers(self, llava_json_path, llava_image_dir):
         ds = self._load(llava_json_path, llava_image_dir)
         _, input_ids, attention_mask, labels = ds[0]
         answer_positions = (labels != -100) & attention_mask.bool()
         if answer_positions.any():
-            assert torch.equal(
-                labels[answer_positions], input_ids[answer_positions]
-            ), "Answer label IDs must match input_ids"
+            assert torch.equal(labels[answer_positions], input_ids[answer_positions]), (
+                "Answer label IDs must match input_ids"
+            )
 
     def test_output_length_is_max_length(self, llava_json_path, llava_image_dir):
         ds = self._load(llava_json_path, llava_image_dir)
@@ -200,7 +205,10 @@ class FakeCOCO:
 
     def __init__(self, n_images=10):
         self.imgs = {i: {"id": i} for i in range(n_images)}
-        self._anns = [{"id": i, "image_id": i, "caption": f"A caption for image {i}."} for i in range(n_images)]
+        self._anns = [
+            {"id": i, "image_id": i, "caption": f"A caption for image {i}."}
+            for i in range(n_images)
+        ]
 
     def getAnnIds(self, imgIds=None):
         if imgIds is None:

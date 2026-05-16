@@ -5,9 +5,6 @@ Also validates the trust_remote_code source-copy behaviour of create_moe_model.
 
 import json
 import shutil
-import sys
-import tempfile
-import importlib
 from pathlib import Path
 
 import pytest

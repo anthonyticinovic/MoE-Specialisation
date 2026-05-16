@@ -27,9 +27,9 @@ def current():
 
 
 def test_hard_routing_loss(baseline, current):
-    assert math.isclose(
-        current["hard"]["loss"], baseline["hard"]["loss"], rel_tol=TOLERANCE
-    ), f"Hard-routing loss drifted: {current['hard']['loss']} vs baseline {baseline['hard']['loss']}"
+    assert math.isclose(current["hard"]["loss"], baseline["hard"]["loss"], rel_tol=TOLERANCE), (
+        f"Hard-routing loss drifted: {current['hard']['loss']} vs {baseline['hard']['loss']}"
+    )
 
 
 def test_hard_routing_grad_norm(baseline, current):
@@ -42,9 +42,9 @@ def test_hard_routing_grad_norm(baseline, current):
 
 
 def test_soft_routing_loss(baseline, current):
-    assert math.isclose(
-        current["soft"]["loss"], baseline["soft"]["loss"], rel_tol=TOLERANCE
-    ), f"Soft-routing loss drifted: {current['soft']['loss']} vs baseline {baseline['soft']['loss']}"
+    assert math.isclose(current["soft"]["loss"], baseline["soft"]["loss"], rel_tol=TOLERANCE), (
+        f"Soft-routing loss drifted: {current['soft']['loss']} vs {baseline['soft']['loss']}"
+    )
 
 
 def test_soft_routing_grad_norm(baseline, current):

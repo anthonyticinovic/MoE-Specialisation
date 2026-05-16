@@ -4,8 +4,7 @@ import importlib
 
 
 def test_models_package():
-    import models
-
+    models = importlib.import_module("models")
     assert hasattr(models, "MoELayer")
     assert hasattr(models, "MistralMoEForCausalLM")
     assert hasattr(models, "MistralMoEConfig")
@@ -13,20 +12,13 @@ def test_models_package():
 
 
 def test_data_package():
-    import data
-
+    data = importlib.import_module("data")
     assert hasattr(data, "COCO_Loader")
     assert hasattr(data, "LLaVA_Loader")
 
 
-def test_models_utils_importable():
-    import models.utils.generation
-    import models.utils.create_moe_model
-
-
 def test_version():
-    import models
-
+    models = importlib.import_module("models")
     assert isinstance(models.__version__, str)
     assert len(models.__version__) > 0
 
@@ -38,12 +30,11 @@ def test_all_model_submodules():
         "models.vl_connector",
         "models.utils.generation",
         "models.utils.create_moe_model",
+        "models.utils.common",
     ]:
-        mod = importlib.import_module(module)
-        assert mod is not None
+        assert importlib.import_module(module) is not None
 
 
 def test_all_data_submodules():
     for module in ["data.COCO_loader", "data.LLaVA_loader"]:
-        mod = importlib.import_module(module)
-        assert mod is not None
+        assert importlib.import_module(module) is not None
