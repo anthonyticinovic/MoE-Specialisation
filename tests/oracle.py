@@ -1,6 +1,6 @@
 """Behavioural oracle for the conservative-refactor safety net.
 
-Builds a tiny synthetic MoE Mistral model (never the real 7B weights) and runs
+Builds a tiny synthetic MoE Mistral model (not the real 7B weights) and runs
 deterministic hard-routing (Stage 2 style) and soft-routing (Stage 2.5 style)
 forward+backward passes, returning loss and total gradient norm.
 
