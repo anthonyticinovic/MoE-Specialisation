@@ -13,6 +13,7 @@ Run from the repo root:
 
 import argparse
 import json
+import logging
 import os
 import shutil
 
@@ -20,25 +21,27 @@ from transformers import MistralForCausalLM
 
 from models.custom_mistral import MistralMoEForCausalLM
 
+logger = logging.getLogger(__name__)
+
 
 def create_moe_model(base_model_path: str, output_path: str):
-    print(f"Loading base model from {base_model_path}...")
+    logger.info("Loading base model from %s...", base_model_path)
     llm_base = MistralForCausalLM.from_pretrained(base_model_path)
 
-    print("Creating MistralMoEForCausalLM...")
+    logger.info("Creating MistralMoEForCausalLM...")
     llm_moe = MistralMoEForCausalLM(llm_base.config)
 
-    print("Copying weights...")
+    logger.info("Copying weights...")
     llm_moe.load_state_dict(llm_base.state_dict(), strict=False)
-    for layer_base, layer_moe in zip(llm_base.model.layers, llm_moe.model.layers):
+    for layer_base, layer_moe in zip(llm_base.model.layers, llm_moe.model.layers, strict=False):
         layer_moe.mlp.experts[0].load_state_dict(layer_base.mlp.state_dict())
         layer_moe.mlp.experts[1].load_state_dict(layer_base.mlp.state_dict())
-    print("Weights copied.")
+    logger.info("Weights copied.")
 
     llm_moe.config.model_type = "mistral_moe"
     llm_moe.config.architectures = ["MistralMoEForCausalLM"]
 
-    print(f"Saving MoE model to {output_path}...")
+    logger.info("Saving MoE model to %s...", output_path)
     llm_moe.save_pretrained(output_path)
 
     # Patch config.json so AutoModel can locate the custom classes
@@ -56,9 +59,9 @@ def create_moe_model(base_model_path: str, output_path: str):
     for src in ["models/custom_mistral.py", "models/moe_layer.py", "models/__init__.py"]:
         if os.path.exists(src):
             shutil.copy2(src, os.path.join(output_path, os.path.basename(src)))
-            print(f"Copied {src}")
+            logger.info("Copied %s", src)
 
-    print("Done.")
+    logger.info("Done.")
 
 
 if __name__ == "__main__":

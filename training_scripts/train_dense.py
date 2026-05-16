@@ -10,7 +10,6 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
-import yaml
 from torch.amp import GradScaler, autocast
 from torch.distributed.fsdp import (
     CPUOffload,
@@ -34,12 +33,15 @@ from transformers.models.mistral.modeling_mistral import MistralMLP
 
 from data import COCO_Loader
 from models import VisionLanguageConnector
+import logging
+from models.utils.common import load_config, setup_logging
+
+logger = logging.getLogger(__name__)
 
 # ====================================================================================
 # 2. SETUP AND CONFIGURATION
 # ====================================================================================
-with open("./configs/training_config.yaml", "r") as file:
-    config = yaml.safe_load(file)
+config = load_config()
 
 paths = config["paths"]
 # CHANGED: Use dense_control parameters from config
@@ -53,18 +55,19 @@ DENSE_CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "dense_checkpoints")
 # --- Initialize the distributed environment ---
 dist.init_process_group("nccl")
 local_rank = int(os.environ["LOCAL_RANK"])
+setup_logging(local_rank)
 torch.cuda.set_device(local_rank)
 DEVICE = local_rank
 
 if local_rank == 0:
     # CHANGED: Print statement for Dense Control model
-    print("--- Initializing Dense Control Model Training ---")
+    logger.info("--- Initializing Dense Control Model Training ---")
 
 # ====================================================================================
 # 3. MODEL LOADING
 # ====================================================================================
 if local_rank == 0:
-    print("Loading foundational models...")
+    logger.info("Loading foundational models...")
 vision_encoder = CLIPVisionModel.from_pretrained(paths["clip_local_path"]).to(DEVICE)
 clip_processor = AutoProcessor.from_pretrained(paths["clip_local_path"])
 tokenizer = AutoTokenizer.from_pretrained(paths["mistral_local_path"])
@@ -83,7 +86,7 @@ llm = AutoModelForCausalLM.from_pretrained(
 # 4. TRAINING SETUP (PART 1 - Parameter Freezing)
 # ====================================================================================
 if local_rank == 0:
-    print("Preparing dense model: Freezing vision, VLC, and embeddings.")
+    logger.info("Preparing dense model: Freezing vision, VLC, and embeddings.")
 
 # Freeze all parameters by default
 for param in llm.parameters():
@@ -130,7 +133,7 @@ llm = FSDP(
 stage1_weights_path = os.path.join(OUTPUT_DIR, "vision_connector_stage1_best.pth")
 if os.path.exists(stage1_weights_path):
     if local_rank == 0:
-        print(f"💾 Loading Stage 1 Vision Connector weights from {stage1_weights_path}")
+        logger.debug(f"💾 Loading Stage 1 Vision Connector weights from {stage1_weights_path}")
     vision_connector.load_state_dict(torch.load(stage1_weights_path, map_location=DEVICE))
 
 dist.barrier()
@@ -139,7 +142,7 @@ dist.barrier()
 # 6. DATA & OPTIMIZER
 # ====================================================================================
 if local_rank == 0:
-    print("Creating datasets and dataloaders...")
+    logger.info("Creating datasets and dataloaders...")
 train_dataset = COCO_Loader(
     image_dir=paths["image_dir"],
     annotations_file=paths["annotations_file"],
@@ -203,7 +206,7 @@ dist.broadcast(resume_tensor, src=0)
 
 if resume_tensor.item() == 1.0:
     if local_rank == 0:
-        print(f"💾 Resuming dense training from latest checkpoint: {latest_checkpoint_path}")
+        logger.debug(f"💾 Resuming dense training from latest checkpoint: {latest_checkpoint_path}")
 
     load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
     checkpoint = torch.load(latest_checkpoint_path, map_location="cpu")
@@ -222,13 +225,13 @@ if resume_tensor.item() == 1.0:
 
     dist.barrier()
     if local_rank == 0:
-        print(f"✅ Resumed successfully. Starting from epoch {start_epoch}.")
+        logger.info(f"✅ Resumed successfully. Starting from epoch {start_epoch}.")
 else:
     if local_rank == 0:
-        print("🏁 No 'latest' checkpoint found. Starting training from scratch.")
+        logger.info("🏁 No 'latest' checkpoint found. Starting training from scratch.")
 
 if local_rank == 0:
-    print(f"Optimizing {sum(p.numel() for p in trainable_params)} trainable parameters.")
+    logger.info(f"Optimizing {sum(p.numel() for p in trainable_params)} trainable parameters.")
 
 metrics_path = os.path.join(OUTPUT_DIR, "training_metrics_dense.json")
 metrics_history = {"epoch": [], "train_loss": [], "val_loss": [], "learning_rate": []}
@@ -240,7 +243,7 @@ if local_rank == 0 and start_epoch > 0 and os.path.exists(metrics_path):
 # 8. TRAINING LOOP
 # ====================================================================================
 if local_rank == 0:
-    print(f"🚀 Starting dense model training from epoch {start_epoch}...")
+    logger.info(f"🚀 Starting dense model training from epoch {start_epoch}...")
 start_time = time.time()
 for epoch in range(start_epoch, NUM_EPOCHS):
     train_sampler.set_epoch(epoch)
@@ -296,7 +299,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
 
     avg_train_loss = total_train_loss / len(train_loader)
     if local_rank == 0:
-        print(f"Epoch [{epoch + 1}/{NUM_EPOCHS}] - Training Loss: {avg_train_loss:.4f}")
+        logger.info(f"Epoch [{epoch + 1}/{NUM_EPOCHS}] - Training Loss: {avg_train_loss:.4f}")
 
     # --- Validation Phase ---
     llm.eval()
@@ -336,7 +339,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
     avg_val_loss = val_loss_tensor.item()
 
     if local_rank == 0:
-        print(f"Epoch [{epoch + 1}/{NUM_EPOCHS}] - Validation Loss: {avg_val_loss:.4f}")
+        logger.info(f"Epoch [{epoch + 1}/{NUM_EPOCHS}] - Validation Loss: {avg_val_loss:.4f}")
 
     # --- Metrics and Checkpoint Saving ---
     if local_rank == 0:
@@ -346,7 +349,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
         metrics_history["learning_rate"].append(optimizer.param_groups[0]["lr"])
         with open(metrics_path, "w") as f:
             json.dump(metrics_history, f, indent=4)
-        print(f"✅ Metrics saved to {metrics_path}")
+        logger.info(f"✅ Metrics saved to {metrics_path}")
 
     save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
     with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, save_policy):
@@ -366,7 +369,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
 
         latest_checkpoint_path = os.path.join(DENSE_CHECKPOINT_DIR, "dense_latest.pth")
         torch.save(consolidated_checkpoint, latest_checkpoint_path)
-        print(f"💾 Saved latest checkpoint to {latest_checkpoint_path}")
+        logger.debug(f"💾 Saved latest checkpoint to {latest_checkpoint_path}")
 
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
@@ -374,7 +377,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
 
             best_checkpoint_path = os.path.join(DENSE_CHECKPOINT_DIR, "dense_best.pth")
             torch.save(consolidated_checkpoint, best_checkpoint_path)
-            print(
+            logger.info(
                 f"🏆 New best model! Val loss: {avg_val_loss:.4f}. Saved to {best_checkpoint_path}"
             )
 
@@ -386,7 +389,7 @@ if local_rank == 0:
     hours = int(duration_seconds // 3600)
     minutes = int((duration_seconds % 3600) // 60)
     seconds = int(duration_seconds % 60)
-    print(f"--- Total Training Time: {hours}h {minutes}m {seconds}s ---")
+    logger.info(f"--- Total Training Time: {hours}h {minutes}m {seconds}s ---")
 
 dist.destroy_process_group()
-print("Job finished.")
+logger.info("Job finished.")

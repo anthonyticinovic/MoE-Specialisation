@@ -7,7 +7,6 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
-import yaml
 from torch.amp import GradScaler, autocast
 from torch.distributed.fsdp import (
     CPUOffload,
@@ -22,8 +21,6 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from transformers import (
-    AutoConfig,
-    AutoModelForCausalLM,
     AutoProcessor,
     AutoTokenizer,
     CLIPVisionModel,
@@ -32,20 +29,17 @@ from transformers.models.mistral.modeling_mistral import MistralMLP
 
 from data import COCO_Loader
 from models import VisionLanguageConnector
-from models.custom_mistral import (
-    MistralMoEConfig,
-    MistralMoEForCausalLM,
-)
+import logging
+from models.utils.common import load_config, register_moe_model, setup_logging
 
-# --- 1. Register Custom Architecture ---
-AutoConfig.register("mistral_moe", MistralMoEConfig)
-AutoModelForCausalLM.register(MistralMoEConfig, MistralMoEForCausalLM)
+logger = logging.getLogger(__name__)
+
+register_moe_model()
 
 # ====================================================================================
 # 2. SETUP AND CONFIGURATION
 # ====================================================================================
-with open("./configs/training_config.yaml", "r") as file:
-    config = yaml.safe_load(file)
+config = load_config()
 
 paths = config["paths"]
 train_params = config["training_stage2.5"]
@@ -59,17 +53,18 @@ LOAD_BALANCING_COEFF = train_params.get("load_balancing_coeff", 0.01)
 # --- Initialize the distributed environment ---
 dist.init_process_group("nccl")
 local_rank = int(os.environ["LOCAL_RANK"])
+setup_logging(local_rank)
 torch.cuda.set_device(local_rank)
 DEVICE = f"cuda:{local_rank}"
 
 if local_rank == 0:
-    print("--- Initializing Stage 2.5 Training (Training the Router) ---")
+    logger.info("--- Initializing Stage 2.5 Training (Training the Router) ---")
 
 # ====================================================================================
 # 3. MODEL LOADING
 # ====================================================================================
 if local_rank == 0:
-    print("Loading foundational models with low_cpu_mem_usage to prevent OOM...")
+    logger.info("Loading foundational models with low_cpu_mem_usage to prevent OOM...")
 vision_encoder = CLIPVisionModel.from_pretrained(paths["clip_local_path"]).to(DEVICE)
 clip_processor = AutoProcessor.from_pretrained(paths["clip_local_path"])
 tokenizer = AutoTokenizer.from_pretrained(paths["mistral_local_path"])
@@ -89,13 +84,13 @@ llm = AutoModelForCausalLM.from_pretrained(
 # 4. TRAINING SETUP
 # ====================================================================================
 if local_rank == 0:
-    print("Setting MoE layers to 'soft' routing mode for Stage 2.5.")
+    logger.info("Setting MoE layers to 'soft' routing mode for Stage 2.5.")
 for layer in llm.model.layers:
     if hasattr(layer.mlp, "routing_mode"):
         layer.mlp.routing_mode = "soft"
 
 if local_rank == 0:
-    print("Preparing model for Stage 2.5: Freezing experts, unfreezing routers.")
+    logger.info("Preparing model for Stage 2.5: Freezing experts, unfreezing routers.")
 for name, param in llm.named_parameters():
     if "mlp.gate" in name:
         param.requires_grad = True
@@ -137,7 +132,7 @@ should_load = file_exists_tensor.item() == 1.0
 # All ranks will attempt to load if the file was found on rank 0
 if should_load:
     if local_rank == 0:
-        print(f"💾 Loading Stage 2 BEST expert weights from: {checkpoint_path}")
+        logger.debug(f"💾 Loading Stage 2 BEST expert weights from: {checkpoint_path}")
 
     # Load the state dict. Your 'best' checkpoint saves the state_dict directly.
     state_dict = torch.load(checkpoint_path, map_location="cpu")
@@ -154,16 +149,16 @@ if should_load:
     dist.barrier()
 
     if local_rank == 0:
-        print("✅ Stage 2 'best' state loaded successfully.")
+        logger.info("✅ Stage 2 'best' state loaded successfully.")
 else:
     if local_rank == 0:
-        print(
+        logger.info(
             f"🚨 WARNING: Stage 2 best checkpoint not found at '{checkpoint_path}'. Starting from base weights."
         )
 
 # ROBUST FIX: Manually re-initialize gates AFTER all loading is done
 if local_rank == 0:
-    print("--- Forcing re-initialization of router gates to fix corruption ---")
+    logger.info("--- Forcing re-initialization of router gates to fix corruption ---")
 
 for layer in llm.module.model.layers:
     if hasattr(layer.mlp, "gate"):
@@ -178,29 +173,29 @@ for layer in llm.module.model.layers:
 # SOLUTION 4: VERIFY EXPERT WEIGHTS ARE FROZEN
 # ====================================================================================
 if local_rank == 0:
-    print("\n=== Expert Weight Verification ===")
+    logger.info("\n=== Expert Weight Verification ===")
     sample_layer = llm.module.model.layers[0]
     expert_0_requires_grad = any(p.requires_grad for p in sample_layer.mlp.experts[0].parameters())
     expert_1_requires_grad = any(p.requires_grad for p in sample_layer.mlp.experts[1].parameters())
     gate_requires_grad = sample_layer.mlp.gate.weight.requires_grad
 
-    print(f"Expert 0 trainable: {expert_0_requires_grad} (should be False)")
-    print(f"Expert 1 trainable: {expert_1_requires_grad} (should be False)")
-    print(f"Gate trainable: {gate_requires_grad} (should be True)")
+    logger.info(f"Expert 0 trainable: {expert_0_requires_grad} (should be False)")
+    logger.info(f"Expert 1 trainable: {expert_1_requires_grad} (should be False)")
+    logger.info(f"Gate trainable: {gate_requires_grad} (should be True)")
 
     if expert_0_requires_grad or expert_1_requires_grad:
         raise RuntimeError("❌ Experts are not frozen! This will corrupt training.")
     if not gate_requires_grad:
         raise RuntimeError("❌ Router gate is frozen! Cannot train routers.")
 
-    print("✅ All weight freeze states correct")
-    print("==================================\n")
+    logger.info("✅ All weight freeze states correct")
+    logger.info("==================================\n")
 
 # ====================================================================================
 # 6. DATA & OPTIMIZER
 # ====================================================================================
 if local_rank == 0:
-    print("Creating datasets and dataloaders...")
+    logger.info("Creating datasets and dataloaders...")
 train_dataset = COCO_Loader(
     image_dir=paths["image_dir"],
     annotations_file=paths["annotations_file"],
@@ -238,7 +233,7 @@ val_loader = DataLoader(
 
 # Create optimizer AFTER gates are fixed
 if local_rank == 0:
-    print("Creating optimizer and scheduler with refreshed trainable parameters...")
+    logger.info("Creating optimizer and scheduler with refreshed trainable parameters...")
 accumulation_steps = train_params.get("gradient_accumulation_steps", 1)
 trainable_params = [p for p in llm.parameters() if p.requires_grad]
 optimizer = optim.AdamW(
@@ -264,7 +259,7 @@ dist.broadcast(resume_tensor, src=0)
 
 if resume_tensor.item() == 1.0:
     if local_rank == 0:
-        print(f"💾 Resuming training from latest checkpoint: {latest_checkpoint_path}")
+        logger.debug(f"💾 Resuming training from latest checkpoint: {latest_checkpoint_path}")
 
     # All ranks load the checkpoint
     checkpoint = torch.load(latest_checkpoint_path, map_location="cpu")
@@ -287,10 +282,10 @@ if resume_tensor.item() == 1.0:
 
     dist.barrier()
     if local_rank == 0:
-        print(f"✅ Resumed successfully. Starting from epoch {start_epoch}.")
+        logger.info(f"✅ Resumed successfully. Starting from epoch {start_epoch}.")
 else:
     if local_rank == 0:
-        print("🏁 No 'latest' checkpoint found. Starting training from scratch.")
+        logger.info("🏁 No 'latest' checkpoint found. Starting training from scratch.")
 
 # --- 5.3. Finalize Model Setup ---
 llm.model.embed_tokens.to(DEVICE)
@@ -308,7 +303,9 @@ for param in vision_connector.parameters():
     param.requires_grad = False
 
 if local_rank == 0:
-    print(f"Optimizing {sum(p.numel() for p in trainable_params)} trainable router parameters.")
+    logger.info(
+        f"Optimizing {sum(p.numel() for p in trainable_params)} trainable router parameters."
+    )
 
 metrics_history = {
     "epoch": [],
@@ -327,17 +324,17 @@ if local_rank == 0 and start_epoch > 0 and os.path.exists(metrics_path):
 
 # Optional: Verification block to confirm gate shapes are correct before training
 if local_rank == 0:
-    print("--- Verifying Gate Parameter Shapes Before Training ---")
+    logger.info("--- Verifying Gate Parameter Shapes Before Training ---")
     for i, layer in enumerate(llm.module.model.layers):
         if hasattr(layer.mlp, "gate") and hasattr(layer.mlp.gate, "weight"):
-            print(f"  Layer {i} gate shape: {tuple(layer.mlp.gate.weight.shape)}")
-    print("---------------------------------------------------------")
+            logger.info(f"  Layer {i} gate shape: {tuple(layer.mlp.gate.weight.shape)}")
+    logger.info("---------------------------------------------------------")
 
 # ====================================================================================
 # 8. TRAINING LOOP
 # ====================================================================================
 if local_rank == 0:
-    print(f"🚀 Starting Stage 2.5 training from epoch {start_epoch}...")
+    logger.info(f"🚀 Starting Stage 2.5 training from epoch {start_epoch}...")
 for epoch in range(start_epoch, NUM_EPOCHS):
     train_sampler.set_epoch(epoch)
     llm.train()
@@ -352,7 +349,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             layer.mlp.temperature = temperature
 
     if local_rank == 0 and epoch == start_epoch:
-        print(f"  Router temperature for epoch {epoch + 1}: {temperature:.3f}")
+        logger.info(f"  Router temperature for epoch {epoch + 1}: {temperature:.3f}")
 
     total_train_loss, total_ce_loss, total_lb_loss = 0, 0, 0
     optimizer.zero_grad()
@@ -484,9 +481,9 @@ for epoch in range(start_epoch, NUM_EPOCHS):
                 text_idx = num_visual + (input_ids.shape[1] // 2)
                 text_hidden = combined_embeddings[0:1, text_idx : text_idx + 1, :]
 
-                print(f"\n{'=' * 60}")
-                print(f"Router Analysis - Batch {i + 1} | Epoch {epoch + 1}")
-                print(f"{'=' * 60}")
+                logger.info(f"\n{'=' * 60}")
+                logger.info(f"Router Analysis - Batch {i + 1} | Epoch {epoch + 1}")
+                logger.info(f"{'=' * 60}")
 
                 for layer_idx in [0, 15, 31]:  # First, middle, last
                     check_layer = llm.module.model.layers[layer_idx]
@@ -503,24 +500,24 @@ for epoch in range(start_epoch, NUM_EPOCHS):
                         text_logits = check_layer.mlp.gate(text_hidden_fp32.view(-1, 4096))
                         text_probs = torch.softmax(text_logits, dim=-1)
 
-                        print(f"\nLayer {layer_idx:2d}:")
-                        print(
+                        logger.info(f"\nLayer {layer_idx:2d}:")
+                        logger.info(
                             f"  Visual Token -> E0: {visual_probs[0, 0]:.3f}, E1: {visual_probs[0, 1]:.3f} ({'✓E0' if visual_probs[0, 0] > 0.6 else '✓E1' if visual_probs[0, 1] > 0.6 else 'MIXED'})"
                         )
-                        print(
+                        logger.info(
                             f"  Text   Token -> E0: {text_probs[0, 0]:.3f}, E1: {text_probs[0, 1]:.3f} ({'✓E0' if text_probs[0, 0] > 0.6 else '✓E1' if text_probs[0, 1] > 0.6 else 'MIXED'})"
                         )
 
                         # Calculate specialization score (how different are the routings?)
                         specialization = abs(visual_probs[0, 0] - text_probs[0, 0]).item()
-                        print(
+                        logger.info(
                             f"  Specialization score: {specialization:.3f} ({'GOOD' if specialization > 0.3 else 'WEAK'})"
                         )
 
-                print(f"{'=' * 60}\n")
+                logger.info(f"{'=' * 60}\n")
 
         if local_rank == 0 and (i + 1) % 100 == 0:
-            print(f"  Epoch {epoch + 1}, Batch [{i + 1}/{len(train_loader)}]")
+            logger.info(f"  Epoch {epoch + 1}, Batch [{i + 1}/{len(train_loader)}]")
 
     avg_train_loss = total_train_loss / len(train_loader)
     avg_ce_loss = total_ce_loss / len(train_loader)
@@ -535,7 +532,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
         torch.cuda._entropy_count = 0
 
     if local_rank == 0:
-        print(
+        logger.info(
             f"Epoch [{epoch + 1}/{NUM_EPOCHS}] - Training Loss: {avg_train_loss:.4f} | CE Loss: {avg_ce_loss:.4f} | "
             f"LB Loss: {avg_lb_loss:.4f} | Entropy: {avg_entropy:.4f} | Temp: {temperature:.3f}"
         )
@@ -547,7 +544,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
     MAX_VAL_BATCHES = 75  # DRASTICALLY reduced to prevent timeout
 
     if local_rank == 0:
-        print(f"  Starting validation (max {MAX_VAL_BATCHES} batches per GPU)...")
+        logger.info(f"  Starting validation (max {MAX_VAL_BATCHES} batches per GPU)...")
 
     with torch.no_grad():
         for i, (images, input_ids, attention_mask) in enumerate(val_loader):
@@ -589,14 +586,14 @@ for epoch in range(start_epoch, NUM_EPOCHS):
                 val_steps += 1
             except Exception as e:
                 if local_rank == 0:
-                    print(f"⚠️  Validation batch {i} failed: {e}")
+                    logger.debug(f"⚠️  Validation batch {i} failed: {e}")
                 break
 
     # Each rank computed its own average - just use local average (no distributed aggregation)
     avg_val_loss = total_val_loss / val_steps if val_steps > 0 else float("inf")
 
     if local_rank == 0:
-        print(
+        logger.info(
             f"Epoch [{epoch + 1}/{NUM_EPOCHS}] - Validation Loss: {avg_val_loss:.4f} (rank 0, {val_steps} batches)"
         )
 
@@ -612,7 +609,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
         metrics_history["temperature"].append(temperature)
         with open(metrics_path, "w") as f:
             json.dump(metrics_history, f, indent=4)
-        print(f"✅ Metrics saved to {metrics_path}")
+        logger.info(f"✅ Metrics saved to {metrics_path}")
 
     save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
     with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, save_policy):
@@ -641,7 +638,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
         # 1. Save this as the 'latest' checkpoint, overwriting the previous one
         latest_checkpoint_path = os.path.join(STAGE2_5_CHECKPOINT_DIR, "llm_stage2_5_latest.pth")
         torch.save(consolidated_checkpoint, latest_checkpoint_path)
-        print(f"💾 Saved latest checkpoint to {latest_checkpoint_path}")
+        logger.debug(f"💾 Saved latest checkpoint to {latest_checkpoint_path}")
 
         # 2. Check if this is the 'best' model and save it if so
         if avg_val_loss < best_val_loss:
@@ -651,11 +648,11 @@ for epoch in range(start_epoch, NUM_EPOCHS):
 
             best_checkpoint_path = os.path.join(STAGE2_5_CHECKPOINT_DIR, "llm_stage2_5_best.pth")
             torch.save(consolidated_checkpoint, best_checkpoint_path)
-            print(
+            logger.info(
                 f"🏆 New best model! Val loss: {avg_val_loss:.4f}. Saved to {best_checkpoint_path}"
             )
 
     # Removed barrier - not needed since only rank 0 saves checkpoints
 
 dist.destroy_process_group()
-print("Job finished.")
+logger.info("Job finished.")

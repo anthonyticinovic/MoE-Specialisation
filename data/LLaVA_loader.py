@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import random
 from typing import Any
@@ -6,6 +7,8 @@ from typing import Any
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
+
+logger = logging.getLogger(__name__)
 
 
 class LLaVA_Loader(Dataset):
@@ -62,14 +65,18 @@ class LLaVA_Loader(Dataset):
         total_val_pool = total_data - total_train_pool
 
         if split == "train":
-            print(f"Using {len(self.data)} unique samples for training (LLaVA, ALL QA pairs).")
-            print(
-                f"  ({subset_fraction * 100:.0f}% of {total_train_pool} total training pool samples)"
+            logger.info(
+                "Using %d unique samples for training (LLaVA, ALL QA pairs) — %.0f%% of %d pool.",
+                len(self.data),
+                subset_fraction * 100,
+                total_train_pool,
             )
         else:
-            print(f"Using {len(self.data)} unique samples for validation (LLaVA, ALL QA pairs).")
-            print(
-                f"  ({subset_fraction * 100:.0f}% of {total_val_pool} total validation pool samples)"
+            logger.info(
+                "Using %d unique samples for validation (LLaVA, ALL QA pairs) — %.0f%% of %d pool.",
+                len(self.data),
+                subset_fraction * 100,
+                total_val_pool,
             )
 
     def _load_data(self) -> list[dict[str, Any]]:
@@ -144,7 +151,7 @@ class LLaVA_Loader(Dataset):
             image = Image.open(image_path).convert("RGB")
         except Exception as e:
             # Fallback: create a blank image if file not found
-            print(f"Warning: Could not load image {image_path}: {e}")
+            logger.warning("Could not load image %s: %s", image_path, e)
             image = Image.new("RGB", (224, 224), color="black")
 
         # Process image with CLIP
@@ -163,7 +170,7 @@ class LLaVA_Loader(Dataset):
         # Skip samples with no valid Q&A pairs
         if len(conversations) < 2:
             # Fallback: return empty sequences (will be filtered in collate_fn if needed)
-            print(f"Warning: Sample {idx} has no valid Q&A pairs, skipping.")
+            logger.warning("Sample %d has no valid Q&A pairs — skipping.", idx)
             return (
                 pixel_values,
                 torch.tensor([self.tokenizer.eos_token_id], dtype=torch.long),
@@ -240,8 +247,8 @@ class LLaVA_Loader(Dataset):
             if num_answer_tokens < 5:
                 # Very few answer tokens remain - warn but continue
                 if self.debug:
-                    print(
-                        f"Warning: Sample {idx} truncated to only {num_answer_tokens} answer tokens"
+                    logger.debug(
+                        "Sample %d truncated to only %d answer tokens.", idx, num_answer_tokens
                     )
 
         # Create labels: -100 for questions, actual token IDs for answers
@@ -294,45 +301,37 @@ class LLaVA_Loader(Dataset):
         return pixel_values, input_ids, attention_mask, labels
 
     def _debug_print_sample(self, idx, input_ids, labels, attention_mask, label_mask):
-        """Print detailed debug information for a sample."""
-        print(f"\n{'=' * 80}")
-        print(f"DEBUG SAMPLE {idx}")
-        print(f"{'=' * 80}")
+        """Log detailed debug information for a sample (only when debug=True)."""
+        sep = "=" * 80
+        logger.debug("\n%s\nDEBUG SAMPLE %d\n%s", sep, idx, sep)
 
-        # Decode full sequence
         decoded_text = self.tokenizer.decode(input_ids, skip_special_tokens=False)
-        print(f"Full decoded text:\n{decoded_text}\n")
+        logger.debug("Full decoded text:\n%s", decoded_text)
 
-        # Show token-by-token breakdown (first 100 tokens only for readability)
-        print("Token-by-token breakdown (first 100 tokens):")
-        print(f"{'Idx':<5} {'Token':<30} {'InputID':<8} {'Label':<8} {'Mask':<6} {'AttnMask':<8}")
-        print("-" * 80)
-
+        header = f"{'Idx':<5} {'Token':<30} {'InputID':<8} {'Label':<8} {'Mask':<6} {'AttnMask':<8}"
+        rows = []
         for i in range(min(100, len(input_ids))):
             token = self.tokenizer.decode([input_ids[i].item()])
-            input_id = input_ids[i].item()
-            label = labels[i].item()
             is_answer = "ANSWER" if i < len(label_mask) and label_mask[i] else "QUEST"
-            attn = attention_mask[i].item()
+            rows.append(
+                f"{i:<5} {repr(token):<30} {input_ids[i].item():<8} "
+                f"{labels[i].item():<8} {is_answer:<6} {attention_mask[i].item():<8}"
+            )
+        logger.debug("Token-by-token (first 100):\n%s\n%s\n%s", header, "-" * 80, "\n".join(rows))
 
-            print(f"{i:<5} {repr(token):<30} {input_id:<8} {label:<8} {is_answer:<6} {attn:<8}")
-
-        # Statistics
         num_real_tokens = attention_mask.sum().item()
-        num_padding = (attention_mask == 0).sum().item()
         num_answer_tokens = (labels != -100).sum().item()
         num_question_tokens = num_real_tokens - num_answer_tokens
+        logger.debug(
+            "Stats — total:%d real:%d pad:%d answer:%d question:%d ratio:%.1f%%",
+            len(input_ids),
+            num_real_tokens,
+            (attention_mask == 0).sum().item(),
+            num_answer_tokens,
+            num_question_tokens,
+            num_answer_tokens / max(num_real_tokens, 1) * 100,
+        )
 
-        print("\nStatistics:")
-        print(f"  Total length: {len(input_ids)}")
-        print(f"  Real tokens: {num_real_tokens}")
-        print(f"  Padding tokens: {num_padding}")
-        print(f"  Answer tokens (trainable): {num_answer_tokens}")
-        print(f"  Question tokens (masked): {num_question_tokens}")
-        print(f"  Answer/Total ratio: {num_answer_tokens / num_real_tokens * 100:.1f}%")
-
-        # Verify masking correctness
-        print("\nMasking Verification:")
         all_question_masked = all(
             labels[i] == -100 for i in range(len(label_mask)) if not label_mask[i]
         )
@@ -340,8 +339,9 @@ class LLaVA_Loader(Dataset):
             labels[i] == input_ids[i] for i in range(len(label_mask)) if label_mask[i]
         )
         all_padding_masked = all(labels[i] == -100 for i in range(num_real_tokens, len(labels)))
-
-        print(f"  ✓ All question tokens masked: {all_question_masked}")
-        print(f"  ✓ All answer tokens unmasked: {all_answer_unmasked}")
-        print(f"  ✓ All padding tokens masked: {all_padding_masked}")
-        print(f"{'=' * 80}\n")
+        logger.debug(
+            "Masking — questions masked: %s | answers unmasked: %s | padding masked: %s",
+            all_question_masked,
+            all_answer_unmasked,
+            all_padding_masked,
+        )

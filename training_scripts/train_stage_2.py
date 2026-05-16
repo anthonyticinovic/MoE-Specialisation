@@ -8,7 +8,6 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
-import yaml
 from torch.amp import GradScaler, autocast
 from torch.distributed.fsdp import (
     CPUOffload,
@@ -23,8 +22,6 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from transformers import (
-    AutoConfig,
-    AutoModelForCausalLM,
     AutoProcessor,
     AutoTokenizer,
     CLIPVisionModel,
@@ -33,16 +30,17 @@ from transformers.models.mistral.modeling_mistral import MistralMLP
 
 from data import COCO_Loader
 from models import VisionLanguageConnector
-from models.custom_mistral import MistralMoEConfig, MistralMoEForCausalLM
+import logging
+from models.utils.common import load_config, register_moe_model, setup_logging
 
-AutoConfig.register("mistral_moe", MistralMoEConfig)
-AutoModelForCausalLM.register(MistralMoEConfig, MistralMoEForCausalLM)
+logger = logging.getLogger(__name__)
+
+register_moe_model()
 
 # ====================================================================================
 # 2. SETUP AND CONFIGURATION
 # ====================================================================================
-with open("./configs/training_config.yaml", "r") as file:
-    config = yaml.safe_load(file)
+config = load_config()
 
 paths = config["paths"]
 train_params = config["training_stage2"]
@@ -54,19 +52,20 @@ STAGE2_CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "stage2_checkpoints")
 # --- Initialize the distributed environment ---
 dist.init_process_group("nccl")
 local_rank = int(os.environ["LOCAL_RANK"])
+setup_logging(local_rank)
 torch.cuda.set_device(local_rank)
 DEVICE = local_rank
 
 if local_rank == 0:
-    print("--- Initializing Stage 2 Training ---")
-    print(f"PyTorch: {torch.__version__}")
-print(f"--- Rank {local_rank} --- Using device: cuda:{DEVICE}")
+    logger.info("--- Initializing Stage 2 Training ---")
+    logger.info(f"PyTorch: {torch.__version__}")
+logger.info(f"--- Rank {local_rank} --- Using device: cuda:{DEVICE}")
 
 # ====================================================================================
 # 3. MODEL LOADING
 # ====================================================================================
 if local_rank == 0:
-    print("Loading foundational models...")
+    logger.info("Loading foundational models...")
 vision_encoder = CLIPVisionModel.from_pretrained(paths["clip_local_path"]).to(DEVICE)
 clip_processor = AutoProcessor.from_pretrained(paths["clip_local_path"])
 tokenizer = AutoTokenizer.from_pretrained(paths["mistral_local_path"])
@@ -75,7 +74,7 @@ tokenizer.pad_token = tokenizer.eos_token
 moe_model_path = paths["moe_model_path"]
 
 if local_rank == 0:
-    print(f"Loading custom MoE model from {moe_model_path}...")
+    logger.info(f"Loading custom MoE model from {moe_model_path}...")
 
 llm = AutoModelForCausalLM.from_pretrained(
     moe_model_path,
@@ -86,13 +85,13 @@ llm = AutoModelForCausalLM.from_pretrained(
 )
 
 if local_rank == 0:
-    print("✅ Custom MoE model loaded on CPU.")
+    logger.info("✅ Custom MoE model loaded on CPU.")
 
 # ====================================================================================
 # 4. TRAINING SETUP (PART 1 - Parameter Freezing)
 # ====================================================================================
 if local_rank == 0:
-    print("Preparing model for Stage 2 training...")
+    logger.info("Preparing model for Stage 2 training...")
 
 for param in llm.parameters():
     param.requires_grad = False
@@ -103,12 +102,12 @@ for layer in llm.model.layers:
             for param in expert.parameters():
                 param.requires_grad = True
         if local_rank == 0:
-            print(f"✅ Unfroze {len(layer.mlp.experts)} experts in layer")
+            logger.info(f"✅ Unfroze {len(layer.mlp.experts)} experts in layer")
 
 # ====================================================================================
 # 5. FSDP WRAPPING
 # ====================================================================================
-print(f"--- Rank {local_rank} --- Wrapping model with FSDP...")
+logger.info(f"--- Rank {local_rank} --- Wrapping model with FSDP...")
 
 ignored_modules = [llm.model.embed_tokens]
 
@@ -132,7 +131,7 @@ llm = FSDP(
     use_orig_params=True,
     ignored_modules=ignored_modules,
 )
-print(f"--- Rank {local_rank} --- ✅ Model wrapped with FSDP.")
+logger.info(f"--- Rank {local_rank} --- ✅ Model wrapped with FSDP.")
 
 # --- MODIFIED: Robust 'best' and 'latest' checkpoint loading ---
 latest_epoch = 0
@@ -145,13 +144,13 @@ if local_rank == 0:
     if os.path.exists(latest_checkpoint_path):
         checkpoint_found.fill_(1.0)
     else:
-        print("�� No checkpoint found. Starting training from scratch.")
+        logger.info("�� No checkpoint found. Starting training from scratch.")
 
 dist.broadcast(checkpoint_found, src=0)
 
 if checkpoint_found.item() == 1.0:
     if local_rank == 0:
-        print(f"💾 Found latest checkpoint. Resuming training...")
+        logger.debug(f"💾 Found latest checkpoint. Resuming training...")
 
     load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
     with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
@@ -161,7 +160,7 @@ if checkpoint_found.item() == 1.0:
             latest_epoch = checkpoint["epoch"]
             best_val_loss = checkpoint["best_val_loss"]
 
-            print(
+            logger.info(
                 f"✅ Resumed from epoch {latest_epoch}. Previous best validation loss: {best_val_loss:.4f}"
             )
 
@@ -174,7 +173,7 @@ if checkpoint_found.item() == 1.0:
         llm.load_state_dict(state_dict_to_load, strict=False)
 
         if local_rank == 0:
-            print(f"✅ Checkpoint loaded successfully!")
+            logger.info(f"✅ Checkpoint loaded successfully!")
 
 # Broadcast epoch and best_val_loss to all ranks
 state_data = [latest_epoch, best_val_loss]
@@ -183,11 +182,11 @@ latest_epoch, best_val_loss = int(state_data[0]), state_data[1]
 
 dist.barrier()
 if checkpoint_found.item() == 1.0:
-    print(f"--- Rank {local_rank} --- ✅ Model weights and state synchronized.")
+    logger.info(f"--- Rank {local_rank} --- ✅ Model weights and state synchronized.")
 
 # Manually move the ignored module to the correct GPU device.
 if local_rank == 0:
-    print(f"Manually moving ignored modules to device {DEVICE}")
+    logger.info(f"Manually moving ignored modules to device {DEVICE}")
 llm.model.embed_tokens.to(DEVICE)
 
 llm.gradient_checkpointing_enable()
@@ -196,13 +195,13 @@ vision_connector = VisionLanguageConnector().to(DEVICE)
 stage1_weights_path = os.path.join(OUTPUT_DIR, "vision_connector_stage1_best.pth")
 if os.path.exists(stage1_weights_path):
     if local_rank == 0:
-        print(f"💾 Loading Stage 1 Vision Connector weights from {stage1_weights_path}")
+        logger.debug(f"💾 Loading Stage 1 Vision Connector weights from {stage1_weights_path}")
     map_loc = f"cuda:{DEVICE}"
     state_dict = torch.load(stage1_weights_path, map_location=map_loc)
     vision_connector.load_state_dict(state_dict)
 else:
     if local_rank == 0:
-        print("🚨 WARNING: Stage 1 weights not found.")
+        logger.info("🚨 WARNING: Stage 1 weights not found.")
 
 for param in vision_encoder.parameters():
     param.requires_grad = False
@@ -213,7 +212,7 @@ for param in vision_connector.parameters():
 # 6. DATA & OPTIMIZER
 # ====================================================================================
 if local_rank == 0:
-    print("Creating datasets and dataloaders...")
+    logger.info("Creating datasets and dataloaders...")
 train_dataset = COCO_Loader(
     image_dir=paths["image_dir"],
     annotations_file=paths["annotations_file"],
@@ -253,8 +252,8 @@ val_loader = DataLoader(
 
 accumulation_steps = train_params.get("gradient_accumulation_steps", 1)
 if local_rank == 0:
-    print(f"Using gradient accumulation with {accumulation_steps} steps.")
-    print(
+    logger.info(f"Using gradient accumulation with {accumulation_steps} steps.")
+    logger.info(
         f"Effective batch size: {train_params['batch_size'] * accumulation_steps * dist.get_world_size()}"
     )
 
@@ -271,29 +270,29 @@ scheduler = CosineAnnealingLR(optimizer, T_max=total_steps)
 loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
 
 if local_rank == 0:
-    print(
+    logger.info(
         f"Optimizing {sum(p.numel() for p in llm.parameters() if p.requires_grad)} trainable parameters."
     )
 
 # --- Load optimizer & scheduler state if resuming ---
 if checkpoint_found.item() == 1.0:
     if local_rank == 0:
-        print(f"💾 Loading optimizer and scheduler states from checkpoint...")
+        logger.debug(f"💾 Loading optimizer and scheduler states from checkpoint...")
         checkpoint = torch.load(latest_checkpoint_path, map_location="cpu", weights_only=False)
 
         if "optimizer_state_dict" in checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            print(
+            logger.info(
                 f"  ✅ Loaded optimizer state (learning_rate: {optimizer.param_groups[0]['lr']:.2e})"
             )
         else:
-            print(f"  ⚠️ No optimizer state found in checkpoint (old format)")
+            logger.debug(f"  ⚠️ No optimizer state found in checkpoint (old format)")
 
         if "scheduler_state_dict" in checkpoint:
             scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-            print(f"  ✅ Loaded scheduler state (last_epoch: {scheduler.last_epoch})")
+            logger.info(f"  ✅ Loaded scheduler state (last_epoch: {scheduler.last_epoch})")
         else:
-            print(f"  ⚠️ No scheduler state found in checkpoint (old format)")
+            logger.debug(f"  ⚠️ No scheduler state found in checkpoint (old format)")
 
         del checkpoint
         gc.collect()
@@ -310,7 +309,7 @@ if local_rank == 0 and latest_epoch > 0 and os.path.exists(metrics_path):
 # 8. TRAINING LOOP
 # ====================================================================================
 if local_rank == 0:
-    print(
+    logger.info(
         f"🚀 Starting Stage 2 training from epoch {latest_epoch} for {NUM_EPOCHS} total epochs..."
     )
 start_time = time.time()
@@ -378,11 +377,11 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
             scheduler.step()
 
         if local_rank == 0 and (i + 1) % 100 == 0:
-            print(f"  Epoch {epoch + 1}, Batch [{i + 1}/{len(train_loader)}]")
+            logger.info(f"  Epoch {epoch + 1}, Batch [{i + 1}/{len(train_loader)}]")
 
     avg_train_loss = total_train_loss / len(train_loader)
     if local_rank == 0:
-        print(f"Epoch [{epoch + 1}/{NUM_EPOCHS}] - Training Loss: {avg_train_loss:.4f}")
+        logger.info(f"Epoch [{epoch + 1}/{NUM_EPOCHS}] - Training Loss: {avg_train_loss:.4f}")
 
     # --- Validation Phase ---
     llm.eval()
@@ -444,7 +443,7 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
     avg_val_loss = val_loss_tensor.item()
 
     if local_rank == 0:
-        print(f"Epoch [{epoch + 1}/{NUM_EPOCHS}] - Validation Loss: {avg_val_loss:.4f}")
+        logger.info(f"Epoch [{epoch + 1}/{NUM_EPOCHS}] - Validation Loss: {avg_val_loss:.4f}")
 
     if local_rank == 0:
         current_lr = optimizer.param_groups[0]["lr"]
@@ -454,7 +453,7 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
         metrics_history["learning_rate"].append(current_lr)
         with open(metrics_path, "w") as f:
             json.dump(metrics_history, f, indent=4)
-        print(f"✅ Metrics saved to {metrics_path}")
+        logger.info(f"✅ Metrics saved to {metrics_path}")
 
     # --- MODIFIED: 'best' and 'latest' checkpoint saving ---
     save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
@@ -477,7 +476,7 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
             },
             latest_model_path,
         )
-        print(f"💾 Saved latest model checkpoint to {latest_model_path}")
+        logger.debug(f"💾 Saved latest model checkpoint to {latest_model_path}")
 
         # Save the 'best' model if validation loss has improved
         if avg_val_loss < best_val_loss:
@@ -495,7 +494,7 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
                 },
                 best_model_path,
             )
-            print(
+            logger.info(
                 f"🏆 New best model found! Validation loss: {avg_val_loss:.4f}. Saved to {best_model_path}"
             )
 
@@ -508,9 +507,9 @@ if local_rank == 0:
     hours = int(duration_seconds // 3600)
     minutes = int((duration_seconds % 3600) // 60)
     seconds = int(duration_seconds % 60)
-    print(f"--- Total Training Time: {hours}h {minutes}m {seconds}s ---")
+    logger.info(f"--- Total Training Time: {hours}h {minutes}m {seconds}s ---")
 
 dist.barrier()
 dist.destroy_process_group()
 
-print("Job finished.")
+logger.info("Job finished.")

@@ -296,7 +296,7 @@ class CaptionGenerator:
         if prompts is None:
             prompts = [None] * len(image_paths)
 
-        for image_path, prompt in zip(image_paths, prompts):
+        for image_path, prompt in zip(image_paths, prompts, strict=False):
             try:
                 result = self.generate(image_path=image_path, prompt=prompt, **generation_kwargs)
                 results.append(result)

@@ -1,13 +1,10 @@
 import gc
 import json
 import os
-import random
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import yaml
 from torch.cuda.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
@@ -20,26 +17,17 @@ from transformers import (
 
 from data import COCO_Loader
 from models import VisionLanguageConnector
+import logging
+from models.utils.common import load_config, set_seed, setup_logging
 
-
-# --- IMPROVEMENT: Seed setting for reproducibility ---
-def set_seed(seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
+logger = logging.getLogger(__name__)
 
 set_seed()
+setup_logging()
 
 # --- 1. Load Configuration ---
-print("--- Initializing Stage 1: Vision Connector Training ---")
-with open("./configs/training_config.yaml", "r") as file:
-    config = yaml.safe_load(file)
+logger.info("--- Initializing Stage 1: Vision Connector Training ---")
+config = load_config()
 
 paths = config["paths"]
 train_params = config["training_stage1"]
@@ -52,13 +40,13 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 accumulation_steps = train_params.get("gradient_accumulation_steps", 1)
 
 
-print(f"Using device: {DEVICE}")
+logger.info(f"Using device: {DEVICE}")
 if DEVICE == "cpu":
-    print("WARNING: CUDA not available, using CPU!")
+    logger.info("WARNING: CUDA not available, using CPU!")
     exit(1)
 
 # --- 2. Load Foundational Models ---
-print("Loading foundational models...")
+logger.info("Loading foundational models...")
 vision_encoder = CLIPVisionModel.from_pretrained(paths["clip_local_path"]).to(DEVICE)
 clip_processor = AutoProcessor.from_pretrained(paths["clip_local_path"])
 llm = MistralForCausalLM.from_pretrained(
@@ -73,10 +61,10 @@ for param in vision_encoder.parameters():
     param.requires_grad = False
 for param in llm.parameters():
     param.requires_grad = False
-print("✅ Models loaded and frozen.")
+logger.info("✅ Models loaded and frozen.")
 
 # --- 3. Create Datasets and DataLoaders ---
-print("Creating datasets and dataloaders...")
+logger.info("Creating datasets and dataloaders...")
 train_dataset = COCO_Loader(
     image_dir=paths["image_dir"],
     annotations_file=paths["annotations_file"],
@@ -135,13 +123,13 @@ latest_model_path = os.path.join(OUTPUT_DIR, "vision_connector_stage1_latest.pth
 
 
 if os.path.exists(latest_model_path):
-    print(f"💾 Loading saved weights from {latest_model_path}")
+    logger.debug(f"💾 Loading saved weights from {latest_model_path}")
     vision_connector.load_state_dict(torch.load(latest_model_path, map_location=DEVICE))
 
 vision_connector = torch.compile(vision_connector)
 
 # --- 5. The Training and Validation Loop ---
-print("🚀 Starting training...")
+logger.info("🚀 Starting training...")
 for epoch in range(NUM_EPOCHS):
     vision_connector.train()
     total_train_loss = 0
@@ -193,7 +181,7 @@ for epoch in range(NUM_EPOCHS):
         total_train_loss += loss.item() * accumulation_steps  # Un-scale for logging
 
         if (i + 1) % 100 == 0:
-            print(f"  Epoch {epoch + 1}, Batch [{i + 1}/{len(train_loader)}]")
+            logger.info(f"  Epoch {epoch + 1}, Batch [{i + 1}/{len(train_loader)}]")
 
         del images, input_ids, attention_mask, patch_embeddings, text_embeddings
         del visual_soft_tokens, combined_embeddings, outputs, logits, loss
@@ -201,7 +189,7 @@ for epoch in range(NUM_EPOCHS):
         torch.cuda.empty_cache()
 
     avg_train_loss = total_train_loss / len(train_loader)
-    print(f"Epoch [{epoch + 1}/{NUM_EPOCHS}] - Training Loss: {avg_train_loss:.4f}")
+    logger.info(f"Epoch [{epoch + 1}/{NUM_EPOCHS}] - Training Loss: {avg_train_loss:.4f}")
 
     # -- Validation Phase --
     vision_connector.eval()
@@ -234,7 +222,7 @@ for epoch in range(NUM_EPOCHS):
             total_val_loss += loss.item()
 
     avg_val_loss = total_val_loss / len(val_loader)
-    print(f"Epoch [{epoch + 1}/{NUM_EPOCHS}] - Validation Loss: {avg_val_loss:.4f}")
+    logger.info(f"Epoch [{epoch + 1}/{NUM_EPOCHS}] - Validation Loss: {avg_val_loss:.4f}")
 
     # --- Early Stopping and Checkpointing Logic ---
     # Access the original model with ._orig_mod to get a compatible state dict
@@ -242,13 +230,13 @@ for epoch in range(NUM_EPOCHS):
 
     # Save the clean state for the latest checkpoint
     torch.save(state_to_save, latest_model_path)
-    print(f"💾 Latest model checkpoint saved to {latest_model_path}")
+    logger.debug(f"💾 Latest model checkpoint saved to {latest_model_path}")
 
     # If it's the best model, save the clean state for the best checkpoint too
     if avg_val_loss < best_val_loss:
         best_val_loss = avg_val_loss
         torch.save(state_to_save, best_model_path)
-        print(f"🏆 New best validation loss! Model saved to {best_model_path}")
+        logger.info(f"🏆 New best validation loss! Model saved to {best_model_path}")
 
     # --- Metrics Logging ---
     metrics_path = os.path.join(OUTPUT_DIR, "loss_history_stage1.json")
@@ -260,6 +248,6 @@ for epoch in range(NUM_EPOCHS):
 
     with open(metrics_path, "w") as f:
         json.dump(metrics_history, f, indent=4)
-    print(f"✅ Metrics saved to {metrics_path}")
+    logger.info(f"✅ Metrics saved to {metrics_path}")
 
-print("✅ Training complete.")
+logger.info("✅ Training complete.")

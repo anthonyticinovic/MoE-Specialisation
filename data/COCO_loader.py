@@ -1,9 +1,12 @@
+import logging
 import os
 import random
 
 from PIL import Image
 from pycocotools.coco import COCO
 from torch.utils.data import Dataset
+
+logger = logging.getLogger(__name__)
 
 
 class COCO_Loader(Dataset):
@@ -39,19 +42,21 @@ class COCO_Loader(Dataset):
         split_index = int(len(subset_img_ids) * (1 - val_split_fraction))
         if split == "train":
             final_img_ids = subset_img_ids[:split_index]
-            print(f"Using {len(final_img_ids)} unique images for training.")
+            logger.info("Using %d unique images for training.", len(final_img_ids))
         elif split == "val":
             val_img_ids = subset_img_ids[split_index:]
             # Apply additional subsampling to validation set if requested
             if val_subset_fraction < 1.0:
                 val_subset_size = int(len(val_img_ids) * val_subset_fraction)
                 final_img_ids = val_img_ids[:val_subset_size]
-                print(
-                    f"Using {len(final_img_ids)} unique images for validation (subsampled from {len(val_img_ids)})."
+                logger.info(
+                    "Using %d unique images for validation (subsampled from %d).",
+                    len(final_img_ids),
+                    len(val_img_ids),
                 )
             else:
                 final_img_ids = val_img_ids
-                print(f"Using {len(final_img_ids)} unique images for validation.")
+                logger.info("Using %d unique images for validation.", len(final_img_ids))
 
         # 3. Load annotations ONLY for the final set of image IDs
         ann_ids = self.coco.getAnnIds(imgIds=final_img_ids)
@@ -69,7 +74,7 @@ class COCO_Loader(Dataset):
         try:
             image = Image.open(image_path).convert("RGB")
         except FileNotFoundError:
-            print(f"Warning: Image file not found at {image_path}. Skipping.")
+            logger.warning("Image file not found at %s — skipping.", image_path)
             # Return None or a placeholder to be handled in the dataloader's collate_fn if needed
             return None
 

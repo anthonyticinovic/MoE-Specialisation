@@ -11,7 +11,6 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
-import yaml
 from torch.amp import GradScaler, autocast
 from torch.distributed.fsdp import (
     CPUOffload,
@@ -26,7 +25,6 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from transformers import (
-    AutoConfig,
     AutoModelForCausalLM,
     AutoProcessor,
     AutoTokenizer,
@@ -36,12 +34,10 @@ from transformers.models.mistral.modeling_mistral import MistralMLP
 
 from data import COCO_Loader, LLaVA_Loader
 from models import VisionLanguageConnector
+import logging
+from models.utils.common import load_config, register_moe_model, setup_logging
 
-# Import your custom MoE classes
-from models.custom_mistral import (
-    MistralMoEConfig,
-    MistralMoEForCausalLM,
-)
+logger = logging.getLogger(__name__)
 
 
 # ====================================================================================
@@ -218,15 +214,12 @@ class ExpertUsageTracker:
         return metrics
 
 
-# --- 1. Register Your Custom Architecture ---
-AutoConfig.register("mistral_moe", MistralMoEConfig)
-AutoModelForCausalLM.register(MistralMoEConfig, MistralMoEForCausalLM)
+register_moe_model()
 
 # ====================================================================================
 # 2. SETUP AND CONFIGURATION
 # ====================================================================================
-with open("./configs/training_config.yaml", "r") as file:
-    config = yaml.safe_load(file)
+config = load_config()
 
 paths = config["paths"]
 # CHANGED: Use training_stage3 parameters from config
@@ -247,19 +240,20 @@ timeout = datetime.timedelta(minutes=60)
 dist.init_process_group("nccl", timeout=timeout)
 
 local_rank = int(os.environ["LOCAL_RANK"])
+setup_logging(local_rank)
 torch.cuda.set_device(local_rank)
 DEVICE = local_rank
 
 if local_rank == 0:
     # CHANGED: Print statement for Stage 3
-    print("--- Initializing Stage 3 Training (End-to-End) ---")
-    print(f"🕐 NCCL timeout set to: {timeout} (60 minutes)")
+    logger.info("--- Initializing Stage 3 Training (End-to-End) ---")
+    logger.debug(f"🕐 NCCL timeout set to: {timeout} (60 minutes)")
 
 # ====================================================================================
 # 3. MODEL LOADING
 # ====================================================================================
 if local_rank == 0:
-    print("Loading foundational models...")
+    logger.info("Loading foundational models...")
 vision_encoder = CLIPVisionModel.from_pretrained(paths["clip_local_path"]).to(DEVICE)
 # CRITICAL: Set vision encoder to eval mode since it's frozen - prevents dropout/stochastic behavior
 vision_encoder.eval()
@@ -283,14 +277,14 @@ llm = AutoModelForCausalLM.from_pretrained(
 
 # Explicitly set all MoE layers to use soft routing for training
 if local_rank == 0:
-    print("Setting MoE layers to 'soft' routing mode for Stage 3.")
+    logger.info("Setting MoE layers to 'soft' routing mode for Stage 3.")
 for layer in llm.model.layers:
     if hasattr(layer.mlp, "routing_mode"):
         layer.mlp.routing_mode = "soft"
 
 # Configure dropout for regularization (Stage 3 only)
 if local_rank == 0:
-    print("Configuring dropout for Stage 3 regularization...")
+    logger.info("Configuring dropout for Stage 3 regularization...")
 
 attention_dropout = train_params.get("attention_dropout", 0.0)
 expert_dropout = train_params.get("expert_dropout", 0.0)
@@ -314,16 +308,16 @@ for layer in llm.model.layers:
             layer.mlp.expert_dropout.p = expert_dropout
 
 if local_rank == 0:
-    print(f"  ✅ Attention dropout: {attention_dropout}")
-    print(f"  ✅ Expert dropout: {expert_dropout}")
-    print(f"  ✅ Router dropout: 0.1 (pre-configured in MoE layer)")
+    logger.info(f"  ✅ Attention dropout: {attention_dropout}")
+    logger.info(f"  ✅ Expert dropout: {expert_dropout}")
+    logger.info(f"  ✅ Router dropout: 0.1 (pre-configured in MoE layer)")
 
 # ====================================================================================
 # 4. TRAINING SETUP (PART 1 - Parameter Freezing)
 # ====================================================================================
 if local_rank == 0:
-    print("Preparing model for Stage 3: Selective unfreezing (self-attn, router, MLP only).")
-    print("Vision connector will remain frozen (using Stage 1 weights).")
+    logger.info("Preparing model for Stage 3: Selective unfreezing (self-attn, router, MLP only).")
+    logger.info("Vision connector will remain frozen (using Stage 1 weights).")
 
 # Freeze all LLM parameters first
 for param in llm.parameters():
@@ -334,7 +328,7 @@ for name, param in llm.named_parameters():
     if any(x in name for x in ["self_attn", "mlp.gate", "mlp.experts"]):
         param.requires_grad = True
         if local_rank == 0 and "layers.0" in name:  # Print first layer as example
-            print(f"  Unfrozen: {name}")
+            logger.info(f"  Unfrozen: {name}")
 
 vision_connector = VisionLanguageConnector().to(DEVICE)
 # Keep vision connector frozen (already trained in Stage 1)
@@ -348,7 +342,7 @@ for param in vision_encoder.parameters():
 if local_rank == 0:
     trainable_count = sum(p.numel() for p in llm.parameters() if p.requires_grad)
     total_count = sum(p.numel() for p in llm.parameters())
-    print(
+    logger.info(
         f"LLM: {trainable_count:,} / {total_count:,} parameters trainable ({100 * trainable_count / total_count:.1f}%)"
     )
 
@@ -373,7 +367,7 @@ ignored_modules = [llm.model.embed_tokens]
 # CRITICAL: Ignored modules must be on the correct device BEFORE FSDP wrapping
 # Moving them after wrapping causes FSDP to detect "newly-added parameters"
 if local_rank == 0:
-    print(f"Placing ignored modules on device {DEVICE} before FSDP wrapping")
+    logger.info(f"Placing ignored modules on device {DEVICE} before FSDP wrapping")
 llm.model.embed_tokens.to(DEVICE)
 
 # CRITICAL: Cache embedding layer reference before FSDP wrapping to avoid accessing
@@ -408,26 +402,26 @@ if local_rank == 0:
     if os.path.exists(stage2_checkpoint_path):
         checkpoint_found.fill_(1.0)
     else:
-        print("❌ CRITICAL: Stage 2 checkpoint not found!")
-        print(f"   Expected path: {stage2_checkpoint_path}")
+        logger.info("❌ CRITICAL: Stage 2 checkpoint not found!")
+        logger.info(f"   Expected path: {stage2_checkpoint_path}")
 
 dist.broadcast(checkpoint_found, src=0)
 
 if checkpoint_found.item() == 1.0:
     if local_rank == 0:
-        print(f"💾 Loading Stage 2 (Expert) checkpoint: {stage2_checkpoint_path}")
+        logger.debug(f"💾 Loading Stage 2 (Expert) checkpoint: {stage2_checkpoint_path}")
 
     # EXACT COPY from train_stage_2.5.py (WORKING VERSION)
     # Load the state dict directly (Stage 2's 'best' checkpoint saves state_dict directly)
     state_dict = torch.load(stage2_checkpoint_path, map_location="cpu")
 
     if local_rank == 0:
-        print(f"  🔍 Checkpoint type: {type(state_dict)}")
-        print(f"  📊 Checkpoint contains {len(state_dict)} keys")
+        logger.debug(f"  🔍 Checkpoint type: {type(state_dict)}")
+        logger.debug(f"  📊 Checkpoint contains {len(state_dict)} keys")
 
         # Sample some keys to verify structure
         sample_keys = list(state_dict.keys())[:5]
-        print(f"  📋 Sample keys: {sample_keys}")
+        logger.debug(f"  📋 Sample keys: {sample_keys}")
 
     # Load the state dict into the FSDP model
     # Use rank0_only=True for GPU-count agnostic loading
@@ -437,11 +431,13 @@ if checkpoint_found.item() == 1.0:
 
         if local_rank == 0:
             if missing_keys:
-                print(f"  ⚠️  Missing keys ({len(missing_keys)}): {missing_keys[:5]}...")
+                logger.debug(f"  ⚠️  Missing keys ({len(missing_keys)}): {missing_keys[:5]}...")
             if unexpected_keys:
-                print(f"  ⚠️  Unexpected keys ({len(unexpected_keys)}): {unexpected_keys[:5]}...")
+                logger.debug(
+                    f"  ⚠️  Unexpected keys ({len(unexpected_keys)}): {unexpected_keys[:5]}..."
+                )
             if not missing_keys and not unexpected_keys:
-                print(f"  ✅ All keys matched perfectly!")
+                logger.info(f"  ✅ All keys matched perfectly!")
 
     del state_dict
     gc.collect()
@@ -450,10 +446,10 @@ if checkpoint_found.item() == 1.0:
     dist.barrier()
 
     if local_rank == 0:
-        print("✅ Stage 2 checkpoint loaded successfully on all ranks.")
-        print("ℹ️  Stage 3: Using loaded router weights (will be fine-tuned end-to-end)")
+        logger.info("✅ Stage 2 checkpoint loaded successfully on all ranks.")
+        logger.debug("ℹ️  Stage 3: Using loaded router weights (will be fine-tuned end-to-end)")
 elif local_rank == 0:
-    print("❌ CRITICAL: Cannot proceed without Stage 2 expert weights!")
+    logger.info("❌ CRITICAL: Cannot proceed without Stage 2 expert weights!")
     raise FileNotFoundError(f"Stage 2 checkpoint not found: {stage2_checkpoint_path}")
 
 dist.barrier()
@@ -464,7 +460,7 @@ dist.barrier()
 # This causes "newly-added parameter" errors during the first backward pass.
 
 if local_rank == 0:
-    print("✅ Stage 2 checkpoint loaded and ready for training.\n")
+    logger.info("✅ Stage 2 checkpoint loaded and ready for training.\n")
 
 dist.barrier()
 
@@ -480,21 +476,23 @@ if local_rank == 0:
     if os.path.exists(stage1_weights_path):
         connector_found.fill_(1.0)
     else:
-        print(f"⚠️  Warning: Stage 1 Vision Connector weights not found at {stage1_weights_path}")
-        print(f"   Vision connector will use random initialization.")
+        logger.debug(
+            f"⚠️  Warning: Stage 1 Vision Connector weights not found at {stage1_weights_path}"
+        )
+        logger.info(f"   Vision connector will use random initialization.")
 
 dist.broadcast(connector_found, src=0)
 
 if connector_found.item() == 1.0:
     if local_rank == 0:
-        print(f"💾 Loading Stage 1 Vision Connector weights from {stage1_weights_path}")
+        logger.debug(f"💾 Loading Stage 1 Vision Connector weights from {stage1_weights_path}")
     map_loc = f"cuda:{DEVICE}"
     vision_connector.load_state_dict(torch.load(stage1_weights_path, map_location=map_loc))
     if local_rank == 0:
-        print("✅ Vision Connector weights loaded successfully on all ranks.")
+        logger.info("✅ Vision Connector weights loaded successfully on all ranks.")
 else:
     if local_rank == 0:
-        print(
+        logger.info(
             "⚠️  Proceeding with randomly initialized Vision Connector (not recommended for Stage 3)"
         )
 
@@ -504,14 +502,14 @@ dist.barrier()
 # 8. DATA & OPTIMIZER
 # ====================================================================================
 if local_rank == 0:
-    print("Creating datasets and dataloaders...")
+    logger.info("Creating datasets and dataloaders...")
 
 # Conditional dataset loading based on config
 dataset_type = train_params.get("dataset", "coco")  # Default to COCO for backward compatibility
 
 if dataset_type == "llava":
     if local_rank == 0:
-        print("📚 Using LLaVA-Instruct-150K dataset (ALL Q&A pairs, multi-turn)")
+        logger.info("📚 Using LLaVA-Instruct-150K dataset (ALL Q&A pairs, multi-turn)")
 
     train_dataset = LLaVA_Loader(
         annotations_file=paths["llava_annotations_file"],
@@ -537,7 +535,7 @@ if dataset_type == "llava":
     )
 else:  # "coco"
     if local_rank == 0:
-        print("📚 Using COCO captions dataset")
+        logger.info("📚 Using COCO captions dataset")
 
     train_dataset = COCO_Loader(
         image_dir=paths["image_dir"],
@@ -608,7 +606,7 @@ loss_fn = nn.CrossEntropyLoss(
 )
 
 if local_rank == 0 and label_smoothing > 0:
-    print(f"  ✅ Label smoothing: {label_smoothing}")
+    logger.info(f"  ✅ Label smoothing: {label_smoothing}")
 
 # --- Resumption logic for Stage 3 ---
 # CHANGED: Always use portable checkpoint (model weights only) for clean resumption
@@ -623,8 +621,10 @@ dist.broadcast(resume_tensor, src=0)
 
 if resume_tensor.item() == 1.0:
     if local_rank == 0:
-        print(f"💾 Resuming Stage 3 training from portable checkpoint: {portable_checkpoint_path}")
-        print(f"   (Model weights only - optimizer/scheduler will use fresh config settings)")
+        logger.debug(
+            f"💾 Resuming Stage 3 training from portable checkpoint: {portable_checkpoint_path}"
+        )
+        logger.info(f"   (Model weights only - optimizer/scheduler will use fresh config settings)")
 
     # All ranks load the checkpoint
     checkpoint = torch.load(portable_checkpoint_path, map_location="cpu")
@@ -645,13 +645,15 @@ if resume_tensor.item() == 1.0:
     # Don't update best_val_loss - let the new training run establish its own best
     # This prevents issues if validation set size changed
     if local_rank == 0:
-        print(
+        logger.info(
             f"   📊 Checkpoint was at epoch {checkpoint['epoch']} with val_loss {checkpoint_val_loss:.4f}"
         )
-        print(f"   🔄 Optimizer and scheduler initialized with NEW config:")
-        print(f"      - Learning rate: {train_params['learning_rate']:.2e}")
-        print(f"      - Total steps: {total_steps} (based on current dataset size)")
-        print(f"   ⚠️  Epoch counter continuing from {start_epoch}, but optimizer state is fresh")
+        logger.info(f"   🔄 Optimizer and scheduler initialized with NEW config:")
+        logger.info(f"      - Learning rate: {train_params['learning_rate']:.2e}")
+        logger.info(f"      - Total steps: {total_steps} (based on current dataset size)")
+        logger.debug(
+            f"   ⚠️  Epoch counter continuing from {start_epoch}, but optimizer state is fresh"
+        )
 
     del checkpoint
     del model_state_dict
@@ -659,14 +661,16 @@ if resume_tensor.item() == 1.0:
 
     dist.barrier()
     if local_rank == 0:
-        print(f"✅ Resumed successfully with fresh optimizer. Starting from epoch {start_epoch}.")
+        logger.info(
+            f"✅ Resumed successfully with fresh optimizer. Starting from epoch {start_epoch}."
+        )
 else:
     if local_rank == 0:
-        print("🏁 No portable checkpoint found. Starting training from scratch.")
+        logger.info("🏁 No portable checkpoint found. Starting training from scratch.")
 
 
 if local_rank == 0:
-    print(f"Optimizing {sum(p.numel() for p in trainable_params)} trainable parameters.")
+    logger.info(f"Optimizing {sum(p.numel() for p in trainable_params)} trainable parameters.")
 
 metrics_path = os.path.join(OUTPUT_DIR, "training_metrics_stage3.json")
 metrics_history = {"epoch": [], "train_loss": [], "val_loss": [], "learning_rate": []}
@@ -691,39 +695,39 @@ if local_rank == 0:
     # Check if we resumed from checkpoint
     resumed_from_checkpoint = start_epoch > 0
 
-    print("\n" + "=" * 70)
-    print("🚀 STAGE 3 TRAINING CONFIGURATION")
-    print("=" * 70)
-    print(f"Dataset:               {dataset_type.upper()}")
-    print(f"Epochs:                {NUM_EPOCHS} (starting from epoch {start_epoch})")
+    logger.info("\n" + "=" * 70)
+    logger.info("🚀 STAGE 3 TRAINING CONFIGURATION")
+    logger.info("=" * 70)
+    logger.info(f"Dataset:               {dataset_type.upper()}")
+    logger.info(f"Epochs:                {NUM_EPOCHS} (starting from epoch {start_epoch})")
     if resumed_from_checkpoint:
-        print(f"Resume mode:           Portable checkpoint (model weights only)")
-        print(f"                       Optimizer/scheduler: FRESH with new config")
-    print(f"Training samples:      {len(train_dataset)}")
-    print(f"Validation samples:    {len(val_dataset)}")
-    print(f"Batch size per GPU:    {train_params['batch_size']}")
-    print(f"Gradient accumulation: {accumulation_steps}")
-    print(
+        logger.info(f"Resume mode:           Portable checkpoint (model weights only)")
+        logger.info(f"                       Optimizer/scheduler: FRESH with new config")
+    logger.info(f"Training samples:      {len(train_dataset)}")
+    logger.info(f"Validation samples:    {len(val_dataset)}")
+    logger.info(f"Batch size per GPU:    {train_params['batch_size']}")
+    logger.info(f"Gradient accumulation: {accumulation_steps}")
+    logger.info(
         f"Effective batch size:  {train_params['batch_size'] * world_size * accumulation_steps} (batch_size × {world_size} GPUs × accum_steps)"
     )
-    print(f"Steps per epoch:       {len(train_loader) // accumulation_steps}")
-    print(f"Total training steps:  {total_steps}")
-    print(f"Learning rate:         {train_params['learning_rate']:.2e}")
-    print(f"Weight decay:          {train_params['weight_decay']}")
-    print(f"Label smoothing:       {label_smoothing}")
-    print(f"Attention dropout:     {attention_dropout}")
-    print(f"Expert dropout:        {expert_dropout}")
-    print(f"Router dropout:        0.1 (pre-configured)")
-    print(f"Optimizer:             AdamW (fused)")
-    print(f"Scheduler:             CosineAnnealingLR")
-    print(f"Mixed precision:       bfloat16")
-    print(f"Gradient checkpointing: Disabled")
-    print(f"FSDP robustness:       Dummy expert touching enabled")
-    print("=" * 70 + "\n")
+    logger.info(f"Steps per epoch:       {len(train_loader) // accumulation_steps}")
+    logger.info(f"Total training steps:  {total_steps}")
+    logger.info(f"Learning rate:         {train_params['learning_rate']:.2e}")
+    logger.info(f"Weight decay:          {train_params['weight_decay']}")
+    logger.info(f"Label smoothing:       {label_smoothing}")
+    logger.info(f"Attention dropout:     {attention_dropout}")
+    logger.info(f"Expert dropout:        {expert_dropout}")
+    logger.info(f"Router dropout:        0.1 (pre-configured)")
+    logger.info(f"Optimizer:             AdamW (fused)")
+    logger.info(f"Scheduler:             CosineAnnealingLR")
+    logger.info(f"Mixed precision:       bfloat16")
+    logger.info(f"Gradient checkpointing: Disabled")
+    logger.info(f"FSDP robustness:       Dummy expert touching enabled")
+    logger.info("=" * 70 + "\n")
     if resumed_from_checkpoint:
-        print(f"🔄 Continuing from model checkpoint with FRESH optimizer state")
-        print(f"   This allows dataset/LR changes without compatibility issues\n")
-    print(f"🚀 Starting training...")
+        logger.info(f"🔄 Continuing from model checkpoint with FRESH optimizer state")
+        logger.info(f"   This allows dataset/LR changes without compatibility issues\n")
+    logger.info(f"🚀 Starting training...")
 
 start_time = time.time()
 for epoch in range(start_epoch, NUM_EPOCHS):
@@ -745,9 +749,9 @@ for epoch in range(start_epoch, NUM_EPOCHS):
     epoch_start_time = time.time()
 
     if local_rank == 0:
-        print(f"\n{'=' * 70}")
-        print(f"📚 Starting Epoch {epoch + 1}/{NUM_EPOCHS}")
-        print(f"{'=' * 70}")
+        logger.info(f"\n{'=' * 70}")
+        logger.info(f"📚 Starting Epoch {epoch + 1}/{NUM_EPOCHS}")
+        logger.info(f"{'=' * 70}")
 
     for i, batch in enumerate(train_loader):
         # Unpack batch - LLaVA returns 4 items (images, input_ids, attention_mask, labels)
@@ -845,7 +849,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
                     )
                     eta_minutes = int(eta_seconds / 60)
 
-                    print(
+                    logger.info(
                         f"  [Step {steps_done:4d}/{total_steps}] Loss: {avg_loss_so_far:.4f} | "
                         f"LR: {current_lr:.2e} | Speed: {steps_per_sec:.2f} steps/s | ETA: {eta_minutes}min"
                     )
@@ -855,7 +859,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
     avg_train_loss = total_train_loss / num_optimizer_steps
     if local_rank == 0:
         epoch_train_time = time.time() - epoch_start_time
-        print(
+        logger.info(
             f"\n✅ Training complete: Avg Loss = {avg_train_loss:.4f} | Time: {epoch_train_time / 60:.2f} min"
         )
 
@@ -877,8 +881,10 @@ for epoch in range(start_epoch, NUM_EPOCHS):
         # CLIP ViT-Large/14 produces 257 visual tokens (256 patches + 1 CLS token)
         # Positions 0-256 are visual, 257+ are text tokens
         expert_tracker = ExpertUsageTracker(num_layers=32, num_experts=2, visual_token_end=256)
-        print(f"\n📊 Running validation (all ranks, max {MAX_VAL_BATCHES} batches per GPU)...")
-        print(f"   📈 Collecting expert utilization metrics for research analysis...")
+        logger.debug(
+            f"\n📊 Running validation (all ranks, max {MAX_VAL_BATCHES} batches per GPU)..."
+        )
+        logger.info(f"   📈 Collecting expert utilization metrics for research analysis...")
         val_start_time = time.time()
 
     with torch.no_grad():
@@ -969,7 +975,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             # Progress logging every 25 batches
             if local_rank == 0 and (i + 1) % 25 == 0:
                 avg_val_loss_so_far = total_val_loss / val_steps if val_steps > 0 else 0.0
-                print(
+                logger.info(
                     f"  Validation progress: {i + 1}/{MAX_VAL_BATCHES} batches | Avg Loss: {avg_val_loss_so_far:.4f}"
                 )
 
@@ -978,7 +984,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
 
     # Compute and save expert metrics (rank 0 only)
     if local_rank == 0 and expert_tracker is not None:
-        print(f"\n📊 Computing expert utilization metrics...")
+        logger.debug(f"\n📊 Computing expert utilization metrics...")
         expert_metrics = expert_tracker.compute_metrics()
 
         # Save to JSON file
@@ -990,70 +996,72 @@ for epoch in range(start_epoch, NUM_EPOCHS):
         with open(metrics_filepath, "w") as f:
             json.dump(expert_metrics, f, indent=2)
 
-        print(f"✅ Expert metrics saved to {metrics_filepath}")
+        logger.info(f"✅ Expert metrics saved to {metrics_filepath}")
 
         # Print summary table
-        print(f"\n{'=' * 70}")
-        print(f"📈 EXPERT UTILIZATION METRICS - Epoch {epoch + 1}")
-        print(f"{'=' * 70}")
+        logger.info(f"\n{'=' * 70}")
+        logger.info(f"📈 EXPERT UTILIZATION METRICS - Epoch {epoch + 1}")
+        logger.info(f"{'=' * 70}")
 
         agg = expert_metrics["aggregate"]
 
         # 1. Expert Load Distribution (Aggregate)
-        print(f"\n1️⃣  Expert Load Distribution (Aggregate across all layers):")
+        logger.info(f"\n1️⃣  Expert Load Distribution (Aggregate across all layers):")
         if "expert_load_distribution" in agg:
             for expert, pct in agg["expert_load_distribution"].items():
-                print(f"   {expert}: {pct}%")
+                logger.info(f"   {expert}: {pct}%")
 
         # 2. Routing Entropy (Aggregate)
-        print(f"\n2️⃣  Average Routing Entropy (Aggregate):")
+        logger.info(f"\n2️⃣  Average Routing Entropy (Aggregate):")
         if "avg_routing_entropy" in agg:
-            print(f"   {agg['avg_routing_entropy']:.4f} (lower = more decisive routing)")
+            logger.info(f"   {agg['avg_routing_entropy']:.4f} (lower = more decisive routing)")
 
         # 3. Routing Confidence (Aggregate)
-        print(f"\n3️⃣  High Confidence Routing Fraction (Aggregate):")
+        logger.info(f"\n3️⃣  High Confidence Routing Fraction (Aggregate):")
         if "high_confidence_fraction" in agg:
-            print(f"   {agg['high_confidence_fraction']:.2%} of tokens routed with >70% confidence")
+            logger.info(
+                f"   {agg['high_confidence_fraction']:.2%} of tokens routed with >70% confidence"
+            )
 
         # 4. Visual vs Text Routing (Aggregate)
-        print(f"\n4️⃣  Visual vs Text Token Routing (Aggregate):")
+        logger.info(f"\n4️⃣  Visual vs Text Token Routing (Aggregate):")
         if "visual_routing" in agg:
-            print(f"   Visual Tokens (positions 0-256):")
+            logger.info(f"   Visual Tokens (positions 0-256):")
             for expert, pct in agg["visual_routing"].items():
-                print(f"      {expert}: {pct}%")
+                logger.info(f"      {expert}: {pct}%")
         if "text_routing" in agg:
-            print(f"   Text Tokens (positions 257+):")
+            logger.info(f"   Text Tokens (positions 257+):")
             for expert, pct in agg["text_routing"].items():
-                print(f"      {expert}: {pct}%")
+                logger.info(f"      {expert}: {pct}%")
 
         # Sample per-layer metrics (first, middle, last layers)
-        print(f"\n📋 Sample Per-Layer Metrics (Layers 0, 15, 31):")
+        logger.debug(f"\n📋 Sample Per-Layer Metrics (Layers 0, 15, 31):")
         for layer_idx in [0, 15, 31]:
             layer_metrics = expert_metrics["per_layer"][layer_idx]
-            print(f"\n   Layer {layer_idx}:")
-            print(f"      Expert Load: {layer_metrics['expert_load_distribution']}")
-            print(f"      Entropy: {layer_metrics['avg_routing_entropy']:.4f}")
-            print(f"      High Conf: {layer_metrics['high_confidence_fraction']:.2%}")
+            logger.info(f"\n   Layer {layer_idx}:")
+            logger.info(f"      Expert Load: {layer_metrics['expert_load_distribution']}")
+            logger.info(f"      Entropy: {layer_metrics['avg_routing_entropy']:.4f}")
+            logger.info(f"      High Conf: {layer_metrics['high_confidence_fraction']:.2%}")
             if "visual" in layer_metrics["visual_vs_text_routing"]:
-                print(f"      Visual: {layer_metrics['visual_vs_text_routing']['visual']}")
+                logger.info(f"      Visual: {layer_metrics['visual_vs_text_routing']['visual']}")
             if "text" in layer_metrics["visual_vs_text_routing"]:
-                print(f"      Text: {layer_metrics['visual_vs_text_routing']['text']}")
+                logger.info(f"      Text: {layer_metrics['visual_vs_text_routing']['text']}")
 
-        print(f"\n💡 Full per-layer metrics available in {metrics_filepath}")
-        print(f"{'=' * 70}\n")
+        logger.info(f"\n💡 Full per-layer metrics available in {metrics_filepath}")
+        logger.info(f"{'=' * 70}\n")
 
     if local_rank == 0:
         val_time = time.time() - val_start_time
         epoch_time = time.time() - epoch_start_time
-        print(f"\n{'=' * 70}")
-        print(f"Epoch [{epoch + 1}/{NUM_EPOCHS}] Complete")
-        print(f"  Training Loss:   {avg_train_loss:.4f}")
-        print(f"  Validation Loss: {avg_val_loss:.4f} (rank 0, {val_steps} batches)")
-        print(
+        logger.info(f"\n{'=' * 70}")
+        logger.info(f"Epoch [{epoch + 1}/{NUM_EPOCHS}] Complete")
+        logger.info(f"  Training Loss:   {avg_train_loss:.4f}")
+        logger.info(f"  Validation Loss: {avg_val_loss:.4f} (rank 0, {val_steps} batches)")
+        logger.info(
             f"  Epoch Time:      {epoch_time / 60:.2f} minutes (Train: {(epoch_time - val_time) / 60:.2f}m, Val: {val_time / 60:.2f}m)"
         )
-        print(f"  Learning Rate:   {scheduler.get_last_lr()[0]:.2e}")
-        print(f"{'=' * 70}\n")  # --- Metrics and Checkpoint Saving ---
+        logger.info(f"  Learning Rate:   {scheduler.get_last_lr()[0]:.2e}")
+        logger.info(f"{'=' * 70}\n")  # --- Metrics and Checkpoint Saving ---
     if local_rank == 0:
         metrics_history["epoch"].append(epoch + 1)
         metrics_history["train_loss"].append(avg_train_loss)
@@ -1061,14 +1069,14 @@ for epoch in range(start_epoch, NUM_EPOCHS):
         metrics_history["learning_rate"].append(optimizer.param_groups[0]["lr"])
         with open(metrics_path, "w") as f:
             json.dump(metrics_history, f, indent=4)
-        print(f"✅ Metrics saved to {metrics_path}")
+        logger.info(f"✅ Metrics saved to {metrics_path}")
 
     # CRITICAL: Barrier before checkpoint extraction to ensure all ranks are ready
     # FSDP state_dict extraction requires coordination between ranks
     dist.barrier()
 
     if local_rank == 0:
-        print(f"\n💾 Saving checkpoints...")
+        logger.debug(f"\n💾 Saving checkpoints...")
         checkpoint_start_time = time.time()
 
     # Force garbage collection and clear cache before checkpoint saving
@@ -1114,9 +1122,9 @@ for epoch in range(start_epoch, NUM_EPOCHS):
         torch.save(portable_checkpoint, portable_checkpoint_path)
 
         checkpoint_time = time.time() - checkpoint_start_time
-        print(f"  ✅ Saved latest checkpoint ({checkpoint_time:.1f}s)")
-        print(f"     Full: {latest_checkpoint_path}")
-        print(f"     Portable: {portable_checkpoint_path}")
+        logger.info(f"  ✅ Saved latest checkpoint ({checkpoint_time:.1f}s)")
+        logger.info(f"     Full: {latest_checkpoint_path}")
+        logger.info(f"     Portable: {portable_checkpoint_path}")
 
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
@@ -1127,11 +1135,13 @@ for epoch in range(start_epoch, NUM_EPOCHS):
 
             torch.save(full_checkpoint, best_checkpoint_path)
             torch.save(portable_checkpoint, best_portable_path)
-            print(f"\n  🏆 NEW BEST MODEL! Val loss improved: {avg_val_loss:.4f}")
-            print(f"     Best: {best_checkpoint_path}")
-            print(f"     Best Portable: {best_portable_path}")
+            logger.info(f"\n  🏆 NEW BEST MODEL! Val loss improved: {avg_val_loss:.4f}")
+            logger.info(f"     Best: {best_checkpoint_path}")
+            logger.info(f"     Best Portable: {best_portable_path}")
         else:
-            print(f"  ℹ️  Best val loss remains: {best_val_loss:.4f} (current: {avg_val_loss:.4f})")
+            logger.debug(
+                f"  ℹ️  Best val loss remains: {best_val_loss:.4f} (current: {avg_val_loss:.4f})"
+            )
 
         # Clean up checkpoint dicts to free memory
         del llm_state_dict, connector_state_dict, full_checkpoint, portable_checkpoint
@@ -1148,7 +1158,7 @@ if local_rank == 0:
     hours = int(duration_seconds // 3600)
     minutes = int((duration_seconds % 3600) // 60)
     seconds = int(duration_seconds % 60)
-    print(f"--- Total Training Time: {hours}h {minutes}m {seconds}s ---")
+    logger.info(f"--- Total Training Time: {hours}h {minutes}m {seconds}s ---")
 
 dist.destroy_process_group()
-print("Job finished.")
+logger.info("Job finished.")
