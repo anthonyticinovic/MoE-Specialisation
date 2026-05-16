@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint & format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Sync dev environment
+        run: uv sync --group dev --no-group hpc
+      # Strict lint on the maintained core; research scripts are held to
+      # formatting-only (same scoping rationale as mypy below).
+      - name: Ruff check (core)
+        run: uv run ruff check models/ data/ tests/
+      - name: Ruff format (whole repo)
+        run: uv run ruff format --check .
+
+  typecheck:
+    name: Type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Sync dev environment
+        run: uv sync --group dev --no-group hpc
+      - name: Mypy (models/, data/)
+        run: uv run mypy
+
+  test:
+    name: Tests (CPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Sync dev environment
+        run: uv sync --group dev --no-group hpc
+      - name: Pytest
+        run: uv run pytest -q
