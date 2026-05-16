@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use this software or build on this research, please cite it as below."
+title: "Emergent Expert Specialisation in Mixture-of-Experts Vision-Language Models"
+authors:
+  - family-names: Ticinovic
+    given-names: Anthony
+    email: apticinovic@gmail.com
+year: 2026
+license: MIT
+repository-code: "https://github.com/apticinovic/MoE-Specialisation"
+keywords:
+  - mixture-of-experts
+  - vision-language-model
+  - mistral
+  - multimodal
+  - expert-specialisation
+preferred-citation:
+  type: conference-paper
+  title: "Emergent Expert Specialisation in Mixture-of-Experts Vision-Language Models"
+  authors:
+    - family-names: Ticinovic
+      given-names: Anthony
+  year: 2026

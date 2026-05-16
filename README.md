@@ -1,5 +1,11 @@
 # MoE Vision-Language Model
 
+[![CI](https://github.com/apticinovic/MoE-Specialisation/actions/workflows/ci.yml/badge.svg)](https://github.com/apticinovic/MoE-Specialisation/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
+[![uv](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/uv/main/assets/badge/v0.json)](https://github.com/astral-sh/uv)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+
 Research code for *Emergent Expert Specialisation in Mixture-of-Experts Vision-Language Models* (Ticinovic, 2026). The paper is included as `ticinovic26a.pdf`.
 
 ## Overview
@@ -53,14 +59,24 @@ All stages read paths from `configs/training_config.yaml`. Fill in the `YOUR_PAT
 
 ### Setup
 
-```bash
-git clone <repo>
-cd MoE-Specialisation
-pip install -r requirements.txt
+Using [uv](https://docs.astral.sh/uv/) (recommended for local development):
 
-# Edit all YOUR_PATH_HERE placeholders:
-vim configs/training_config.yaml
+```bash
+git clone https://github.com/apticinovic/MoE-Specialisation.git
+cd MoE-Specialisation
+uv sync                       # creates .venv from the pinned uv.lock
+# prefix commands with `uv run`, e.g. uv run python -m models.utils.create_moe_model ...
 ```
+
+On HPC/SLURM (uv may be unavailable on compute nodes):
+
+```bash
+pip install -r requirements.txt   # generated export of uv.lock
+```
+
+Then edit all `YOUR_PATH_HERE` placeholders in `configs/training_config.yaml`.
+`load_config()` validates these on startup and fails fast with a clear message
+if any are left unfilled.
 
 ### Stage 0 — Create the MoE model
 
@@ -203,7 +219,7 @@ MoE-Specialisation/
 │   ├── vl_connector.py       # VisionLanguageConnector (CLIP→LLM projection)
 │   └── utils/
 │       ├── create_moe_model.py   # Build MoE model from Mistral-7B
-│       ├── create_n_experts.py   # FFN→MoE surgical replacement utility
+│       ├── common.py             # Shared helpers (config, seed, logging, registration)
 │       └── generation.py         # CaptionGenerator inference helper
 ├── data/
 │   ├── COCO_loader.py        # COCO captions dataset
@@ -213,6 +229,7 @@ MoE-Specialisation/
 │   ├── karpathy_evaluation/  # COCO Karpathy split pipeline
 │   ├── pope_evaluation/      # POPE hallucination benchmark
 │   └── llava_evaluation/     # LLaVA-Wild evaluation
+├── tests/                    # CPU-only pytest suite + behavioural oracle
 ├── configs/
 │   ├── training_config.yaml  # All paths + hyperparameters (edit this first)
 │   └── *.json                # Per-analysis configs
@@ -220,6 +237,41 @@ MoE-Specialisation/
     ├── training_scripts/     # SLURM job scripts for training
     └── model_scripts/        # SLURM job script for model creation
 ```
+
+## Reproduce the paper
+
+The full pipeline, in order, with the artifacts each stage produces:
+
+| Step | Command | Produces |
+|------|---------|----------|
+| 0 | `python -m models.utils.create_moe_model --base-model <Mistral-7B> --output <MoE>` | MoE model dir (`trust_remote_code`) |
+| 1 | `python training_scripts/train_stage_1.py` | `vision_connector_stage1_best.pth` |
+| 2 | `torchrun --nproc_per_node=4 training_scripts/train_stage_2.py` | `stage2_checkpoints/llm_stage2_best.pth` |
+| 2.5 | `torchrun --nproc_per_node=4 training_scripts/train_stage_2.5.py` | `stage2_5_checkpoints/` (learned router) |
+| 3 | `torchrun --nproc_per_node=4 training_scripts/train_stage_3.py` | `stage3_checkpoints/` + `outputs/expert_metrics/` |
+
+Then run the analysis scripts (see below) against the resulting checkpoints.
+The `uv.lock` pins the exact dependency set; exact paper figures used the
+`transformers` 4.x line (the dependency is capped `<5`).
+
+## Development
+
+```bash
+uv sync --group dev          # runtime + dev tooling
+uv run pre-commit install
+
+uv run ruff check models/ data/ tests/   # lint the maintained core
+uv run ruff format --check .             # formatting (whole repo)
+uv run mypy                              # type-check models/ + data/
+uv run pytest -q                         # CPU-only suite (~1s)
+```
+
+ruff and mypy are strict on the maintained core (`models/`, `data/`, `tests/`);
+the research scripts (`training_scripts/`, `analysis_scripts/`) are held to
+formatting only, since they reproduce the published paper and are changed
+conservatively. `tests/test_training_dry_run.py` is a behavioural oracle: it
+asserts a tiny synthetic model produces bit-identical loss/grad-norm against a
+recorded baseline — if those numbers move, a refactor changed training numerics.
 
 ## Citation
 
