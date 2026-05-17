@@ -24,7 +24,21 @@ from models.custom_mistral import MistralMoEForCausalLM
 logger = logging.getLogger(__name__)
 
 
-def create_moe_model(base_model_path: str, output_path: str):
+def create_moe_model(base_model_path: str, output_path: str) -> None:
+    """Build and save an MoE checkpoint from a base Mistral-7B model (Stage 0).
+
+    Loads the base model, constructs a :class:`MistralMoEForCausalLM` with the
+    same config, copies every original FFN's weights into *both* experts of the
+    corresponding MoE layer (identical start, so the model is functionally
+    unchanged until experts diverge during training), then saves the result.
+    The saved ``config.json`` is patched with an ``auto_map`` and the custom
+    model source files are copied alongside it so the checkpoint loads via
+    ``trust_remote_code`` without this repo on the path.
+
+    Args:
+        base_model_path: Local path to the base Mistral-7B-v0.3 checkpoint.
+        output_path: Directory to write the MoE checkpoint to.
+    """
     logger.info("Loading base model from %s...", base_model_path)
     llm_base = MistralForCausalLM.from_pretrained(base_model_path)
 

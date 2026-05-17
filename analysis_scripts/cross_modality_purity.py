@@ -13,102 +13,17 @@ import argparse
 import json
 import os
 
-import matplotlib.pyplot as plt
 import numpy as np
-import seaborn as sns
 import torch
-import yaml
-from PIL import Image, ImageDraw
-from transformers import (
-    AutoConfig,
-    AutoModelForCausalLM,
-    AutoProcessor,
-    AutoTokenizer,
-    CLIPVisionModel,
+from PIL import Image
+
+from analysis_scripts import cross_modality_purity_plots as cmp_plots
+from analysis_scripts._lib import (
+    SyntheticImageGenerator,
+    load_stage2_models,
+    load_stage3_models,
+    load_training_config,
 )
-
-from models import VisionLanguageConnector
-from models.custom_mistral import MistralMoEConfig, MistralMoEForCausalLM
-
-# Register custom architecture
-AutoConfig.register("mistral_moe", MistralMoEConfig)
-AutoModelForCausalLM.register(MistralMoEConfig, MistralMoEForCausalLM)
-
-
-class SyntheticImageGenerator:
-    """Generates simple synthetic images for concept testing."""
-
-    def __init__(self, image_size: int = 224):
-        self.image_size = image_size
-        self.colors = {
-            "red": (255, 0, 0),
-            "blue": (0, 0, 255),
-            "green": (0, 255, 0),
-            "yellow": (255, 255, 0),
-            "orange": (255, 165, 0),
-            "purple": (128, 0, 128),
-            "black": (0, 0, 0),
-            "white": (255, 255, 255),
-        }
-
-    def generate_concept_image(self, concept: str) -> Image.Image:
-        """Generate image from concept: 'red', 'circle', or 'red circle'."""
-        parts = concept.lower().split()
-
-        # Pure color patch
-        if len(parts) == 1 and parts[0] in self.colors:
-            return Image.new("RGB", (self.image_size, self.image_size), self.colors[parts[0]])
-
-        # Shape (with optional color)
-        if len(parts) == 2:
-            # Colored shape: "red circle"
-            color_name = parts[0]
-            shape_name = parts[1]
-            if color_name not in self.colors or shape_name not in ["circle", "square", "triangle"]:
-                raise ValueError(f"Unknown concept: {concept}")
-            fill_color = self.colors[color_name]
-            outline_color = self.colors[color_name]
-        elif len(parts) == 1 and parts[0] in ["circle", "square", "triangle"]:
-            # Pure shape: black outline only, white fill (no color contamination)
-            shape_name = parts[0]
-            fill_color = (255, 255, 255)  # white fill
-            outline_color = (0, 0, 0)  # black outline
-        else:
-            raise ValueError(f"Unknown concept: {concept}")
-
-        # Create white background and draw shape
-        image = Image.new("RGB", (self.image_size, self.image_size), (255, 255, 255))
-        draw = ImageDraw.Draw(image)
-        margin = self.image_size // 4
-        line_width = 3  # Make outline visible
-
-        if shape_name == "circle":
-            draw.ellipse(
-                [margin, margin, self.image_size - margin, self.image_size - margin],
-                fill=fill_color,
-                outline=outline_color,
-                width=line_width,
-            )
-        elif shape_name == "square":
-            draw.rectangle(
-                [margin, margin, self.image_size - margin, self.image_size - margin],
-                fill=fill_color,
-                outline=outline_color,
-                width=line_width,
-            )
-        elif shape_name == "triangle":
-            center_x = self.image_size // 2
-            draw.polygon(
-                [
-                    (center_x, margin),
-                    (margin, self.image_size - margin),
-                    (self.image_size - margin, self.image_size - margin),
-                ],
-                fill=fill_color,
-                outline=outline_color,
-            )
-
-        return image
 
 
 class CrossModalityPurityAnalyzer:
@@ -144,65 +59,21 @@ class CrossModalityPurityAnalyzer:
         print(f"🔧 Initialized analyzer on device: {self.device}")
 
     def _load_config(self, config_path: str) -> dict:
-        """Load training configuration."""
-        with open(config_path) as f:
-            config = yaml.safe_load(f)
-        return config
+        """Load training configuration (validated, placeholder-checked)."""
+        return load_training_config(config_path)
+
+    def _assign(self, models) -> None:
+        """Copy a _lib.LoadedModels bundle onto this analyzer's attributes."""
+        self.llm = models.llm
+        self.vision_encoder = models.vision_encoder
+        self.vision_connector = models.vision_connector
+        self.tokenizer = models.tokenizer
+        self.clip_processor = models.clip_processor
 
     def load_models(self):
-        """Load all required models and weights."""
+        """Load CLIP + connector + Stage-2 MoE LLM (hard routing)."""
         print("📦 Loading models...")
-
-        paths = self.config["paths"]
-        output_dir = paths["output_dir"]
-
-        # Load tokenizer
-        print(f"  - Loading tokenizer from {paths['mistral_local_path']}")
-        self.tokenizer = AutoTokenizer.from_pretrained(paths["mistral_local_path"])
-        self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        # Load CLIP processor and vision encoder
-        print(f"  - Loading CLIP from {paths['clip_local_path']}")
-        self.clip_processor = AutoProcessor.from_pretrained(paths["clip_local_path"])
-        self.vision_encoder = CLIPVisionModel.from_pretrained(paths["clip_local_path"]).to(
-            self.device
-        )
-        self.vision_encoder.eval()
-
-        # Load base MoE model
-        moe_model_path = paths["moe_model_path"]
-        print(f"  - Loading base MoE model from {moe_model_path}")
-        self.llm = AutoModelForCausalLM.from_pretrained(
-            moe_model_path,
-            trust_remote_code=True,
-            local_files_only=True,
-            torch_dtype=torch.bfloat16,
-            attn_implementation="eager",  # Required for output_attentions=True
-        ).to(self.device)
-
-        # Load Stage 2 expert weights (for Stage 2 analysis only)
-        stage2_path = os.path.join(output_dir, "stage2_checkpoints", "llm_stage2_best.pth")
-        print(f"  - Loading Stage 2 expert weights from {stage2_path}")
-        expert_weights = torch.load(stage2_path, map_location=self.device)
-        self.llm.load_state_dict(expert_weights, strict=False)
-
-        # Note: Stage 2.5 router weights not needed
-        # Stage 3 will override with its own learned routers
-
-        self.llm.eval()
-
-        # Force hard routing mode
-        for layer in self.llm.model.layers:
-            if hasattr(layer.mlp, "routing_mode"):
-                layer.mlp.routing_mode = "hard"
-
-        # Load vision connector
-        print("  - Loading vision connector")
-        self.vision_connector = VisionLanguageConnector().to(self.device)
-        connector_path = os.path.join(output_dir, "vision_connector_stage1_best.pth")
-        self.vision_connector.load_state_dict(torch.load(connector_path, map_location=self.device))
-        self.vision_connector.eval()
-
+        self._assign(load_stage2_models(self.config, self.device))
         print("✅ All models loaded successfully")
 
     def load_stage3_models(self, checkpoint_path: str, temperature: float = 0.01):
@@ -213,42 +84,7 @@ class CrossModalityPurityAnalyzer:
             temperature: Softmax temperature for routing (default: 0.01 for near-deterministic)
         """
         print("📦 Loading Stage 3 models with learned routing...")
-
-        # First load base Stage 2 models (experts + connector)
-        self.load_models()
-
-        # Load Stage 3 checkpoint (contains learned router weights)
-        print(f"  - Loading Stage 3 checkpoint from {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
-
-        # Check if this is a full checkpoint or portable checkpoint
-        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-            # FULL checkpoint format (with training state and vision connector)
-            print("      Detected FULL checkpoint format")
-            self.llm.load_state_dict(checkpoint["model_state_dict"], strict=False)
-            print(f"      ✓ Loaded LLM weights (epoch {checkpoint.get('epoch', 'unknown')})")
-
-            if "connector_state_dict" in checkpoint:
-                self.vision_connector.load_state_dict(checkpoint["connector_state_dict"])
-                print("      ✓ Loaded vision connector weights (Stage 3 trained)")
-        else:
-            # PORTABLE checkpoint format (direct state_dict, LLM only)
-            print("      Detected PORTABLE checkpoint format (state_dict only)")
-            self.llm.load_state_dict(checkpoint, strict=False)
-            print("      ✓ Loaded LLM weights (portable format)")
-            print("      ⚠️  Note: Vision connector NOT updated (using Stage 1 weights)")
-
-        # Switch all MoE layers to soft routing mode
-        for layer in self.llm.model.layers:
-            if hasattr(layer.mlp, "routing_mode"):
-                layer.mlp.routing_mode = "soft"
-                layer.mlp.temperature = temperature
-
-        # Set to eval mode and fix random seed for deterministic routing
-        self.llm.eval()
-        torch.manual_seed(42)
-
-        print(f"✅ Stage 3 models loaded (soft routing, temperature={temperature})")
+        self._assign(load_stage3_models(self.config, self.device, checkpoint_path, temperature))
 
     def _prepare_vision_input(self, concept: str) -> torch.Tensor:
         """Generate synthetic image or load from file path and convert to visual tokens via vision connector.
@@ -1177,326 +1013,6 @@ class CrossModalityPurityAnalyzer:
 
         return results
 
-    def _plot_metric(
-        self,
-        results: dict,
-        concepts: list[str],
-        layers: list[int],
-        metric_key: str,
-        output_dir: str,
-        ylabel: str,
-        title: str,
-        filename: str,
-        ylim: tuple = None,
-    ):
-        """Generic plotting function for metrics."""
-        plt.figure(figsize=(12, 8))
-
-        for concept in concepts:
-            values = [results[metric_key][concept].get(f"layer_{layer}", 0.0) for layer in layers]
-            plt.plot(layers, values, marker="o", linewidth=2, markersize=8, label=concept)
-
-        if "Cosine" in ylabel:
-            plt.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
-
-        plt.xlabel("Layer", fontsize=12)
-        plt.ylabel(ylabel, fontsize=12)
-        plt.title(f"{title}\n(Vision vs Text Expert)", fontweight="bold")
-        plt.legend(loc="best", fontsize=10)
-        plt.grid(True, alpha=0.3)
-        if ylim:
-            plt.ylim(ylim)
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, filename), dpi=300)
-        plt.close()
-        print(f"  ✓ Saved {filename}")
-
-    def _plot_purity_matrices(self, matrices: dict, target_layers: list[int], output_dir: str):
-        """Plot purity matrices as heatmaps for comparison across layers."""
-        # Dynamically create subplots based on number of matrices actually computed
-        num_matrices = len(matrices)
-        fig, axes = plt.subplots(1, num_matrices, figsize=(6 * num_matrices, 5))
-
-        # Handle case where only 1 matrix (axes won't be an array)
-        if num_matrices == 1:
-            axes = [axes]
-
-        for idx, layer in enumerate(target_layers):
-            if layer not in matrices:
-                continue  # Skip if this layer wasn't computed
-            matrix, labels = matrices[layer]
-
-            # Create heatmap
-            sns.heatmap(
-                matrix,
-                annot=True,
-                fmt=".3f",
-                cmap="RdYlGn",
-                vmin=-1,
-                vmax=1,
-                xticklabels=labels,
-                yticklabels=labels,
-                ax=axes[idx],
-                cbar_kws={"label": "Cosine Similarity"},
-                square=True,
-            )
-            axes[idx].set_title(f"Layer {layer}", fontsize=14, fontweight="bold")
-
-        plt.suptitle(
-            "Cross-Concept Purity Matrix (Mean-Pooled)", fontsize=16, fontweight="bold", y=1.02
-        )
-        plt.tight_layout()
-
-        output_path = os.path.join(output_dir, "purity_matrix_comparison.png")
-        plt.savefig(output_path, dpi=300, bbox_inches="tight")
-        plt.close()
-        print("  ✓ Saved purity_matrix_comparison.png")
-
-    def _plot_clip_connector_comparison(
-        self,
-        clip_matrix: np.ndarray,
-        connector_matrix: np.ndarray,
-        labels: list[str],
-        output_dir: str,
-        pooling: str = "mean",
-    ):
-        """
-        Plot side-by-side comparison of CLIP vs connector similarity matrices.
-
-        Args:
-            clip_matrix: 2×2 similarity matrix for CLIP embeddings
-            connector_matrix: 2×2 similarity matrix for connector embeddings
-            labels: List of concept names
-            output_dir: Directory to save plot
-            pooling: "mean" or "cls" for plot labeling and filename
-        """
-        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-
-        # Determine titles and filename based on pooling
-        if pooling == "cls":
-            clip_title = "Raw CLIP Embeddings\n(1024-dim, CLS token)"
-            connector_title = "Post-Connector Embeddings\n(4096-dim, CLS token)"
-            filename = "clip_vs_connector_comparison_cls.png"
-            suptitle = "CLIP vs Vision Connector: CLS Token Comparison"
-        else:  # mean pooling
-            clip_title = "Raw CLIP Embeddings\n(1024-dim, mean-pooled)"
-            connector_title = "Post-Connector Embeddings\n(4096-dim, mean-pooled)"
-            filename = "clip_vs_connector_comparison.png"
-            suptitle = "CLIP vs Vision Connector: Mean-Pooled Comparison"
-
-        # Plot raw CLIP embeddings
-        sns.heatmap(
-            clip_matrix,
-            annot=True,
-            fmt=".3f",
-            cmap="RdYlGn",
-            vmin=-1,
-            vmax=1,
-            xticklabels=labels,
-            yticklabels=labels,
-            ax=axes[0],
-            cbar_kws={"label": "Cosine Similarity"},
-            square=True,
-        )
-        axes[0].set_title(clip_title, fontsize=13, fontweight="bold")
-
-        # Plot post-connector embeddings
-        sns.heatmap(
-            connector_matrix,
-            annot=True,
-            fmt=".3f",
-            cmap="RdYlGn",
-            vmin=-1,
-            vmax=1,
-            xticklabels=labels,
-            yticklabels=labels,
-            ax=axes[1],
-            cbar_kws={"label": "Cosine Similarity"},
-            square=True,
-        )
-        axes[1].set_title(connector_title, fontsize=13, fontweight="bold")
-
-        plt.suptitle(suptitle, fontsize=15, fontweight="bold", y=1.02)
-        plt.tight_layout()
-
-        output_path = os.path.join(output_dir, filename)
-        plt.savefig(output_path, dpi=300, bbox_inches="tight")
-        plt.close()
-        print(f"  ✓ Saved {filename}")
-
-    def _plot_token_variance(self, variance_results: dict, labels: list[str], output_dir: str):
-        """
-        Plot Level 1: Token-level variance analysis.
-
-        Shows the standard deviation of pairwise token similarities within each image,
-        comparing CLIP vs connector for both concepts.
-        """
-        fig, ax = plt.subplots(figsize=(10, 6))
-
-        concepts = list(variance_results.keys())
-        x = np.arange(len(concepts))
-        width = 0.35
-
-        # Extract standard deviations
-        clip_stds = [variance_results[c]["clip"]["std"] for c in concepts]
-        connector_stds = [variance_results[c]["connector"]["std"] for c in concepts]
-
-        # Create grouped bar chart
-        bars1 = ax.bar(x - width / 2, clip_stds, width, label="CLIP", color="#3498db", alpha=0.8)
-        bars2 = ax.bar(
-            x + width / 2, connector_stds, width, label="Connector", color="#e74c3c", alpha=0.8
-        )
-
-        # Add value labels on bars
-        for bars in [bars1, bars2]:
-            for bar in bars:
-                height = bar.get_height()
-                ax.text(
-                    bar.get_x() + bar.get_width() / 2.0,
-                    height,
-                    f"{height:.4f}",
-                    ha="center",
-                    va="bottom",
-                    fontsize=10,
-                )
-
-        ax.set_xlabel("Concept", fontsize=12, fontweight="bold")
-        ax.set_ylabel("Token Similarity Std Dev", fontsize=12, fontweight="bold")
-        ax.set_title(
-            "Level 1: Internal Token Diversity\n(Higher = More Diverse Spatial Structure)",
-            fontsize=14,
-            fontweight="bold",
-        )
-        ax.set_xticks(x)
-        ax.set_xticklabels(concepts, fontsize=11)
-        ax.legend(fontsize=11)
-        ax.grid(axis="y", alpha=0.3)
-
-        plt.tight_layout()
-
-        # Generate filename with concept names
-        concept_suffix = "_".join(concepts)
-        filename = f"token_variance_analysis_{concept_suffix}.png"
-        output_path = os.path.join(output_dir, filename)
-        plt.savefig(output_path, dpi=300, bbox_inches="tight")
-        plt.close()
-        print(f"  ✓ Saved {filename}")
-
-    def _plot_position_specific_similarity(self, position_results: dict, output_dir: str):
-        """
-        Plot Level 2: Position-specific similarity analysis.
-
-        Shows cat-car similarity at each of the 257 token positions for both
-        CLIP and connector, revealing if certain positions maintain better separation.
-        """
-        fig, ax = plt.subplots(figsize=(14, 6))
-
-        positions = np.arange(257)
-        clip_sims = position_results["clip_similarities"]
-        connector_sims = position_results["connector_similarities"]
-        labels = position_results["labels"]
-
-        # Plot both lines
-        ax.plot(positions, clip_sims, linewidth=2, label="CLIP", color="#3498db", alpha=0.8)
-        ax.plot(
-            positions, connector_sims, linewidth=2, label="Connector", color="#e74c3c", alpha=0.8
-        )
-
-        # Highlight CLS token (position 0)
-        ax.axvline(x=0, color="gray", linestyle="--", alpha=0.5, linewidth=1.5)
-        ax.text(
-            0,
-            ax.get_ylim()[1] * 0.95,
-            "CLS",
-            ha="center",
-            fontsize=10,
-            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
-        )
-
-        # Add horizontal reference line at 0.5
-        ax.axhline(y=0.5, color="gray", linestyle=":", alpha=0.3)
-
-        ax.set_xlabel("Token Position", fontsize=12, fontweight="bold")
-        ax.set_ylabel(
-            f"Cosine Similarity ({labels[0]} vs {labels[1]})", fontsize=12, fontweight="bold"
-        )
-        ax.set_title(
-            f"Level 2: Position-Specific Concept Similarity\n({labels[0]} vs {labels[1]} across 257 tokens)",
-            fontsize=14,
-            fontweight="bold",
-        )
-        ax.legend(fontsize=11, loc="best")
-        ax.grid(alpha=0.3)
-        ax.set_ylim(-0.1, 1.1)
-
-        plt.tight_layout()
-
-        # Generate filename with concept names
-        concept_suffix = "_".join(labels)
-        filename = f"position_specific_similarity_{concept_suffix}.png"
-        output_path = os.path.join(output_dir, filename)
-        plt.savefig(output_path, dpi=300, bbox_inches="tight")
-        plt.close()
-        print(f"  ✓ Saved {filename}")
-
-    def plot_alignment_curves(
-        self, curves: dict[str, dict[int, float]], output_dir: str, title_suffix: str = ""
-    ):
-        """Plot layer-by-layer alignment curves for multiple concept pairs.
-
-        Args:
-            curves: Dict mapping concept_name to {layer: similarity} dict
-            output_dir: Directory to save plot
-            title_suffix: Optional suffix for plot title (e.g., "Stage 3")
-        """
-        plt.figure(figsize=(14, 8))
-
-        # Plot each concept's alignment curve
-        for concept_name, similarities in curves.items():
-            layers = sorted(similarities.keys())
-            values = [similarities[l] for l in layers]
-            plt.plot(
-                layers,
-                values,
-                marker="o",
-                linewidth=2.5,
-                markersize=8,
-                label=concept_name,
-                alpha=0.8,
-            )
-
-        # Add reference lines
-        plt.axhline(y=0, color="gray", linestyle="--", alpha=0.5, linewidth=1.5)
-        plt.axhline(y=0.5, color="lightgray", linestyle=":", alpha=0.4)
-        plt.axvline(x=-1, color="lightblue", linestyle="--", alpha=0.3, linewidth=1)
-
-        # Annotations
-        plt.text(
-            -1,
-            plt.ylim()[1] * 0.95,
-            "Embedding",
-            ha="center",
-            fontsize=9,
-            bbox=dict(boxstyle="round", facecolor="lightblue", alpha=0.3),
-        )
-
-        plt.xlabel("Layer", fontsize=13, fontweight="bold")
-        plt.ylabel("Cosine Similarity (Vision ↔ Text)", fontsize=13, fontweight="bold")
-        title = "Cross-Modal Concept Alignment by Layer"
-        if title_suffix:
-            title += f" ({title_suffix})"
-        plt.title(title, fontsize=15, fontweight="bold")
-
-        plt.legend(loc="best", fontsize=11, framealpha=0.9)
-        plt.grid(True, alpha=0.3)
-        plt.ylim(-0.1, 1.1)
-        plt.tight_layout()
-
-        output_path = os.path.join(output_dir, "stage3_alignment_curves.png")
-        plt.savefig(output_path, dpi=300, bbox_inches="tight")
-        plt.close()
-        print("  ✓ Saved stage3_alignment_curves.png")
-
     def run_stage3_alignment_analysis(
         self, config_path: str = "configs/stage3_alignment.json"
     ) -> dict:
@@ -1620,7 +1136,7 @@ class CrossModalityPurityAnalyzer:
 
         # Generate visualization
         print("\n📈 Generating alignment curve plot...")
-        self.plot_alignment_curves(alignment_curves, output_dir, title_suffix="Stage 3")
+        cmp_plots.plot_alignment_curves(alignment_curves, output_dir, title_suffix="Stage 3")
 
         print("\n" + "=" * 80)
         print("✅ Stage 3 alignment analysis complete!")
@@ -1637,7 +1153,7 @@ class CrossModalityPurityAnalyzer:
         layers = results["layers"]
 
         # Plot all four metrics
-        self._plot_metric(
+        cmp_plots.plot_metric(
             results,
             concepts,
             layers,
@@ -1649,7 +1165,7 @@ class CrossModalityPurityAnalyzer:
             ylim=(-1, 1),
         )
 
-        self._plot_metric(
+        cmp_plots.plot_metric(
             results,
             concepts,
             layers,
@@ -1660,7 +1176,7 @@ class CrossModalityPurityAnalyzer:
             "euclidean_distance_lineplot.png",
         )
 
-        self._plot_metric(
+        cmp_plots.plot_metric(
             results,
             concepts,
             layers,
@@ -1672,7 +1188,7 @@ class CrossModalityPurityAnalyzer:
             ylim=(-1, 1),
         )
 
-        self._plot_metric(
+        cmp_plots.plot_metric(
             results,
             concepts,
             layers,
@@ -1695,7 +1211,7 @@ class CrossModalityPurityAnalyzer:
                 clip_matrix, connector_matrix, labels = self.compute_clip_connector_comparison(
                     concepts
                 )
-                self._plot_clip_connector_comparison(
+                cmp_plots.plot_clip_connector_comparison(
                     clip_matrix, connector_matrix, labels, output_dir, pooling="mean"
                 )
             except Exception as e:
@@ -1706,7 +1222,7 @@ class CrossModalityPurityAnalyzer:
                 clip_matrix_cls, connector_matrix_cls, labels_cls = (
                     self.compute_clip_connector_comparison_cls(concepts)
                 )
-                self._plot_clip_connector_comparison(
+                cmp_plots.plot_clip_connector_comparison(
                     clip_matrix_cls, connector_matrix_cls, labels_cls, output_dir, pooling="cls"
                 )
             except Exception as e:
@@ -1716,7 +1232,7 @@ class CrossModalityPurityAnalyzer:
             print("\n🔬 Level 1: Analyzing token-level variance...")
             try:
                 variance_results = self.analyze_token_variance(concepts)
-                self._plot_token_variance(variance_results, labels_cls, output_dir)
+                cmp_plots.plot_token_variance(variance_results, labels_cls, output_dir)
             except Exception as e:
                 print(f"  ✗ Error in token variance analysis: {e}")
 
@@ -1724,7 +1240,7 @@ class CrossModalityPurityAnalyzer:
             print("\n🔬 Level 2: Analyzing position-specific similarity...")
             try:
                 position_results = self.analyze_position_specific_similarity(concepts)
-                self._plot_position_specific_similarity(position_results, output_dir)
+                cmp_plots.plot_position_specific_similarity(position_results, output_dir)
             except Exception as e:
                 print(f"  ✗ Error in position-specific analysis: {e}")
 
@@ -1740,7 +1256,7 @@ class CrossModalityPurityAnalyzer:
                         print(f"  ✗ Error computing purity matrix for layer {layer}: {e}")
 
             if matrices:
-                self._plot_purity_matrices(matrices, target_layers, output_dir)
+                cmp_plots.plot_purity_matrices(matrices, target_layers, output_dir)
 
         print("✅ Visualization complete!")
 

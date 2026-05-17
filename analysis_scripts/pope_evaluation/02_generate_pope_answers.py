@@ -16,6 +16,7 @@ from tqdm import tqdm
 # Add parent directories to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "karpathy_evaluation"))
+sys.path.insert(0, str(Path(__file__).parent))
 
 from karpathy_utils import (
     format_time,
@@ -24,137 +25,7 @@ from karpathy_utils import (
     print_banner,
     save_json,
 )
-
-
-def extract_yes_no_answer(text: str, question: str = None) -> str:
-    """
-    Extract yes/no answer from model output.
-    Handles both concise answers (Stage 2) and elaborate answers (Stage 3).
-
-    Args:
-        text: Generated text from model
-        question: Optional - the original question, used to check if queried object is mentioned
-
-    Returns:
-        'yes', 'no', or 'unclear'
-    """
-    text_lower = text.lower().strip()
-
-    # Direct matches (most common for Stage 2)
-    if text_lower.startswith("yes"):
-        return "yes"
-    if text_lower.startswith("no"):
-        return "no"
-
-    # Check first few words
-    words = text_lower.split()
-    if len(words) > 0:
-        first_word = words[0].strip(".,!?")
-        if first_word == "yes":
-            return "yes"
-        if first_word == "no":
-            return "no"
-
-    # Strong negative indicators (explicit negation)
-    strong_negative_phrases = [
-        "there is no",
-        "there are no",
-        "there isn't",
-        "there aren't",
-        "not visible",
-        "cannot see",
-        "no visible",
-        "absence of",
-        "no sign of",
-        "does not show",
-        "does not feature",
-    ]
-    for phrase in strong_negative_phrases:
-        if phrase in text_lower[:80]:
-            return "no"
-
-    # Strong affirmative indicators (explicit affirmation)
-    strong_affirmative_phrases = [
-        "yes,",
-        "yes there",
-        "yes it",
-        "there is a",
-        "there are",
-        "shows a",
-        "features a",
-        "depicts a",
-        "contains a",
-        "includes a",
-        "has a",
-        "with a",
-        "shows the",
-        "features the",
-    ]
-    for phrase in strong_affirmative_phrases:
-        if phrase in text_lower[:80]:
-            return "yes"
-
-    # For Stage 3: Check if the queried object is actually mentioned in the response
-    # This prevents treating generic captions as "yes" answers
-    if question:
-        import re
-
-        # Extract object from question: "Is there a/an X in the image?"
-        match = re.search(r"is there (?:a |an )?(\w+)", question.lower())
-        if match:
-            queried_object = match.group(1)
-            object_mentioned = queried_object in text_lower[:80]
-
-            if object_mentioned:
-                # Object is mentioned - check if it's in a descriptive context (likely yes)
-                # vs. a negative context
-                # If definite article precedes object, it's describing it (yes)
-                if f"the {queried_object}" in text_lower[:80]:
-                    return "yes"
-                # If possessive or descriptive phrase
-                if any(
-                    p in text_lower[:80]
-                    for p in [
-                        f"{queried_object} is",
-                        f"{queried_object} in",
-                        f"{queried_object} on",
-                        f"{queried_object} at",
-                    ]
-                ):
-                    return "yes"
-            else:
-                # Object NOT mentioned but we have descriptive text
-                # Could be describing something else in the image (maybe no, maybe unclear)
-                # If it's a generic truncated description, mark as unclear
-                if len(text_lower) < 20 or text_lower.endswith(
-                    (",", "and", "or", "with", "in", "a")
-                ):
-                    # Truncated or incomplete - unclear
-                    return "unclear"
-                # If it describes other objects, tentatively say no
-                # But this is weak evidence
-                return "unclear"
-
-    # Fallback: If no strong indicators and no question context, check generic patterns
-    # Descriptive patterns WITHOUT object mention are unclear (could be anything)
-    descriptive_patterns = [
-        "the image features",
-        "the image shows",
-        "the image depicts",
-        "the scene features",
-        "the scene shows",
-    ]
-    for pattern in descriptive_patterns:
-        if pattern in text_lower[:50]:
-            # Generic description without clear answer - unclear
-            return "unclear"
-
-    # Definite article at start suggests describing something, but we don't know what
-    if text_lower.startswith("the ") and len(words) > 2:
-        # Could be describing the queried object or something else
-        return "unclear"
-
-    return "unclear"
+from pope_utils import extract_yes_no_answer, extract_yes_no_answer_primed
 
 
 def generate_pope_answers(
@@ -400,6 +271,226 @@ def generate_pope_answers(
     return results
 
 
+def generate_answers_primed(
+    model,
+    questions,
+    image_dir,
+    processor,
+    tokenizer,
+    device="cuda",
+    max_new_tokens=10,
+    temperature=0.0,
+    stage_name="stage3",
+    priming_strategy="simple",
+):
+    """
+    Generate POPE answers using priming strategy for Stage 3.
+
+    Priming strategies:
+    - 'simple': Prime with "The image contains objects."
+    - 'conversational': Prime with full Q&A pair
+    - 'none': No priming (baseline for comparison)
+
+    Args:
+        model: VLM model
+        questions: List of question dicts with 'image_id', 'question', 'answer'
+        image_dir: Path to COCO val2017 images
+        processor: CLIP processor
+        tokenizer: Text tokenizer
+        device: Device to run on
+        max_new_tokens: Maximum tokens to generate
+        temperature: Sampling temperature (0 = greedy)
+        stage_name: 'stage2' or 'stage3'
+        priming_strategy: 'simple', 'conversational', or 'none'
+
+    Returns:
+        results: List of questions with 'predicted_answer' added
+    """
+    model.eval()
+    model.to(device)
+
+    results = []
+    num_questions = len(questions)
+
+    print("\n🔮 Generating POPE answers with PRIMING strategy")
+    print(f"   Questions: {num_questions}")
+    print(f"   Max tokens: {max_new_tokens}")
+    print(f"   Temperature: {temperature} ({'greedy' if temperature == 0 else 'sampling'})")
+    print(f"   Device: {device}")
+    print(f"   Stage: {stage_name}")
+    print(f"   Priming: {priming_strategy}")
+
+    # Detect stage type for routing
+    is_stage3 = stage_name == "stage3"
+    if is_stage3:
+        print("   📍 Using Stage 3 (SOFT routing)")
+        # Set all MoE layers to soft routing mode
+        for layer in model.llm.model.layers:
+            if hasattr(layer.mlp, "routing_mode"):
+                layer.mlp.routing_mode = "soft"
+    else:
+        print("   📍 Using Stage 2 (HARD routing)")
+
+    start_time = time.time()
+
+    # Group questions by image_id for efficiency
+    questions_by_image = {}
+    for q in questions:
+        img_id = q["image_id"]
+        if img_id not in questions_by_image:
+            questions_by_image[img_id] = []
+        questions_by_image[img_id].append(q)
+
+    unique_images = list(questions_by_image.keys())
+    print(f"   Processing {len(unique_images)} unique images")
+
+    unclear_count = 0
+
+    with torch.no_grad():
+        for img_id in tqdm(unique_images, desc="Answering"):
+            # Load image once for all questions about this image
+            image_filename = f"{img_id:012d}.jpg"
+            image_path = Path(image_dir) / image_filename
+
+            if not image_path.exists():
+                print(f"\n⚠️  Image not found: {image_path}")
+                for question_data in questions_by_image[img_id]:
+                    result = question_data.copy()
+                    result["predicted_answer"] = "unclear"
+                    results.append(result)
+                continue
+
+            try:
+                # Load and preprocess image
+                pixel_values = load_and_preprocess_image(str(image_path), processor)
+                pixel_values = pixel_values.unsqueeze(0).to(device)
+
+                # Process vision through encoder and connector
+                vision_outputs = model.vision_encoder(pixel_values=pixel_values)
+                patch_embeddings = vision_outputs.last_hidden_state
+
+                # Project to LLM space
+                visual_soft_tokens = model.connector(patch_embeddings)
+                visual_soft_tokens = visual_soft_tokens.to(torch.bfloat16)
+
+                # Answer each question about this image
+                for question_data in questions_by_image[img_id]:
+                    question_text = question_data["question"]
+
+                    # Construct prompt with priming
+                    if priming_strategy == "simple":
+                        # Prime with a simple statement, then ask the actual question
+                        # This mimics the A1 → A2 pattern Stage 3 learned
+                        primer = "This image has been analyzed."
+                        prompt = f"{primer} {question_text} Answer yes or no:"
+
+                    elif priming_strategy == "conversational":
+                        # Prime with full Q&A to mimic LLaVA multi-turn format
+                        # Q1: Generic, A1: Generic, Q2: Actual question
+                        primer_q = "What type of image is this?"
+                        primer_a = "This is a photograph."
+                        prompt = f"{primer_q} {primer_a} {question_text} Answer:"
+
+                    else:  # 'none'
+                        # No priming (baseline)
+                        prompt = f"{question_text} Answer yes or no:"
+
+                    # Tokenize prompt
+                    prompt_ids = tokenizer(
+                        prompt, return_tensors="pt", add_special_tokens=False
+                    ).input_ids.to(device)
+
+                    # Add BOS token
+                    bos_ids = torch.tensor([[tokenizer.bos_token_id]]).to(device)
+                    input_ids = torch.cat([bos_ids, prompt_ids], dim=1)
+
+                    # Get text embeddings
+                    text_embeddings = model.llm.get_input_embeddings()(input_ids)
+
+                    # Combine visual and text embeddings
+                    combined_embeddings = torch.cat([visual_soft_tokens, text_embeddings], dim=1)
+
+                    # Create attention mask
+                    attention_mask = torch.ones(combined_embeddings.shape[:2], device=device)
+
+                    # Generate answer tokens autoregressively
+                    generated_ids = input_ids[0].tolist()
+
+                    for step in range(max_new_tokens):
+                        # Forward pass
+                        outputs = model.llm(
+                            inputs_embeds=combined_embeddings,
+                            attention_mask=attention_mask,
+                            use_cache=False,
+                        )
+
+                        # Get next token logits
+                        next_token_logits = outputs.logits[:, -1, :]
+
+                        # Apply temperature
+                        if temperature > 0:
+                            next_token_logits = next_token_logits / temperature
+                            next_token = torch.multinomial(
+                                torch.softmax(next_token_logits, dim=-1), num_samples=1
+                            ).item()
+                        else:
+                            next_token = torch.argmax(next_token_logits, dim=-1).item()
+
+                        # Stop if EOS
+                        if next_token == tokenizer.eos_token_id:
+                            break
+
+                        # Append token
+                        generated_ids.append(next_token)
+
+                        # Update embeddings for next step
+                        next_token_tensor = torch.tensor([[next_token]]).to(device)
+                        next_embedding = model.llm.get_input_embeddings()(next_token_tensor)
+                        combined_embeddings = torch.cat(
+                            [combined_embeddings, next_embedding], dim=1
+                        )
+                        attention_mask = torch.cat(
+                            [attention_mask, torch.ones((1, 1), device=device)], dim=1
+                        )
+
+                    # Decode generated tokens (only the new ones)
+                    prompt_length = len(input_ids[0])
+                    generated_answer_ids = generated_ids[prompt_length:]
+                    generated_text = tokenizer.decode(
+                        generated_answer_ids, skip_special_tokens=True
+                    )
+
+                    # Extract yes/no from generated text
+                    predicted_answer = extract_yes_no_answer_primed(generated_text, question_text)
+
+                    if predicted_answer == "unclear":
+                        unclear_count += 1
+
+                    # Store result
+                    result = question_data.copy()
+                    result["predicted_answer"] = predicted_answer
+                    result["raw_model_output"] = generated_text
+                    result["priming_strategy"] = priming_strategy
+                    results.append(result)
+
+            except Exception as e:
+                print(f"\n❌ Error processing image {img_id}: {e}")
+                for question_data in questions_by_image[img_id]:
+                    result = question_data.copy()
+                    result["predicted_answer"] = "unclear"
+                    result["raw_model_output"] = f"ERROR: {str(e)}"
+                    results.append(result)
+
+    elapsed = time.time() - start_time
+    unclear_pct = (unclear_count / len(results)) * 100 if results else 0
+
+    print(f"\n✅ Generated {len(results)} answers in {elapsed / 60:.1f} minutes")
+    print(f"   Unclear answers: {unclear_count} ({unclear_pct:.1f}%)")
+    print(f"   Speed: {len(results) / elapsed:.2f} questions/sec")
+
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate POPE answers using trained model")
     parser.add_argument(
@@ -418,8 +509,8 @@ def main():
     parser.add_argument(
         "--image_dir",
         type=str,
-        default="YOUR_PATH_HERE/datasets/coco/val2017",
-        help="Directory containing COCO val2017 images",
+        default=None,
+        help="COCO val2017 image dir (default: <parent of paths.image_dir>/val2017 from config)",
     )
     parser.add_argument(
         "--output_dir",
@@ -434,8 +525,25 @@ def main():
         "--temperature", type=float, default=0.0, help="Sampling temperature (0.0 for greedy)"
     )
     parser.add_argument("--device", type=str, default="cuda", help="Device (cuda or cpu)")
+    parser.add_argument(
+        "--use-priming",
+        action="store_true",
+        help="Use the Stage-3 priming generation strategy (default: standard prompting)",
+    )
+    parser.add_argument(
+        "--priming",
+        type=str,
+        default="simple",
+        choices=["simple", "conversational", "none"],
+        help="Priming strategy (only used with --use-priming)",
+    )
 
     args = parser.parse_args()
+
+    if args.image_dir is None:
+        from analysis_scripts._lib import get_paths
+
+        args.image_dir = str(Path(get_paths()["image_dir"]).parent / "val2017")
 
     print_banner(f"POPE ANSWER GENERATION - {args.stage_name.upper()}")
 
@@ -451,17 +559,31 @@ def main():
     print(f"   Found {len(questions)} questions")
 
     # Generate answers
-    answers = generate_pope_answers(
-        model=model,
-        processor=processor,
-        tokenizer=tokenizer,
-        questions=questions,
-        image_dir=args.image_dir,
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        device=args.device,
-        stage_name=args.stage_name,
-    )
+    if args.use_priming:
+        answers = generate_answers_primed(
+            model=model,
+            questions=questions,
+            image_dir=args.image_dir,
+            processor=processor,
+            tokenizer=tokenizer,
+            device=args.device,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            stage_name=args.stage_name,
+            priming_strategy=args.priming,
+        )
+    else:
+        answers = generate_pope_answers(
+            model=model,
+            processor=processor,
+            tokenizer=tokenizer,
+            questions=questions,
+            image_dir=args.image_dir,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            device=args.device,
+            stage_name=args.stage_name,
+        )
 
     # Save results
     output_dir = Path(args.output_dir)

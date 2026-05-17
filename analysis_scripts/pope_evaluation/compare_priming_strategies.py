@@ -5,6 +5,7 @@ Shows whether priming Stage 3 with "fake previous answers" improves performance
 by exploiting its learned multi-turn conversation behavior.
 """
 
+import argparse
 import json
 from pathlib import Path
 
@@ -90,7 +91,16 @@ def compute_metrics(results):
 
 
 def main():
-    results_dir = Path("YOUR_PATH_HERE/results/pope_evaluation")
+    parser = argparse.ArgumentParser(description="Compare POPE priming strategies")
+    parser.add_argument(
+        "--results-dir",
+        type=str,
+        default="results/pope_evaluation",
+        help="POPE evaluation results directory (contains answers_primed/)",
+    )
+    args = parser.parse_args()
+
+    results_dir = Path(args.results_dir)
     answers_dir = results_dir / "answers_primed"
 
     if not answers_dir.exists():

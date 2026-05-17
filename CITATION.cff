@@ -1,6 +1,6 @@
 cff-version: 1.2.0
 message: "If you use this software or build on this research, please cite it as below."
-title: "Emergent Expert Specialisation in Mixture-of-Experts Vision-Language Models"
+title: "Expert Collapse and Compositional Failure in Simple Multimodal MoE"
 authors:
   - family-names: Ticinovic
     given-names: Anthony
@@ -13,11 +13,25 @@ keywords:
   - vision-language-model
   - mistral
   - multimodal
-  - expert-specialisation
+  - expert-collapse
+  - compositional-generalisation
 preferred-citation:
   type: conference-paper
-  title: "Emergent Expert Specialisation in Mixture-of-Experts Vision-Language Models"
+  title: "Expert Collapse and Compositional Failure in Simple Multimodal MoE"
   authors:
     - family-names: Ticinovic
       given-names: Anthony
+    - family-names: Han
+      given-names: Caren
   year: 2026
+  collection-title: "Proceedings of the AAAI 2026 Workshop on Bias in Multimodal AI: Representation, Risk, and Repair (Proceedings of Machine Learning Research)"
+  volume: 332
+  publisher:
+    name: PMLR
+  conference:
+    name: "AAAI 2026 Workshop on Bias in Multimodal AI: Representation, Risk, and Repair"
+    city: Singapore
+    country: SG
+    date-start: 2026-01-25
+    date-end: 2026-01-25
+  url: "https://proceedings.mlr.press/v332/"

@@ -205,7 +205,7 @@ def main():
     parser.add_argument(
         "--image_base_dir",
         type=str,
-        default="YOUR_PATH_HERE/datasets/coco",
+        required=True,
         help="Base directory for COCO images",
     )
     parser.add_argument(

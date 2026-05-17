@@ -1,3 +1,13 @@
+"""The two-expert MoE FFN that replaces every Mistral decoder-layer feed-forward.
+
+A single :class:`MoELayer` holds two independent ``MistralMLP`` experts and
+routes each token to exactly one of them. Routing is either ``'hard'`` (a
+position-derived mask supplied externally, used in Stage 2) or ``'soft'`` (a
+learned gate trained with Straight-Through Gumbel-Softmax, used in Stages 2.5
+and 3). See the class docstring for the per-mode contract and the FSDP
+synchronisation requirement that shapes the soft-routing forward pass.
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,7 +25,21 @@ class MoELayer(nn.Module):
       Straight-Through Estimator. Used in Stages 2.5 and 3.
     """
 
-    def __init__(self, config, d_model: int, num_experts: int = 2, routing_mode: str = "hard"):
+    def __init__(
+        self, config, d_model: int, num_experts: int = 2, routing_mode: str = "hard"
+    ) -> None:
+        """Build ``num_experts`` independent ``MistralMLP`` experts plus the gate.
+
+        Args:
+            config: Mistral config; passed straight to each ``MistralMLP`` expert.
+            d_model: Hidden size — input/output width of the layer and gate.
+            num_experts: Number of experts (2 for the vision/text split).
+            routing_mode: ``'hard'`` or ``'soft'`` (see class docstring).
+
+        The gate is created in both modes so checkpoints stay structurally
+        identical when loading across stages, even though it is only trained
+        and used under soft routing.
+        """
         super().__init__()
         self.d_model = d_model
         self.num_experts = num_experts
@@ -29,12 +53,29 @@ class MoELayer(nn.Module):
 
         self.router_dropout = nn.Dropout(0.1)
 
-    def initialize_gate(self):
-        """Re-initialise gate weights (called in Stage 2.5 to break symmetry)."""
+    def initialize_gate(self) -> None:
+        """Re-initialise gate weights from scratch.
+
+        Called at the start of Stage 2.5: after Stage 2 the experts are
+        specialised but the gate has never been trained, so it is reset to a
+        fresh small-variance state to break symmetry before soft routing begins.
+        """
         self.gate = nn.Linear(self.d_model, self.num_experts, bias=False)
         nn.init.normal_(self.gate.weight, std=0.05)
 
-    def forward(self, hidden_states: torch.Tensor, temperature: float = 1.0):
+    def forward(self, hidden_states: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+        """Route ``hidden_states`` through the experts for the active mode.
+
+        Args:
+            hidden_states: ``(batch, seq, d_model)`` decoder-layer activations.
+            temperature: Soft-routing Gumbel-Softmax temperature. Ignored under
+                hard routing. Overridden by ``self._forward_temperature`` when
+                set, which is how Stage 2.5/3 apply temperature annealing
+                without changing the call sites.
+
+        Returns:
+            Tensor of the same shape as ``hidden_states``.
+        """
         if hasattr(self, "_forward_temperature"):
             temperature = self._forward_temperature
 

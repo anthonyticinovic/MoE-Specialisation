@@ -41,6 +41,12 @@ import numpy as np
 import seaborn as sns
 import torch
 
+from analysis_scripts._lib import (
+    compute_cosine_similarity_matrix,
+    load_analysis_config,
+    load_stage2_models,
+    load_stage3_models,
+)
 from analysis_scripts.cross_modality_purity import CrossModalityPurityAnalyzer
 
 
@@ -112,155 +118,36 @@ class CrossConceptSimilarityAnalyzer:
             self._load_stage3_models()
 
     def _load_stage2_models(self):
-        """Load Stage 2 models with forced expert routing.
-
-        Uses base analyzer's load_models() which loads:
-        1. Stage 1 vision connector (vision_connector_stage1_best.pth)
-        2. Stage 2 LLM checkpoint (llm_stage2_best.pth) with trained experts
-        3. Hard routing mode enabled
-
-        Optionally overrides the Stage 2 checkpoint path if provided.
-        """
+        """Load Stage 2 models with forced expert routing via the shared _lib loader."""
         print("\n📦 Loading Stage 2 models...")
-
-        # If custom checkpoint path provided, load models with custom checkpoint
         if self.stage2_checkpoint:
             print(f"   Using custom Stage 2 checkpoint: {self.stage2_checkpoint}")
-
-            # Import required classes
-            from transformers import (
-                AutoModelForCausalLM,
-                AutoProcessor,
-                AutoTokenizer,
-                CLIPVisionModel,
+            self.base_analyzer._assign(
+                load_stage2_models(
+                    self.base_analyzer.config,
+                    self.device,
+                    stage2_checkpoint=self.stage2_checkpoint,
+                )
             )
-
-            from models import VisionLanguageConnector
-
-            # Load base models (tokenizer, CLIP, MoE architecture, vision connector)
-            paths = self.base_analyzer.config["paths"]
-            output_dir = paths["output_dir"]
-
-            # Load tokenizer
-            print(f"  - Loading tokenizer from {paths['mistral_local_path']}")
-            self.base_analyzer.tokenizer = AutoTokenizer.from_pretrained(
-                paths["mistral_local_path"]
-            )
-            self.base_analyzer.tokenizer.pad_token = self.base_analyzer.tokenizer.eos_token
-
-            # Load CLIP processor and vision encoder
-            print(f"  - Loading CLIP from {paths['clip_local_path']}")
-            self.base_analyzer.clip_processor = AutoProcessor.from_pretrained(
-                paths["clip_local_path"]
-            )
-            self.base_analyzer.vision_encoder = CLIPVisionModel.from_pretrained(
-                paths["clip_local_path"]
-            ).to(self.device)
-            self.base_analyzer.vision_encoder.eval()
-
-            # Load base MoE model
-            moe_model_path = paths["moe_model_path"]
-            print(f"  - Loading base MoE model from {moe_model_path}")
-            self.base_analyzer.llm = AutoModelForCausalLM.from_pretrained(
-                moe_model_path,
-                trust_remote_code=True,
-                local_files_only=True,
-                torch_dtype=torch.bfloat16,
-                attn_implementation="eager",
-            ).to(self.device)
-
-            # Load custom Stage 2 checkpoint (load to CPU first to avoid OOM)
-            print(f"  - Loading Stage 2 expert weights from {self.stage2_checkpoint}")
-            expert_weights = torch.load(self.stage2_checkpoint, map_location="cpu")
-            self.base_analyzer.llm.load_state_dict(expert_weights, strict=False)
-            self.base_analyzer.llm.eval()
-
-            # Force hard routing mode
-            for layer in self.base_analyzer.llm.model.layers:
-                if hasattr(layer.mlp, "routing_mode"):
-                    layer.mlp.routing_mode = "hard"
-
-            # Load vision connector
-            print("  - Loading vision connector")
-            self.base_analyzer.vision_connector = VisionLanguageConnector().to(self.device)
-            connector_path = os.path.join(output_dir, "vision_connector_stage1_best.pth")
-            self.base_analyzer.vision_connector.load_state_dict(
-                torch.load(connector_path, map_location=self.device)
-            )
-            self.base_analyzer.vision_connector.eval()
-
-            print("✅ All Stage 2 models loaded successfully (custom checkpoint)")
         else:
-            # Use default Stage 2 checkpoint path from base analyzer
             print("   Using default Stage 2 checkpoint from training_config.yaml")
             self.base_analyzer.load_models()
 
     def _load_stage3_models(self):
-        """Load Stage 3 end-to-end trained model with learned soft routing.
-
-        Reuses base analyzer infrastructure for CLIP/tokenizer, only differs in:
-        1. Model checkpoint (Stage 3 vs Stage 2/2.5)
-        2. Routing mode (soft vs hard)
-        3. Temperature setting for deterministic analysis
-        """
-
+        """Load Stage 3 end-to-end model with learned soft routing via _lib."""
         print("\n📦 Loading Stage 3 models...")
-
-        # Create base analyzer to reuse CLIP/tokenizer loading logic
         self.base_analyzer = CrossModalityPurityAnalyzer(
             config_path=self.config_path, device=self.device
         )
-
-        # Load base models (CLIP, tokenizer, MoE architecture)
-        # This loads Stage 2/2.5 weights initially, but we'll override with Stage 3
-        self.base_analyzer.load_models()
-
-        # Now override with Stage 3 checkpoint
-        print(f"   Loading Stage 3 checkpoint: {self.stage3_checkpoint}")
-        checkpoint = torch.load(self.stage3_checkpoint, map_location=self.device)
-
-        # Check if this is a full checkpoint or portable checkpoint
-        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-            # FULL checkpoint format (with training state)
-            print("      Detected FULL checkpoint format")
-            self.base_analyzer.llm.load_state_dict(checkpoint["model_state_dict"], strict=False)
-            print(f"      ✓ Loaded LLM weights (epoch {checkpoint.get('epoch', 'unknown')})")
-
-            if "connector_state_dict" in checkpoint:
-                self.base_analyzer.vision_connector.load_state_dict(
-                    checkpoint["connector_state_dict"]
-                )
-                print("      ✓ Loaded vision connector weights")
-        else:
-            # PORTABLE checkpoint format (direct state_dict)
-            print("      Detected PORTABLE checkpoint format (state_dict only)")
-            self.base_analyzer.llm.load_state_dict(checkpoint, strict=False)
-            print("      ✓ Loaded LLM weights (portable format)")
-            print("      ⚠️  Note: Vision connector NOT updated (using Stage 1 weights)")
-
-        # Set all MoE layers to soft routing mode (CRITICAL DIFFERENCE from Stage 2)
-        print("   Setting MoE layers to soft routing mode...")
-        for layer in self.base_analyzer.llm.model.layers:
-            if hasattr(layer.mlp, "routing_mode"):
-                layer.mlp.routing_mode = "soft"
-                # Set low temperature for deterministic routing
-                layer.mlp._forward_temperature = self.temperature
-
-        # Ensure models are in eval mode for deterministic behavior
-        self.base_analyzer.llm.eval()
-        self.base_analyzer.vision_encoder.eval()
-        self.base_analyzer.vision_connector.eval()
-
-        # Set random seed for reproducibility (Gumbel noise)
-        torch.manual_seed(42)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(42)
-
-        print("   ✅ Stage 3 models loaded successfully!")
-        print("      Routing mode: SOFT (learned, no forcing)")
-        print(f"      Temperature: {self.temperature} (lower = more deterministic routing)")
-        print("      Random seed: 42 (for reproducibility)")
-        print(f"      Validation loss: {checkpoint.get('val_loss', 'N/A')}")
+        self.base_analyzer._assign(
+            load_stage3_models(
+                self.base_analyzer.config,
+                self.device,
+                self.stage3_checkpoint,
+                self.temperature,
+            )
+        )
+        print(f"   ✅ Stage 3 models loaded (soft routing, temperature={self.temperature})")
 
     def extract_concept_samples(
         self, annotations_file: str, concepts: list[str], samples_per_concept: int, seed: int = 42
@@ -486,31 +373,8 @@ class CrossConceptSimilarityAnalyzer:
         return hidden_states
 
     def _compute_cosine_similarity_matrix(self, representations: list[np.ndarray]) -> np.ndarray:
-        """
-        Compute pairwise cosine similarity matrix for a list of representations.
-
-        Args:
-            representations: List of N representations, each of shape [hidden_dim]
-
-        Returns:
-            N×N matrix where matrix[i,j] = cosine_similarity(rep_i, rep_j)
-        """
-        n = len(representations)
-        matrix = np.zeros((n, n))
-
-        for i in range(n):
-            for j in range(n):
-                if i == j:
-                    matrix[i, j] = 1.0
-                else:
-                    # Cosine similarity: dot(a,b) / (norm(a) * norm(b))
-                    cos_sim = np.dot(representations[i], representations[j]) / (
-                        np.linalg.norm(representations[i]) * np.linalg.norm(representations[j])
-                        + 1e-8
-                    )
-                    matrix[i, j] = float(cos_sim)
-
-        return matrix
+        """Pairwise cosine-similarity matrix (delegates to shared _lib helper)."""
+        return compute_cosine_similarity_matrix(representations)
 
     def compute_cross_concept_matrix(
         self,
@@ -1065,35 +929,12 @@ class CrossConceptSimilarityAnalyzer:
 
 
 def load_config(config_file: str) -> dict:
-    """
-    Load configuration from JSON file.
-
-    Args:
-        config_file: Path to JSON config file
-
-    Returns:
-        Dictionary with configuration parameters
-    """
-    with open(config_file) as f:
-        config = json.load(f)
-
-    # Validate required fields for new COCO-based format
-    required_fields = ["concepts", "samples_per_concept", "annotations_file", "image_dir"]
-    for field in required_fields:
-        if field not in config:
-            raise ValueError(
-                f"Config file missing required field: {field}\n"
-                f"Required fields: {required_fields}\n"
-                f"See SIMILARITY_MATRIX_UPDATES.md for new config format."
-            )
-
-    # Set defaults for optional fields
-    config.setdefault("layers", [31])
-    config.setdefault("pooling", "mean")
-    config.setdefault("seed", 42)  # Random seed for reproducibility
-    # Note: mode, output_dir, temperature, checkpoints now come from CLI args
-
-    return config
+    """Load the JSON analysis config (COCO-based similarity-matrix format)."""
+    return load_analysis_config(
+        config_file,
+        required_fields=["concepts", "samples_per_concept", "annotations_file", "image_dir"],
+        defaults={"layers": [31], "pooling": "mean", "seed": 42},
+    )
 
 
 def main():

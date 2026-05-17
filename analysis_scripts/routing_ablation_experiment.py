@@ -16,66 +16,21 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from tqdm import tqdm
-from transformers import AutoTokenizer, CLIPImageProcessor, CLIPVisionModel
 
-from models.custom_mistral import MistralMoEForCausalLM
-from models.vl_connector import VisionLanguageConnector
+from analysis_scripts._lib import load_stage2_models, load_training_config
 
 
-def load_stage2_model(checkpoint_path, device="cuda"):
-    """Load Stage 2 model with hard routing."""
+def load_stage2_model(checkpoint_path, config, device="cuda"):
+    """Load Stage 2 model with hard routing via the shared _lib loader."""
     print("Loading Stage 2 model...")
-
-    # Load CLIP vision encoder
-    clip_model = CLIPVisionModel.from_pretrained("YOUR_PATH_HERE/models/clip-vit-large-patch14").to(
-        device
+    models = load_stage2_models(config, device, stage2_checkpoint=checkpoint_path)
+    return (
+        models.vision_encoder,
+        models.vision_connector,
+        models.llm,
+        models.tokenizer,
+        models.clip_processor,
     )
-
-    # Load vision connector
-    vision_connector = VisionLanguageConnector()
-    connector_state = torch.load(
-        "YOUR_PATH_HERE/outputs/vision_connector_stage1_best.pth", map_location="cpu"
-    )
-    vision_connector.load_state_dict(connector_state)
-    vision_connector = vision_connector.to(device)
-
-    # Load LLM
-    llm = MistralMoEForCausalLM.from_pretrained(
-        "YOUR_PATH_HERE/models/Mistral-7B-MoE", torch_dtype=torch.bfloat16, device_map=device
-    )
-
-    # Load checkpoint - exactly matching cross_concept_similarity_matrix.py pattern
-    print(f"   Loading Stage 2 expert weights from {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-
-    # Check if this is a full checkpoint (dict with keys) or direct state_dict
-    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        # FULL checkpoint format (with training state)
-        print(f"   Detected FULL checkpoint format (epoch {checkpoint.get('epoch', 'unknown')})")
-        llm.load_state_dict(checkpoint["model_state_dict"], strict=False)
-    else:
-        # PORTABLE/DIRECT state_dict format
-        print("   Detected PORTABLE checkpoint format (state_dict only)")
-        llm.load_state_dict(checkpoint, strict=False)
-
-    print("   ✅ Stage 2 checkpoint loaded successfully")
-    llm.eval()
-
-    # Force hard routing mode (Stage 2 uses hard routing)
-    print("   Setting MoE layers to hard routing mode...")
-    for layer in llm.model.layers:
-        if hasattr(layer.mlp, "routing_mode"):
-            layer.mlp.routing_mode = "hard"
-
-    # Load tokenizer and processor
-    tokenizer = AutoTokenizer.from_pretrained(
-        "YOUR_PATH_HERE/models/Mistral-7B-v0.3", use_fast=False
-    )
-    tokenizer.pad_token = tokenizer.eos_token  # Set pad token for COCO_Loader
-
-    processor = CLIPImageProcessor.from_pretrained("YOUR_PATH_HERE/models/clip-vit-large-patch14")
-
-    return clip_model, vision_connector, llm, tokenizer, processor
 
 
 def set_routing_mask(
@@ -177,26 +132,31 @@ def compute_loss_single_example(
         return outputs.loss.item()
 
 
-def run_routing_ablation(checkpoint_path, data_path, num_samples=100, device="cuda"):
+def run_routing_ablation(
+    checkpoint_path, data_path, num_samples=100, device="cuda", training_config=None
+):
     """
     Run routing ablation experiment.
 
     Args:
-        checkpoint_path: Path to Stage 2 checkpoint
-        data_path: Path to COCO validation data
+        checkpoint_path: Path to Stage 2 checkpoint (None → default from config)
+        data_path: Path to COCO root directory (expects val2017/ and annotations/)
         num_samples: Number of examples to evaluate
+        training_config: Path to training_config.yaml (for model paths)
     """
+    config = load_training_config(training_config or "configs/training_config.yaml")
+
     print("=" * 80)
     print("EXPERT ROUTING ABLATION STUDY - STAGE 2")
     print("=" * 80)
-    print(f"Checkpoint: {checkpoint_path}")
+    print(f"Checkpoint: {checkpoint_path or 'default (from training_config.yaml)'}")
     print(f"Num samples: {num_samples}")
     print(f"Device: {device}")
     print()
 
     # Load model
     clip_model, vision_connector, llm, tokenizer, processor = load_stage2_model(
-        checkpoint_path, device
+        checkpoint_path, config, device
     )
 
     # Put models in eval mode
@@ -204,15 +164,19 @@ def run_routing_ablation(checkpoint_path, data_path, num_samples=100, device="cu
     vision_connector.eval()
     llm.eval()
 
-    # Load data
-    print(f"Loading data from {data_path}...")
+    # Load data. data_path is the COCO root; default to the parent of the
+    # training image_dir so the script works out-of-the-box from config.
+    if data_path is None:
+        data_path = str(Path(config["paths"]["image_dir"]).parent)
+    coco_root = Path(data_path)
+    print(f"Loading data from {coco_root}...")
     from torch.utils.data import DataLoader
 
     from data.COCO_loader import COCO_Loader
 
     val_dataset = COCO_Loader(
-        image_dir="YOUR_PATH_HERE/datasets/coco/val2017",
-        annotations_file="YOUR_PATH_HERE/datasets/coco/annotations/captions_val2017.json",
+        image_dir=str(coco_root / "val2017"),
+        annotations_file=str(coco_root / "annotations" / "captions_val2017.json"),
         clip_processor=processor,
         tokenizer=tokenizer,
         subset_fraction=1.0,
@@ -376,19 +340,25 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="YOUR_PATH_HERE/outputs/stage2_checkpoints/llm_stage2_best.pth",
-        help="Path to Stage 2 checkpoint",
+        default=None,
+        help="Path to Stage 2 checkpoint (default: llm_stage2_best.pth from training_config.yaml)",
     )
     parser.add_argument(
         "--data",
         type=str,
-        default="YOUR_PATH_HERE/datasets/coco",
-        help="Path to COCO data directory",
+        default=None,
+        help="Path to COCO root directory (default: parent of paths.image_dir in config)",
     )
     parser.add_argument(
-        "--num_samples", type=int, default=100, help="Number of samples to evaluate"
+        "--num-samples", type=int, default=100, help="Number of samples to evaluate"
     )
     parser.add_argument("--device", type=str, default="cuda", help="Device (cuda or cpu)")
+    parser.add_argument(
+        "--training-config",
+        type=str,
+        default="configs/training_config.yaml",
+        help="Path to training config file for model paths",
+    )
 
     args = parser.parse_args()
 
@@ -397,4 +367,5 @@ if __name__ == "__main__":
         data_path=args.data,
         num_samples=args.num_samples,
         device=args.device,
+        training_config=args.training_config,
     )

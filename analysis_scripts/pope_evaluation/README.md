@@ -109,8 +109,10 @@ sbatch hpc/analysis_scripts/pope_04_evaluate.sbatch
 ```
 analysis_scripts/pope_evaluation/
 ├── 01_generate_pope_questions.py    # Question generation
-├── 02_generate_pope_answers.py      # Answer generation
-└── 03_evaluate_pope.py              # Evaluation & comparison
+├── 02_generate_pope_answers.py      # Answer generation (+ optional --use-priming)
+├── 03_evaluate_pope.py              # Evaluation & comparison
+├── compare_priming_strategies.py    # Compare priming strategies
+└── pope_utils.py                    # Shared extractors + metrics
 
 hpc/analysis_scripts/
 ├── pope_01_generate_questions.sbatch
@@ -148,6 +150,24 @@ Edit `pope_02_generate_stage2_answers.sbatch` or `pope_03_generate_stage3_answer
 ```bash
 --temperature 0.0     # Greedy (default)
 --temperature 0.7     # More diverse answers
+```
+
+### Stage-3 priming strategy (optional):
+
+The priming experiment (previously a separate `02b` script) is now a flag on
+`02_generate_pope_answers.py`. Default behaviour is unchanged; opt in with:
+
+```bash
+python 02_generate_pope_answers.py \
+    --checkpoint_path /path/to/stage3_best.pth --stage_name stage3 \
+    --questions_file results/pope_evaluation/pope_random.json \
+    --use-priming --priming simple        # or: conversational | none
+```
+
+Then compare strategies (writes nothing; prints a table):
+
+```bash
+python compare_priming_strategies.py --results-dir results/pope_evaluation
 ```
 
 ## Troubleshooting

@@ -44,6 +44,8 @@ import numpy as np
 import seaborn as sns
 import torch
 
+from analysis_scripts._lib import compute_cosine_similarity_matrix, load_analysis_config
+
 # REUSE: Import existing analyzer class for model loading and representation extraction
 from analysis_scripts.cross_concept_similarity_matrix import CrossConceptSimilarityAnalyzer
 
@@ -244,19 +246,7 @@ class CompositionalCaseStudyAnalyzer:
         n = len(representations)
         print(f"\n📊 Computing {stage_name} similarity matrix ({n}×{n})...")
 
-        matrix = np.zeros((n, n))
-
-        for i in range(n):
-            for j in range(n):
-                if i == j:
-                    matrix[i, j] = 1.0
-                else:
-                    # REUSE: Same cosine similarity formula
-                    cos_sim = np.dot(representations[i], representations[j]) / (
-                        np.linalg.norm(representations[i]) * np.linalg.norm(representations[j])
-                        + 1e-8
-                    )
-                    matrix[i, j] = float(cos_sim)
+        matrix = compute_cosine_similarity_matrix(representations)
 
         print(f"   ✓ Matrix computed: shape={matrix.shape}")
         print(f"   ✓ Similarity range: [{matrix.min():.3f}, {matrix.max():.3f}]")
@@ -628,31 +618,17 @@ class CompositionalCaseStudyAnalyzer:
 
 
 def load_config(config_file: str) -> dict:
-    """
-    Load configuration from JSON file.
-
-    Args:
-        config_file: Path to JSON config
-
-    Returns:
-        Dictionary with configuration parameters
-    """
-    with open(config_file) as f:
-        config = json.load(f)
-
-    # Validate required fields
-    required_fields = ["manifest_file", "stage2_checkpoint", "stage3_checkpoint"]
-    for field in required_fields:
-        if field not in config:
-            raise ValueError(f"Config file missing required field: {field}")
-
-    # Set defaults for optional fields
-    config.setdefault("layers", [0, 16, 31])
-    config.setdefault("pooling", "mean")
-    config.setdefault("temperature", 0.01)
-    config.setdefault("output_dir", "results/compositional_case_study/")
-
-    return config
+    """Load the JSON analysis config for the compositional case study."""
+    return load_analysis_config(
+        config_file,
+        required_fields=["manifest_file", "stage2_checkpoint", "stage3_checkpoint"],
+        defaults={
+            "layers": [0, 16, 31],
+            "pooling": "mean",
+            "temperature": 0.01,
+            "output_dir": "results/compositional_case_study/",
+        },
+    )
 
 
 def main():

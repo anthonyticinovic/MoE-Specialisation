@@ -156,21 +156,27 @@ else:
             f"🚨 WARNING: Stage 2 best checkpoint not found at '{checkpoint_path}'. Starting from base weights."
         )
 
-# ROBUST FIX: Manually re-initialize gates AFTER all loading is done
+# Re-initialise every router gate from scratch *after* loading the Stage 2
+# checkpoint. The Stage 2 checkpoint carries gate tensors that were never
+# trained (Stage 2 uses hard routing), so they must be discarded rather than
+# fine-tuned — keeping them collapses routing onto a single expert. This is a
+# deliberate design choice, not a workaround for a load bug.
 if local_rank == 0:
-    logger.info("--- Forcing re-initialization of router gates to fix corruption ---")
+    logger.info("--- Re-initialising router gates before soft routing ---")
 
 for layer in llm.module.model.layers:
     if hasattr(layer.mlp, "gate"):
         new_gate = nn.Linear(layer.mlp.d_model, layer.mlp.num_experts, bias=False)
-        # Increased std to create stronger initial preferences, helping routers explore specialization
-        nn.init.normal_(new_gate.weight, std=0.1)  # Changed from 0.02 to 0.1
+        # std=0.1 (vs the 0.05 default in MoELayer): a slightly wider init gives
+        # each gate a stronger initial modality preference, which empirically
+        # helps the routers escape the uniform-routing fixed point early on.
+        nn.init.normal_(new_gate.weight, std=0.1)
         new_gate = new_gate.to(DEVICE)
         layer.mlp.gate = new_gate
         layer.mlp.gate.weight.requires_grad = True
 
 # ====================================================================================
-# SOLUTION 4: VERIFY EXPERT WEIGHTS ARE FROZEN
+# Verify the expert weights are frozen (only the gate trains in Stage 2.5)
 # ====================================================================================
 if local_rank == 0:
     logger.info("\n=== Expert Weight Verification ===")
@@ -289,7 +295,9 @@ else:
 
 # --- 5.3. Finalize Model Setup ---
 llm.model.embed_tokens.to(DEVICE)
-# llm.gradient_checkpointing_enable()
+# Gradient checkpointing is intentionally left disabled: combined with FSDP and
+# the MoE layer's per-rank dummy expert pass it produced unstable activations.
+# Stage 2.5 only trains the small gate, so the memory saving is not needed.
 vision_connector = VisionLanguageConnector().to(DEVICE)
 vision_connector.load_state_dict(
     torch.load(

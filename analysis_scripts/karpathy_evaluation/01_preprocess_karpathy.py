@@ -144,8 +144,8 @@ def main():
     parser.add_argument(
         "--karpathy_json",
         type=str,
-        default="YOUR_PATH_HERE/datasets/coco/karpathy_split/dataset_coco.json",
-        help="Path to dataset_coco.json",
+        required=True,
+        help="Path to dataset_coco.json (Karpathy split)",
     )
     parser.add_argument(
         "--output_dir",

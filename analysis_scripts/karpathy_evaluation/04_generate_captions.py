@@ -311,8 +311,8 @@ def main():
     parser.add_argument(
         "--image_base_dir",
         type=str,
-        default="YOUR_PATH_HERE/data/coco",
-        help="Base directory for images",
+        required=True,
+        help="Base directory for COCO images",
     )
     parser.add_argument(
         "--output_dir",

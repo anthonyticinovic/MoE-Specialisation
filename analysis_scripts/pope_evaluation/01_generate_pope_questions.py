@@ -329,8 +329,9 @@ def main():
     parser.add_argument(
         "--annotations_file",
         type=str,
-        default="YOUR_PATH_HERE/datasets/coco/annotations/instances_val2017.json",
-        help="Path to COCO instances annotations (val2017)",
+        default=None,
+        help="COCO instances annotations (default: <parent of paths.image_dir>/"
+        "annotations/instances_val2017.json from config)",
     )
     parser.add_argument(
         "--output_dir",
@@ -350,6 +351,15 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
 
     args = parser.parse_args()
+
+    if args.annotations_file is None:
+        import sys
+
+        sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+        from analysis_scripts._lib import get_paths
+
+        coco_root = Path(get_paths()["image_dir"]).parent
+        args.annotations_file = str(coco_root / "annotations" / "instances_val2017.json")
 
     print("=" * 80)
     print("POPE QUESTION GENERATION".center(80))

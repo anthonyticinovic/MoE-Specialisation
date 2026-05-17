@@ -234,7 +234,7 @@ STAGE3_CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "stage3_checkpoints")
 # --- Initialize the distributed environment with extended timeout ---
 import datetime
 
-# CRITICAL: Set timeout to 60 minutes for large checkpoint loading operations
+# Note: Set timeout to 60 minutes for large checkpoint loading operations
 # Default is 10 minutes which is too short for FSDP checkpoint loading
 timeout = datetime.timedelta(minutes=60)
 dist.init_process_group("nccl", timeout=timeout)
@@ -255,7 +255,7 @@ if local_rank == 0:
 if local_rank == 0:
     logger.info("Loading foundational models...")
 vision_encoder = CLIPVisionModel.from_pretrained(paths["clip_local_path"]).to(DEVICE)
-# CRITICAL: Set vision encoder to eval mode since it's frozen - prevents dropout/stochastic behavior
+# Note: Set vision encoder to eval mode since it's frozen - prevents dropout/stochastic behavior
 vision_encoder.eval()
 clip_processor = AutoProcessor.from_pretrained(paths["clip_local_path"])
 tokenizer = AutoTokenizer.from_pretrained(paths["mistral_local_path"])
@@ -272,7 +272,9 @@ llm = AutoModelForCausalLM.from_pretrained(
     low_cpu_mem_usage=True,
 )
 
-# CRITICAL FIX: Disable gradient checkpointing - it causes FSDP corruption issues
+# Gradient checkpointing is intentionally left disabled: under FSDP it
+# interacts badly with the MoE layer's per-rank dummy expert pass and
+# destabilises activations. Left as a documented, deliberate trade-off.
 # llm.gradient_checkpointing_enable()
 
 # Explicitly set all MoE layers to use soft routing for training
@@ -350,7 +352,7 @@ if local_rank == 0:
 # 5. FSDP WRAPPING & CHECKPOINTING
 # ====================================================================================
 
-# CRITICAL: Cache vocab_size BEFORE FSDP wrapping to avoid accessing llm.config later
+# Note: Cache vocab_size BEFORE FSDP wrapping to avoid accessing llm.config later
 # Accessing FSDP-wrapped model config can trigger collective operations
 VOCAB_SIZE = llm.config.vocab_size
 
@@ -364,17 +366,17 @@ my_auto_wrap_policy = partial(
 # Prevent FSDP from sharding the embedding layer (accessed directly in training loop)
 ignored_modules = [llm.model.embed_tokens]
 
-# CRITICAL: Ignored modules must be on the correct device BEFORE FSDP wrapping
+# Note: Ignored modules must be on the correct device BEFORE FSDP wrapping
 # Moving them after wrapping causes FSDP to detect "newly-added parameters"
 if local_rank == 0:
     logger.info(f"Placing ignored modules on device {DEVICE} before FSDP wrapping")
 llm.model.embed_tokens.to(DEVICE)
 
-# CRITICAL: Cache embedding layer reference before FSDP wrapping to avoid accessing
+# Note: Cache embedding layer reference before FSDP wrapping to avoid accessing
 # llm.module.* in the training loop (safer and avoids potential FSDP interactions)
 embed_tokens_layer = llm.model.embed_tokens
 
-# CRITICAL FIX: Use exact FSDP configuration from working Stage 2.5
+# Note: FSDP configuration mirrors Stage 2.5 exactly (kept identical on purpose)
 # device_id must be DEVICE (local_rank as int), NOT torch.cuda.current_device()
 # cpu_offload must be CPUOffload(offload_params=None), NOT False
 llm = FSDP(
@@ -454,7 +456,7 @@ elif local_rank == 0:
 
 dist.barrier()
 
-# CRITICAL: Do NOT access llm.module.model.layers after FSDP wrapping!
+# Note: Do NOT access llm.module.model.layers after FSDP wrapping!
 # Accessing FSDP internals (even just len(llm.module.model.layers)) can trigger
 # collective operations on rank 0 only, corrupting execution order tracking.
 # This causes "newly-added parameter" errors during the first backward pass.
@@ -467,7 +469,7 @@ dist.barrier()
 # ====================================================================================
 # 7. LOAD STAGE 1 VISION CONNECTOR
 # ====================================================================================
-# CRITICAL: Use same synchronization pattern as Stage 2 checkpoint loading
+# Note: Use same synchronization pattern as Stage 2 checkpoint loading
 # to prevent race conditions on distributed file systems
 connector_found = torch.tensor(0.0, device=DEVICE)
 stage1_weights_path = os.path.join(OUTPUT_DIR, "vision_connector_stage1_best.pth")
@@ -559,7 +561,7 @@ else:  # "coco"
         seed=loader_params.get("data_seed", 42),  # Same seed ensures consistent splits
     )
 
-# CRITICAL: Use drop_last=True for training to ensure deterministic batch counts
+# Note: Use drop_last=True for training to ensure deterministic batch counts
 # With large datasets not perfectly divisible by world_size, padding can cause
 # rank-specific execution paths that FSDP detects as execution order divergence.
 # drop_last=False for validation is fine since validation doesn't update FSDP state.
@@ -592,7 +594,7 @@ optimizer = optim.AdamW(
     weight_decay=train_params["weight_decay"],
     fused=False,
 )
-# CRITICAL: GradScaler is not compatible with bfloat16 (only float16)
+# Note: GradScaler is not compatible with bfloat16 (only float16)
 # Since we use bfloat16, we don't need GradScaler (bfloat16 has better numerical stability)
 scaler = GradScaler(enabled=False)  # Disabled for bfloat16
 total_steps = (len(train_loader) // accumulation_steps) * NUM_EPOCHS
@@ -733,14 +735,14 @@ start_time = time.time()
 for epoch in range(start_epoch, NUM_EPOCHS):
     train_sampler.set_epoch(epoch)
 
-    # CRITICAL: Synchronize random seed across all ranks for deterministic Gumbel sampling
+    # Note: Synchronize random seed across all ranks for deterministic Gumbel sampling
     # The MoE layer uses Gumbel noise for routing, which must be identical across ranks
     # to ensure FSDP execution order consistency
     torch.manual_seed(42 + epoch)
     torch.cuda.manual_seed_all(42 + epoch)
 
     llm.train()
-    # CRITICAL: Keep vision_connector in eval mode since all its parameters are frozen
+    # Note: Keep vision_connector in eval mode since all its parameters are frozen
     # Calling .train() on a frozen module is inconsistent and may cause issues with
     # BatchNorm/Dropout layers if they exist
     vision_connector.eval()
@@ -818,7 +820,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
 
         scaler.scale(loss).backward()
 
-        # CRITICAL: Accumulate loss tensor WITHOUT .item() to avoid CPU-GPU sync during accumulation
+        # Note: Accumulate loss tensor WITHOUT .item() to avoid CPU-GPU sync during accumulation
         # Calling .item() on every iteration can cause timing skew between ranks (especially with 4+ GPUs)
         # Instead, accumulate the tensor and only extract .item() after gradient update
         if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):
@@ -854,7 +856,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
                         f"LR: {current_lr:.2e} | Speed: {steps_per_sec:.2f} steps/s | ETA: {eta_minutes}min"
                     )
 
-    # CRITICAL: Average training loss over number of optimizer steps, NOT total batches
+    # Note: Average training loss over number of optimizer steps, NOT total batches
     num_optimizer_steps = len(train_loader) // accumulation_steps
     avg_train_loss = total_train_loss / num_optimizer_steps
     if local_rank == 0:
@@ -912,7 +914,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
                 )
                 use_llava_labels = False
 
-            # CRITICAL: Don't use try-except with break - it can cause ranks to diverge
+            # Note: Don't use try-except with break - it can cause ranks to diverge
             # Instead, just skip failed batches but continue the loop
             with autocast(device_type="cuda", dtype=torch.bfloat16):
                 patch_embeddings = vision_encoder(images).last_hidden_state
@@ -1071,7 +1073,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             json.dump(metrics_history, f, indent=4)
         logger.info(f"✅ Metrics saved to {metrics_path}")
 
-    # CRITICAL: Barrier before checkpoint extraction to ensure all ranks are ready
+    # Note: Barrier before checkpoint extraction to ensure all ranks are ready
     # FSDP state_dict extraction requires coordination between ranks
     dist.barrier()
 
