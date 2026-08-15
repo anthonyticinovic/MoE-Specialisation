@@ -10,8 +10,6 @@ import torch.optim as optim
 from torch.amp import GradScaler, autocast
 from torch.distributed.fsdp import (
     CPUOffload,
-    FullStateDictConfig,
-    StateDictType,
 )
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
@@ -21,6 +19,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from transformers import (
+    AutoModelForCausalLM,
     AutoProcessor,
     AutoTokenizer,
     CLIPVisionModel,
@@ -30,7 +29,17 @@ from transformers.models.mistral.modeling_mistral import MistralMLP
 from data import COCO_Loader
 from models import VisionLanguageConnector
 import logging
-from models.utils.common import load_config, register_moe_model, setup_logging
+from models.utils.common import (
+    full_state_dict_context,
+    get_attn_implementation,
+    get_model_dtype,
+    init_distributed,
+    load_config,
+    register_moe_model,
+    setup_logging,
+    supports_fsdp,
+    unwrap_model,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,11 +60,17 @@ STAGE2_5_CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "stage2_5_checkpoints")
 LOAD_BALANCING_COEFF = train_params.get("load_balancing_coeff", 0.01)
 
 # --- Initialize the distributed environment ---
-dist.init_process_group("nccl")
-local_rank = int(os.environ["LOCAL_RANK"])
+USE_FSDP = supports_fsdp()
+local_rank = int(os.environ.get("LOCAL_RANK", 0))
+init_distributed(local_rank)
 setup_logging(local_rank)
-torch.cuda.set_device(local_rank)
-DEVICE = f"cuda:{local_rank}"
+if USE_FSDP:
+    torch.cuda.set_device(local_rank)
+    DEVICE = f"cuda:{local_rank}"
+else:
+    DEVICE = "cpu"
+# autocast/GradScaler take a device *type* string; DEVICE may be an ordinal.
+AMP_DEVICE = "cuda" if USE_FSDP else "cpu"
 
 if local_rank == 0:
     logger.info("--- Initializing Stage 2.5 Training (Training the Router) ---")
@@ -75,8 +90,8 @@ llm = AutoModelForCausalLM.from_pretrained(
     moe_model_path,
     trust_remote_code=True,
     local_files_only=True,
-    torch_dtype=torch.bfloat16,
-    attn_implementation="flash_attention_2",
+    torch_dtype=get_model_dtype(),
+    attn_implementation=get_attn_implementation(),
     low_cpu_mem_usage=True,
 )
 
@@ -103,19 +118,23 @@ for name, param in llm.named_parameters():
 my_auto_wrap_policy = partial(transformer_auto_wrap_policy, transformer_layer_cls={MistralMLP})
 ignored_modules = [llm.model.embed_tokens]
 
-llm = FSDP(
-    llm,
-    device_id=DEVICE,
-    auto_wrap_policy=my_auto_wrap_policy,
-    cpu_offload=CPUOffload(offload_params=None),
-    mixed_precision=torch.distributed.fsdp.MixedPrecision(
-        param_dtype=torch.bfloat16,
-        reduce_dtype=torch.bfloat16,
-        buffer_dtype=torch.bfloat16,
-    ),
-    use_orig_params=True,
-    ignored_modules=ignored_modules,
-)
+if USE_FSDP:
+    llm = FSDP(
+        llm,
+        device_id=DEVICE,
+        auto_wrap_policy=my_auto_wrap_policy,
+        cpu_offload=CPUOffload(offload_params=None),
+        mixed_precision=torch.distributed.fsdp.MixedPrecision(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.bfloat16,
+            buffer_dtype=torch.bfloat16,
+        ),
+        use_orig_params=True,
+        ignored_modules=ignored_modules,
+    )
+else:
+    # CPU demo: sharding is a no-op at one rank; the loop below is unchanged.
+    llm = llm.to(DEVICE)
 
 # --- 5.1. Load Stage 2 Checkpoint (Base weights for experts) ---
 # Define the path to the best checkpoint directly
@@ -138,8 +157,7 @@ if should_load:
     state_dict = torch.load(checkpoint_path, map_location="cpu")
 
     # Load the state dict into the FSDP model
-    load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
-    with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
+    with full_state_dict_context(llm, rank0_only=False):
         llm.load_state_dict(state_dict, strict=False)
 
     del state_dict
@@ -164,7 +182,7 @@ else:
 if local_rank == 0:
     logger.info("--- Re-initialising router gates before soft routing ---")
 
-for layer in llm.module.model.layers:
+for layer in unwrap_model(llm).model.layers:
     if hasattr(layer.mlp, "gate"):
         new_gate = nn.Linear(layer.mlp.d_model, layer.mlp.num_experts, bias=False)
         # std=0.1 (vs the 0.05 default in MoELayer): a slightly wider init gives
@@ -180,7 +198,7 @@ for layer in llm.module.model.layers:
 # ====================================================================================
 if local_rank == 0:
     logger.info("\n=== Expert Weight Verification ===")
-    sample_layer = llm.module.model.layers[0]
+    sample_layer = unwrap_model(llm).model.layers[0]
     expert_0_requires_grad = any(p.requires_grad for p in sample_layer.mlp.experts[0].parameters())
     expert_1_requires_grad = any(p.requires_grad for p in sample_layer.mlp.experts[1].parameters())
     gate_requires_grad = sample_layer.mlp.gate.weight.requires_grad
@@ -227,14 +245,14 @@ train_loader = DataLoader(
     batch_size=train_params["batch_size"],
     sampler=train_sampler,
     num_workers=loader_params["num_workers"],
-    pin_memory=True,
+    pin_memory=USE_FSDP,
 )
 val_loader = DataLoader(
     val_dataset,
     batch_size=train_params["batch_size"],
     sampler=val_sampler,
     num_workers=loader_params["num_workers"],
-    pin_memory=True,
+    pin_memory=USE_FSDP,
 )
 
 # Create optimizer AFTER gates are fixed
@@ -248,7 +266,7 @@ optimizer = optim.AdamW(
     weight_decay=train_params["weight_decay"],
     fused=True,
 )
-scaler = GradScaler()
+scaler = GradScaler(AMP_DEVICE, enabled=USE_FSDP)
 total_steps = (len(train_loader) // accumulation_steps) * NUM_EPOCHS
 scheduler = CosineAnnealingLR(optimizer, T_max=total_steps)
 loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
@@ -271,8 +289,7 @@ if resume_tensor.item() == 1.0:
     checkpoint = torch.load(latest_checkpoint_path, map_location="cpu")
     model_state_dict = checkpoint["model_state_dict"]
 
-    load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
-    with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
+    with full_state_dict_context(llm, rank0_only=False):
         llm.load_state_dict(model_state_dict, strict=False)
 
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -298,7 +315,10 @@ llm.model.embed_tokens.to(DEVICE)
 # Gradient checkpointing is intentionally left disabled: combined with FSDP and
 # the MoE layer's per-rank dummy expert pass it produced unstable activations.
 # Stage 2.5 only trains the small gate, so the memory saving is not needed.
-vision_connector = VisionLanguageConnector().to(DEVICE)
+vision_connector = VisionLanguageConnector(
+    clip_hidden_size=vision_encoder.config.hidden_size,
+    llm_hidden_size=llm.config.hidden_size,
+).to(DEVICE)
 vision_connector.load_state_dict(
     torch.load(
         os.path.join(OUTPUT_DIR, "vision_connector_stage1_best.pth"),
@@ -333,7 +353,7 @@ if local_rank == 0 and start_epoch > 0 and os.path.exists(metrics_path):
 # Optional: Verification block to confirm gate shapes are correct before training
 if local_rank == 0:
     logger.info("--- Verifying Gate Parameter Shapes Before Training ---")
-    for i, layer in enumerate(llm.module.model.layers):
+    for i, layer in enumerate(unwrap_model(llm).model.layers):
         if hasattr(layer.mlp, "gate") and hasattr(layer.mlp.gate, "weight"):
             logger.info(f"  Layer {i} gate shape: {tuple(layer.mlp.gate.weight.shape)}")
     logger.info("---------------------------------------------------------")
@@ -352,7 +372,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
     temperature = max(1.0, 2.0 * (0.9**epoch))  # Starts at 2.0, decays to 1.0
 
     # Set temperature for all MoE layers
-    for layer in llm.module.model.layers:
+    for layer in unwrap_model(llm).model.layers:
         if hasattr(layer.mlp, "temperature"):
             layer.mlp.temperature = temperature
 
@@ -369,7 +389,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             attention_mask.to(DEVICE),
         )
 
-        with autocast(device_type="cuda", dtype=torch.bfloat16):
+        with autocast(device_type=AMP_DEVICE, dtype=torch.bfloat16, enabled=USE_FSDP):
             with torch.no_grad():
                 patch_embeddings = vision_encoder(images).last_hidden_state
                 visual_soft_tokens = vision_connector(patch_embeddings)
@@ -386,7 +406,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
 
             # Pass temperature to MoE layers through forward hooks
             # Note: LLM doesn't directly accept temperature, so we set it as layer attribute
-            for layer in llm.module.model.layers:
+            for layer in unwrap_model(llm).model.layers:
                 if hasattr(layer.mlp, "routing_mode") and layer.mlp.routing_mode == "soft":
                     # Store temperature for this forward pass
                     layer.mlp._forward_temperature = temperature
@@ -404,14 +424,16 @@ for epoch in range(start_epoch, NUM_EPOCHS):
 
             total_load_balancing_loss = 0
             total_entropy_bonus = 0
-            for layer in llm.module.model.layers:
+            for layer in unwrap_model(llm).model.layers:
                 if hasattr(layer.mlp, "load_balancing_loss"):
                     total_load_balancing_loss += layer.mlp.load_balancing_loss
 
                 # Add entropy bonus to encourage exploration
                 if hasattr(layer.mlp, "gate"):
                     # Get routing logits for current batch
-                    gate_logits = layer.mlp.gate(combined_embeddings.view(-1, 4096))
+                    gate_logits = layer.mlp.gate(
+                        combined_embeddings.view(-1, llm.config.hidden_size)
+                    )
                     gate_probs = torch.softmax(gate_logits, dim=-1)
                     # Entropy = -sum(p * log(p)). Higher entropy = more exploration
                     entropy = -(gate_probs * torch.log(gate_probs + 1e-10)).sum(dim=-1).mean()
@@ -494,18 +516,22 @@ for epoch in range(start_epoch, NUM_EPOCHS):
                 logger.info(f"{'=' * 60}")
 
                 for layer_idx in [0, 15, 31]:  # First, middle, last
-                    check_layer = llm.module.model.layers[layer_idx]
+                    check_layer = unwrap_model(llm).model.layers[layer_idx]
                     if hasattr(check_layer.mlp, "gate"):
                         # Convert to float32 to match gate weights dtype
                         visual_hidden_fp32 = visual_hidden.float()
                         text_hidden_fp32 = text_hidden.float()
 
                         # Visual token routing
-                        visual_logits = check_layer.mlp.gate(visual_hidden_fp32.view(-1, 4096))
+                        visual_logits = check_layer.mlp.gate(
+                            visual_hidden_fp32.view(-1, llm.config.hidden_size)
+                        )
                         visual_probs = torch.softmax(visual_logits, dim=-1)
 
                         # Text token routing
-                        text_logits = check_layer.mlp.gate(text_hidden_fp32.view(-1, 4096))
+                        text_logits = check_layer.mlp.gate(
+                            text_hidden_fp32.view(-1, llm.config.hidden_size)
+                        )
                         text_probs = torch.softmax(text_logits, dim=-1)
 
                         logger.info(f"\nLayer {layer_idx:2d}:")
@@ -567,7 +593,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             )
 
             try:
-                with autocast(device_type="cuda", dtype=torch.bfloat16):
+                with autocast(device_type=AMP_DEVICE, dtype=torch.bfloat16, enabled=USE_FSDP):
                     patch_embeddings = vision_encoder(images).last_hidden_state
                     visual_soft_tokens = vision_connector(patch_embeddings)
                     text_embeddings = llm.model.embed_tokens(input_ids)
@@ -619,8 +645,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             json.dump(metrics_history, f, indent=4)
         logger.info(f"✅ Metrics saved to {metrics_path}")
 
-    save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-    with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, save_policy):
+    with full_state_dict_context(llm, rank0_only=True):
         full_state_dict = llm.state_dict()
 
     if local_rank == 0:

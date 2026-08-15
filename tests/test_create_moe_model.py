@@ -2,15 +2,19 @@
 
 The script copies the base Mistral FFN weights into *both* experts of every
 layer; a regression here silently corrupts the initial state of every
-downstream experiment. CPU-only, no real weights, no network — the heavy 7B
-load is monkeypatched to a tiny synthetic base model.
+downstream experiment. CPU-only, no real weights, no network — a tiny synthetic
+base model is written to a tmp dir and the real script runs against it.
 
-The saved checkpoint is inspected directly (safetensors), not reloaded through
-``from_pretrained``: that path re-dispatches on config.json's ``model_type``
-(left as the base ``mistral`` because create_moe_model builds the MoE model
-from the base config object) and is exercised by the trust_remote_code /
-registration tests elsewhere. Here we only care that the bytes on disk are
-correct.
+Weight copying is verified by inspecting the saved safetensors directly. The
+saved ``config.json`` is verified separately: it must declare
+``model_type="mistral_moe"`` so that ``from_pretrained`` re-dispatches to the
+MoE classes. An earlier version built the MoE model from the *base*
+``MistralConfig``; because ``PretrainedConfig.to_dict()`` reads ``model_type``
+from the config class rather than the instance, that wrote
+``model_type="mistral"`` and any load without ``trust_remote_code=True``
+silently produced a dense ``MistralForCausalLM`` with randomly initialised
+FFNs. ``test_config_declares_moe_model_type`` and
+``test_reloads_as_moe_without_trust_remote_code`` pin that fix.
 """
 
 import json
@@ -38,17 +42,21 @@ def tiny_base_model() -> MistralForCausalLM:
 
 
 @pytest.fixture
-def moe_output_dir(tiny_base_model, tmp_path, monkeypatch):
-    """Run the real create_moe_model with the 7B load stubbed out."""
+def moe_output_dir(tiny_base_model, tmp_path):
+    """Run the real create_moe_model end-to-end on a tiny on-disk base model.
+
+    The base model is saved to disk rather than monkeypatching
+    ``from_pretrained``: patching it would also intercept the *reload* in
+    TestCheckpointReload, because MistralMoEForCausalLM inherits that
+    classmethod from MistralForCausalLM.
+    """
     import models.utils.create_moe_model as cmm
 
-    monkeypatch.setattr(
-        cmm.MistralForCausalLM,
-        "from_pretrained",
-        classmethod(lambda cls, *a, **k: tiny_base_model),
-    )
+    base_dir = tmp_path / "base_model"
+    tiny_base_model.save_pretrained(str(base_dir))
+
     out_dir = tmp_path / "moe_model"
-    cmm.create_moe_model("ignored-base-path", str(out_dir))
+    cmm.create_moe_model(str(base_dir), str(out_dir))
     return out_dir
 
 
@@ -91,3 +99,61 @@ class TestCreateMoEModel:
         """The custom class sources must be copied beside the checkpoint."""
         for fname in ("custom_mistral.py", "moe_layer.py", "__init__.py"):
             assert (moe_output_dir / fname).exists(), f"Missing source file: {fname}"
+
+    def test_config_declares_moe_model_type(self, moe_output_dir):
+        """config.json must say mistral_moe, not the base mistral.
+
+        Regression: to_dict() takes model_type from the config *class*, so
+        constructing the MoE model from a plain MistralConfig silently wrote
+        "mistral" here and produced a checkpoint that loads as a dense model.
+        """
+        cfg = json.loads((moe_output_dir / "config.json").read_text())
+        assert cfg["model_type"] == "mistral_moe", (
+            f"config.json declares model_type={cfg['model_type']!r}; a checkpoint "
+            "declaring 'mistral' loads as a dense MistralForCausalLM with randomly "
+            "initialised FFNs unless trust_remote_code=True is passed."
+        )
+        assert cfg["architectures"] == ["MistralMoEForCausalLM"]
+
+
+class TestCheckpointReload:
+    """The saved checkpoint must come back as a real MoE model."""
+
+    def test_reloads_as_moe_without_trust_remote_code(self, moe_output_dir):
+        """Registered classes alone must be enough to reload as an MoE model.
+
+        This is the load path that silently degraded before the model_type fix:
+        no exception, just a dense model with random FFN weights.
+        """
+        from transformers import AutoModelForCausalLM
+
+        from models.moe_layer import MoELayer
+        from models.utils.common import register_moe_model
+
+        register_moe_model()
+        model = AutoModelForCausalLM.from_pretrained(str(moe_output_dir), local_files_only=True)
+
+        assert type(model).__name__ == "MistralMoEForCausalLM", (
+            f"Reloaded as {type(model).__name__}, expected MistralMoEForCausalLM"
+        )
+        for idx, layer in enumerate(model.model.layers):
+            assert isinstance(layer.mlp, MoELayer), f"Layer {idx} mlp is {type(layer.mlp).__name__}"
+            assert len(layer.mlp.experts) == 2
+
+    def test_reloaded_expert_weights_match_disk(self, moe_output_dir, saved_state_dict):
+        """Reloading must actually restore the expert weights, not reinitialise them."""
+        from transformers import AutoModelForCausalLM
+
+        from models.utils.common import register_moe_model
+
+        register_moe_model()
+        model = AutoModelForCausalLM.from_pretrained(str(moe_output_dir), local_files_only=True)
+
+        reloaded = model.state_dict()
+        expert_keys = [k for k in saved_state_dict if ".mlp.experts." in k]
+        assert expert_keys, "No expert weights found in the saved checkpoint"
+        for key in expert_keys:
+            assert key in reloaded, f"Expert weight {key} missing after reload"
+            assert torch.equal(saved_state_dict[key], reloaded[key]), (
+                f"Expert weight {key} changed on reload — weights were reinitialised"
+            )

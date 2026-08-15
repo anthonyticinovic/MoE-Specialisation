@@ -29,6 +29,11 @@ jobs:
       # Fail-fast: any step below failing fails the run.
       # Strict lint on the maintained core; research scripts are held to
       # formatting-only (same scoping rationale as mypy below).
+      # Correctness rules run everywhere, including the research scripts: a
+      # refactor once removed an import that was still used, and scoping ruff
+      # to the core meant CI never saw the resulting NameError.
+      - name: Ruff undefined names (whole repo)
+        run: uv run ruff check --select F821,F811,F822 .
       - name: Ruff check (core)
         run: uv run ruff check models/ data/ tests/
       - name: Ruff format (whole repo)

@@ -11,6 +11,31 @@ Research code for [*Expert Collapse and Compositional Failure in Simple Multimod
 AI: Representation, Risk, and Repair** ([PMLR v332](https://proceedings.mlr.press/v332/)).
 See the paper for the full method and results.
 
+## Run it in 30 seconds (no GPU, no data, no downloads)
+
+The full pipeline — Stage 0 → 1 → 2 → 2.5 → 3 — runs on a laptop CPU against
+generated fixtures:
+
+```bash
+uv sync --group dev
+make demo
+```
+
+About 15 seconds. It writes checkpoints, routing metrics, two figures and a
+one-page `demo_output/demo_report.md`.
+
+This runs the **real training scripts**, not a reimplementation: the same
+`train_stage_*.py` files used on the H100 cluster, pointed at a miniature config
+via `MOE_CONFIG`. What differs is only scale and device — a 2-layer/64-hidden
+Mistral, a 4-patch CLIP tower, 24 synthetic images, and CPU fallbacks for FSDP,
+8-bit loading and FlashAttention. Nothing is stubbed.
+
+It is a smoke test, not a result: a randomly-initialised 2-layer model cannot
+caption anything, and the routing metrics sit near an even split. The point is
+that the pipeline, the checkpoint formats and the routing instrumentation are
+verifiably intact — and that a reader can confirm that themselves without a
+cluster.
+
 ## Overview
 
 This project investigates whether intentional modal (vision/text) expert specialisation can emerge in a Mixture-of-Experts (MoE) language model. This creates a testbed that allows us to investigate the process of expert specialisation, particularly across modalities. We replace every FFN layer in Mistral-7B with two experts, one for visual tokens, one for text tokens, and train the model to caption images.
@@ -103,7 +128,7 @@ This is refactored research code, not a product. Before anything will run:
 Using [uv](https://docs.astral.sh/uv/) (recommended for local development):
 
 ```bash
-git clone https://github.com/apticinovic/MoE-Specialisation.git
+git clone https://github.com/anthonyticinovic/MoE-Specialisation.git
 cd MoE-Specialisation
 uv sync                       # creates .venv from the pinned uv.lock
 # prefix commands with `uv run`, e.g. uv run python -m models.utils.create_moe_model ...

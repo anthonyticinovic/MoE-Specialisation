@@ -46,7 +46,7 @@ hpc = [
 ]
 
 [project.urls]
-Repository = "https://github.com/apticinovic/MoE-Specialisation"
+Repository = "https://github.com/anthonyticinovic/MoE-Specialisation"
 
 [dependency-groups]
 dev = [

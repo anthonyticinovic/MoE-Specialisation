@@ -3,6 +3,9 @@ repos:
     rev: v0.6.9
     hooks:
       - id: ruff
+        name: ruff undefined names (whole repo)
+        args: [--select, "F821,F811,F822"]
+      - id: ruff
         name: ruff (core only)
         files: ^(models|data|tests)/
         args: [--fix]

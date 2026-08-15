@@ -5,7 +5,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from transformers import (
@@ -18,7 +18,7 @@ from transformers import (
 from data import COCO_Loader
 from models import VisionLanguageConnector
 import logging
-from models.utils.common import load_config, set_seed, setup_logging
+from models.utils.common import get_device, load_config, set_seed, setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -34,26 +34,32 @@ train_params = config["training_stage1"]
 loader_params = config["dataloader"]
 NUM_EPOCHS = train_params["num_epochs"]
 OUTPUT_DIR = paths["output_dir"]
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = get_device()
+ON_GPU = DEVICE == "cuda"
 
-# --- NEW: Add Gradient Accumulation Steps from config ---
 accumulation_steps = train_params.get("gradient_accumulation_steps", 1)
 
-
 logger.info(f"Using device: {DEVICE}")
-if DEVICE == "cpu":
-    logger.info("WARNING: CUDA not available, using CPU!")
-    exit(1)
+if not ON_GPU:
+    logger.warning(
+        "CUDA not available — running on CPU. Mixed precision, 8-bit loading and "
+        "torch.compile are disabled. This path exists for the CPU demo and local "
+        "smoke tests; real training requires a GPU."
+    )
 
 # --- 2. Load Foundational Models ---
 logger.info("Loading foundational models...")
 vision_encoder = CLIPVisionModel.from_pretrained(paths["clip_local_path"]).to(DEVICE)
 clip_processor = AutoProcessor.from_pretrained(paths["clip_local_path"])
-llm = MistralForCausalLM.from_pretrained(
-    paths["mistral_local_path"],
-    load_in_8bit=True,
-    torch_dtype=torch.bfloat16,  # Use bfloat16 for consistency
+# 8-bit loading needs bitsandbytes + CUDA; on CPU load the model in float32.
+llm_load_kwargs = (
+    {"load_in_8bit": True, "torch_dtype": torch.bfloat16}
+    if ON_GPU
+    else {"torch_dtype": torch.float32}
 )
+llm = MistralForCausalLM.from_pretrained(paths["mistral_local_path"], **llm_load_kwargs)
+if not ON_GPU:
+    llm = llm.to(DEVICE)
 tokenizer = AutoTokenizer.from_pretrained(paths["mistral_local_path"])
 tokenizer.pad_token = tokenizer.eos_token
 
@@ -83,25 +89,34 @@ val_dataset = COCO_Loader(
     split="val",
     seed=loader_params.get("data_seed", 42),  # Same seed ensures consistent splits
 )
+# persistent_workers requires num_workers > 0; pin_memory only helps host→GPU copies.
+num_workers = loader_params["num_workers_s1"]
+loader_kwargs = {
+    "num_workers": num_workers,
+    "pin_memory": ON_GPU,
+    "persistent_workers": num_workers > 0,
+}
 train_loader = DataLoader(
     train_dataset,
     batch_size=train_params["batch_size"],
     shuffle=True,
-    num_workers=loader_params["num_workers_s1"],
-    pin_memory=True,
-    persistent_workers=True,
+    **loader_kwargs,
 )
 val_loader = DataLoader(
     val_dataset,
     batch_size=train_params["batch_size"],
     shuffle=False,
-    num_workers=loader_params["num_workers_s1"],
-    pin_memory=True,  # IMPROVEMENT: Faster data transfer to GPU
-    persistent_workers=True,
+    **loader_kwargs,
 )
 
 # --- 4. Setup Model, Optimizer, and Checkpointing ---
-vision_connector = VisionLanguageConnector().to(DEVICE)
+# Derive the projection dims from the loaded backbones rather than relying on
+# the CLIP ViT-L/14 (1024) → Mistral-7B (4096) defaults, so the script also runs
+# against the tiny models used by the CPU demo.
+vision_connector = VisionLanguageConnector(
+    clip_hidden_size=vision_encoder.config.hidden_size,
+    llm_hidden_size=llm.config.hidden_size,
+).to(DEVICE)
 
 optimizer = optim.AdamW(
     vision_connector.parameters(),
@@ -113,7 +128,8 @@ scheduler = CosineAnnealingLR(
     optimizer, T_max=(len(train_loader) // accumulation_steps) * NUM_EPOCHS
 )
 loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
-scaler = GradScaler()
+# Loss scaling and autocast are GPU-only; on CPU the loop runs in plain float32.
+scaler = GradScaler(DEVICE, enabled=ON_GPU)
 metrics_history = {"epoch": [], "train_loss": [], "val_loss": [], "learning_rate": []}
 best_val_loss = float("inf")
 
@@ -126,7 +142,11 @@ if os.path.exists(latest_model_path):
     logger.debug(f"💾 Loading saved weights from {latest_model_path}")
     vision_connector.load_state_dict(torch.load(latest_model_path, map_location=DEVICE))
 
-vision_connector = torch.compile(vision_connector)
+# torch.compile wraps the module in an OptimizedModule whose state_dict is
+# prefixed; the checkpoint code below unwraps via ._orig_mod. Skipped on CPU,
+# where compilation costs more warm-up time than it saves.
+if ON_GPU:
+    vision_connector = torch.compile(vision_connector)
 
 # --- 5. The Training and Validation Loop ---
 logger.info("🚀 Starting training...")
@@ -148,7 +168,7 @@ for epoch in range(NUM_EPOCHS):
             patch_embeddings = vision_encoder(images).last_hidden_state
             text_embeddings = llm.model.embed_tokens(input_ids)
 
-        with autocast(dtype=torch.bfloat16):
+        with autocast(DEVICE, dtype=torch.bfloat16, enabled=ON_GPU):
             visual_soft_tokens = vision_connector(patch_embeddings)
             num_visual_tokens = visual_soft_tokens.shape[1]
 
@@ -186,7 +206,8 @@ for epoch in range(NUM_EPOCHS):
         del images, input_ids, attention_mask, patch_embeddings, text_embeddings
         del visual_soft_tokens, combined_embeddings, outputs, logits, loss
         gc.collect()
-        torch.cuda.empty_cache()
+        if ON_GPU:
+            torch.cuda.empty_cache()
 
     avg_train_loss = total_train_loss / len(train_loader)
     logger.info(f"Epoch [{epoch + 1}/{NUM_EPOCHS}] - Training Loss: {avg_train_loss:.4f}")
@@ -201,7 +222,7 @@ for epoch in range(NUM_EPOCHS):
                 input_ids.to(DEVICE),
                 attention_mask.to(DEVICE),
             )
-            with autocast(dtype=torch.bfloat16):
+            with autocast(DEVICE, dtype=torch.bfloat16, enabled=ON_GPU):
                 patch_embeddings = vision_encoder(images).last_hidden_state
                 text_embeddings = llm.model.embed_tokens(input_ids)
                 visual_soft_tokens = vision_connector(patch_embeddings)
@@ -225,8 +246,9 @@ for epoch in range(NUM_EPOCHS):
     logger.info(f"Epoch [{epoch + 1}/{NUM_EPOCHS}] - Validation Loss: {avg_val_loss:.4f}")
 
     # --- Early Stopping and Checkpointing Logic ---
-    # Access the original model with ._orig_mod to get a compatible state dict
-    state_to_save = vision_connector._orig_mod.state_dict()
+    # Unwrap torch.compile's OptimizedModule so the saved state dict is loadable
+    # by an uncompiled VisionLanguageConnector.
+    state_to_save = getattr(vision_connector, "_orig_mod", vision_connector).state_dict()
 
     # Save the clean state for the latest checkpoint
     torch.save(state_to_save, latest_model_path)

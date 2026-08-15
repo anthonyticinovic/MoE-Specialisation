@@ -47,6 +47,9 @@ results/
 *.out
 *.err
 
+# CPU demo artifacts (regenerate with `make demo`)
+demo_output/
+
 # OS files
 .DS_Store
 .DS_Store?
@@ -75,3 +78,4 @@ Thumbs.db
 # Local-only: AI assistant guidance and legacy conda env
 CLAUDE.md
 environment.yml
+docs/improvement-plan.md

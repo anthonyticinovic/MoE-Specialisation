@@ -19,7 +19,7 @@ import shutil
 
 from transformers import MistralForCausalLM
 
-from models.custom_mistral import MistralMoEForCausalLM
+from models.custom_mistral import MistralMoEConfig, MistralMoEForCausalLM
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +43,14 @@ def create_moe_model(base_model_path: str, output_path: str) -> None:
     llm_base = MistralForCausalLM.from_pretrained(base_model_path)
 
     logger.info("Creating MistralMoEForCausalLM...")
-    llm_moe = MistralMoEForCausalLM(llm_base.config)
+    # Build a genuine MistralMoEConfig rather than reusing the base MistralConfig.
+    # PretrainedConfig.to_dict() reads model_type from the config *class*, so
+    # passing the base config here would save config.json with
+    # model_type="mistral" — and the checkpoint would then silently load as a
+    # dense MistralForCausalLM (with randomly initialised FFNs) for any caller
+    # that omits trust_remote_code=True.
+    moe_config = MistralMoEConfig(**llm_base.config.to_dict())
+    llm_moe = MistralMoEForCausalLM(moe_config)
 
     logger.info("Copying weights...")
     llm_moe.load_state_dict(llm_base.state_dict(), strict=False)
@@ -52,7 +59,8 @@ def create_moe_model(base_model_path: str, output_path: str) -> None:
         layer_moe.mlp.experts[1].load_state_dict(layer_base.mlp.state_dict())
     logger.info("Weights copied.")
 
-    llm_moe.config.model_type = "mistral_moe"
+    # model_type now comes from MistralMoEConfig itself; only architectures
+    # needs setting so the saved config names the concrete class.
     llm_moe.config.architectures = ["MistralMoEForCausalLM"]
 
     logger.info("Saving MoE model to %s...", output_path)

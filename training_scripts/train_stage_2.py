@@ -11,8 +11,6 @@ import torch.optim as optim
 from torch.amp import GradScaler, autocast
 from torch.distributed.fsdp import (
     CPUOffload,
-    FullStateDictConfig,
-    StateDictType,
 )
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
@@ -22,6 +20,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from transformers import (
+    AutoModelForCausalLM,
     AutoProcessor,
     AutoTokenizer,
     CLIPVisionModel,
@@ -31,7 +30,16 @@ from transformers.models.mistral.modeling_mistral import MistralMLP
 from data import COCO_Loader
 from models import VisionLanguageConnector
 import logging
-from models.utils.common import load_config, register_moe_model, setup_logging
+from models.utils.common import (
+    full_state_dict_context,
+    get_attn_implementation,
+    get_model_dtype,
+    init_distributed,
+    load_config,
+    register_moe_model,
+    setup_logging,
+    supports_fsdp,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,16 +58,26 @@ OUTPUT_DIR = paths["output_dir"]
 STAGE2_CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "stage2_checkpoints")
 
 # --- Initialize the distributed environment ---
-dist.init_process_group("nccl")
-local_rank = int(os.environ["LOCAL_RANK"])
+# torchrun sets LOCAL_RANK; when it is absent this is a plain single-process
+# run (the CPU demo), so a single-rank gloo group is initialised instead.
+USE_FSDP = supports_fsdp()
+local_rank = int(os.environ.get("LOCAL_RANK", 0))
+init_distributed(local_rank)
 setup_logging(local_rank)
-torch.cuda.set_device(local_rank)
-DEVICE = local_rank
+
+if USE_FSDP:
+    torch.cuda.set_device(local_rank)
+    DEVICE = local_rank
+else:
+    DEVICE = "cpu"
+# autocast/GradScaler take a device *type* string, whereas DEVICE is an ordinal
+# under FSDP.
+AMP_DEVICE = "cuda" if USE_FSDP else "cpu"
 
 if local_rank == 0:
     logger.info("--- Initializing Stage 2 Training ---")
     logger.info(f"PyTorch: {torch.__version__}")
-logger.info(f"--- Rank {local_rank} --- Using device: cuda:{DEVICE}")
+logger.info(f"--- Rank {local_rank} --- Using device: {DEVICE}")
 
 # ====================================================================================
 # 3. MODEL LOADING
@@ -80,8 +98,8 @@ llm = AutoModelForCausalLM.from_pretrained(
     moe_model_path,
     trust_remote_code=True,
     local_files_only=True,
-    torch_dtype=torch.bfloat16,
-    attn_implementation="flash_attention_2",
+    torch_dtype=get_model_dtype(),
+    attn_implementation=get_attn_implementation(),
 )
 
 if local_rank == 0:
@@ -118,20 +136,26 @@ my_auto_wrap_policy = partial(
     },
 )
 
-llm = FSDP(
-    llm,
-    device_id=torch.cuda.current_device(),
-    auto_wrap_policy=my_auto_wrap_policy,
-    cpu_offload=CPUOffload(offload_params=True),
-    mixed_precision=torch.distributed.fsdp.MixedPrecision(
-        param_dtype=torch.bfloat16,
-        reduce_dtype=torch.bfloat16,
-        buffer_dtype=torch.bfloat16,
-    ),
-    use_orig_params=True,
-    ignored_modules=ignored_modules,
-)
-logger.info(f"--- Rank {local_rank} --- ✅ Model wrapped with FSDP.")
+if USE_FSDP:
+    llm = FSDP(
+        llm,
+        device_id=torch.cuda.current_device(),
+        auto_wrap_policy=my_auto_wrap_policy,
+        cpu_offload=CPUOffload(offload_params=True),
+        mixed_precision=torch.distributed.fsdp.MixedPrecision(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.bfloat16,
+            buffer_dtype=torch.bfloat16,
+        ),
+        use_orig_params=True,
+        ignored_modules=ignored_modules,
+    )
+    logger.info(f"--- Rank {local_rank} --- ✅ Model wrapped with FSDP.")
+else:
+    # CPU demo: sharding is a no-op at one rank, so the model is used directly.
+    # The training loop below is unchanged either way.
+    llm = llm.to(DEVICE)
+    logger.info(f"--- Rank {local_rank} --- FSDP skipped (CPU); using the model unwrapped.")
 
 # --- MODIFIED: Robust 'best' and 'latest' checkpoint loading ---
 latest_epoch = 0
@@ -144,7 +168,7 @@ if local_rank == 0:
     if os.path.exists(latest_checkpoint_path):
         checkpoint_found.fill_(1.0)
     else:
-        logger.info("�� No checkpoint found. Starting training from scratch.")
+        logger.info("No checkpoint found. Starting training from scratch.")
 
 dist.broadcast(checkpoint_found, src=0)
 
@@ -152,8 +176,7 @@ if checkpoint_found.item() == 1.0:
     if local_rank == 0:
         logger.debug(f"💾 Found latest checkpoint. Resuming training...")
 
-    load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-    with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
+    with full_state_dict_context(llm):
         if local_rank == 0:
             checkpoint = torch.load(latest_checkpoint_path, map_location="cpu", weights_only=False)
             state_dict_to_load = checkpoint["model_state_dict"]
@@ -191,12 +214,16 @@ llm.model.embed_tokens.to(DEVICE)
 
 llm.gradient_checkpointing_enable()
 
-vision_connector = VisionLanguageConnector().to(DEVICE)
+vision_connector = VisionLanguageConnector(
+    clip_hidden_size=vision_encoder.config.hidden_size,
+    llm_hidden_size=llm.config.hidden_size,
+).to(DEVICE)
 stage1_weights_path = os.path.join(OUTPUT_DIR, "vision_connector_stage1_best.pth")
 if os.path.exists(stage1_weights_path):
     if local_rank == 0:
         logger.debug(f"💾 Loading Stage 1 Vision Connector weights from {stage1_weights_path}")
-    map_loc = f"cuda:{DEVICE}"
+    # DEVICE is a CUDA ordinal under FSDP and the string "cpu" otherwise.
+    map_loc = f"cuda:{DEVICE}" if USE_FSDP else DEVICE
     state_dict = torch.load(stage1_weights_path, map_location=map_loc)
     vision_connector.load_state_dict(state_dict)
 else:
@@ -240,14 +267,14 @@ train_loader = DataLoader(
     batch_size=train_params["batch_size"],
     sampler=train_sampler,
     num_workers=loader_params["num_workers"],
-    pin_memory=True,
+    pin_memory=USE_FSDP,
 )
 val_loader = DataLoader(
     val_dataset,
     batch_size=train_params["batch_size"],
     sampler=val_sampler,
     num_workers=loader_params["num_workers"],
-    pin_memory=True,
+    pin_memory=USE_FSDP,
 )
 
 accumulation_steps = train_params.get("gradient_accumulation_steps", 1)
@@ -264,7 +291,7 @@ optimizer = optim.AdamW(
     weight_decay=train_params["weight_decay"],
     fused=True,
 )
-scaler = GradScaler()
+scaler = GradScaler(AMP_DEVICE, enabled=USE_FSDP)
 total_steps = (len(train_loader) // accumulation_steps) * NUM_EPOCHS
 scheduler = CosineAnnealingLR(optimizer, T_max=total_steps)
 loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
@@ -325,7 +352,7 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
             attention_mask.to(DEVICE),
         )
 
-        with autocast(device_type="cuda", dtype=torch.bfloat16):
+        with autocast(device_type=AMP_DEVICE, dtype=torch.bfloat16, enabled=USE_FSDP):
             with torch.no_grad():
                 patch_embeddings = vision_encoder(images).last_hidden_state
                 visual_soft_tokens = vision_connector(patch_embeddings)
@@ -393,7 +420,7 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
                 input_ids.to(DEVICE),
                 attention_mask.to(DEVICE),
             )
-            with autocast(device_type="cuda", dtype=torch.bfloat16):
+            with autocast(device_type=AMP_DEVICE, dtype=torch.bfloat16, enabled=USE_FSDP):
                 patch_embeddings = vision_encoder(images).last_hidden_state
                 visual_soft_tokens = vision_connector(patch_embeddings)
                 text_embeddings = llm.model.embed_tokens(input_ids)
@@ -456,8 +483,7 @@ for epoch in range(latest_epoch, NUM_EPOCHS):
         logger.info(f"✅ Metrics saved to {metrics_path}")
 
     # --- MODIFIED: 'best' and 'latest' checkpoint saving ---
-    save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-    with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, save_policy):
+    with full_state_dict_context(llm):
         cpu_state_dict = llm.state_dict()
 
     if local_rank == 0:

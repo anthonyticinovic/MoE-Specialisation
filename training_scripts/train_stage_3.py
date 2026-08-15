@@ -14,8 +14,6 @@ import torch.optim as optim
 from torch.amp import GradScaler, autocast
 from torch.distributed.fsdp import (
     CPUOffload,
-    FullStateDictConfig,
-    StateDictType,
 )
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
@@ -35,7 +33,17 @@ from transformers.models.mistral.modeling_mistral import MistralMLP
 from data import COCO_Loader, LLaVA_Loader
 from models import VisionLanguageConnector
 import logging
-from models.utils.common import load_config, register_moe_model, setup_logging
+from models.utils.common import (
+    full_state_dict_context,
+    get_attn_implementation,
+    get_model_dtype,
+    init_distributed,
+    load_config,
+    register_moe_model,
+    setup_logging,
+    supports_fsdp,
+    unwrap_model,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -237,12 +245,17 @@ import datetime
 # Note: Set timeout to 60 minutes for large checkpoint loading operations
 # Default is 10 minutes which is too short for FSDP checkpoint loading
 timeout = datetime.timedelta(minutes=60)
-dist.init_process_group("nccl", timeout=timeout)
-
-local_rank = int(os.environ["LOCAL_RANK"])
+USE_FSDP = supports_fsdp()
+local_rank = int(os.environ.get("LOCAL_RANK", 0))
+init_distributed(local_rank, timeout=timeout)
 setup_logging(local_rank)
-torch.cuda.set_device(local_rank)
-DEVICE = local_rank
+if USE_FSDP:
+    torch.cuda.set_device(local_rank)
+    DEVICE = local_rank
+else:
+    DEVICE = "cpu"
+# autocast/GradScaler take a device *type* string; DEVICE may be an ordinal.
+AMP_DEVICE = "cuda" if USE_FSDP else "cpu"
 
 if local_rank == 0:
     # CHANGED: Print statement for Stage 3
@@ -255,6 +268,9 @@ if local_rank == 0:
 if local_rank == 0:
     logger.info("Loading foundational models...")
 vision_encoder = CLIPVisionModel.from_pretrained(paths["clip_local_path"]).to(DEVICE)
+# Patch grid plus the CLS token: 257 for CLIP ViT-L/14 at 224px, smaller for the
+# demo's tiny tower. Drives the visual/text split in the routing metrics.
+NUM_VISUAL_TOKENS = (vision_encoder.config.image_size // vision_encoder.config.patch_size) ** 2 + 1
 # Note: Set vision encoder to eval mode since it's frozen - prevents dropout/stochastic behavior
 vision_encoder.eval()
 clip_processor = AutoProcessor.from_pretrained(paths["clip_local_path"])
@@ -267,8 +283,8 @@ llm = AutoModelForCausalLM.from_pretrained(
     moe_model_path,
     trust_remote_code=True,
     local_files_only=True,
-    torch_dtype=torch.bfloat16,
-    attn_implementation="flash_attention_2",
+    torch_dtype=get_model_dtype(),
+    attn_implementation=get_attn_implementation(),
     low_cpu_mem_usage=True,
 )
 
@@ -332,7 +348,10 @@ for name, param in llm.named_parameters():
         if local_rank == 0 and "layers.0" in name:  # Print first layer as example
             logger.info(f"  Unfrozen: {name}")
 
-vision_connector = VisionLanguageConnector().to(DEVICE)
+vision_connector = VisionLanguageConnector(
+    clip_hidden_size=vision_encoder.config.hidden_size,
+    llm_hidden_size=llm.config.hidden_size,
+).to(DEVICE)
 # Keep vision connector frozen (already trained in Stage 1)
 for param in vision_connector.parameters():
     param.requires_grad = False
@@ -373,25 +392,29 @@ if local_rank == 0:
 llm.model.embed_tokens.to(DEVICE)
 
 # Note: Cache embedding layer reference before FSDP wrapping to avoid accessing
-# llm.module.* in the training loop (safer and avoids potential FSDP interactions)
+# unwrap_model(llm).* in the training loop (safer and avoids potential FSDP interactions)
 embed_tokens_layer = llm.model.embed_tokens
 
 # Note: FSDP configuration mirrors Stage 2.5 exactly (kept identical on purpose)
 # device_id must be DEVICE (local_rank as int), NOT torch.cuda.current_device()
 # cpu_offload must be CPUOffload(offload_params=None), NOT False
-llm = FSDP(
-    llm,
-    device_id=DEVICE,
-    auto_wrap_policy=my_auto_wrap_policy,
-    cpu_offload=CPUOffload(offload_params=None),
-    mixed_precision=torch.distributed.fsdp.MixedPrecision(
-        param_dtype=torch.bfloat16,
-        reduce_dtype=torch.bfloat16,
-        buffer_dtype=torch.bfloat16,
-    ),
-    use_orig_params=True,
-    ignored_modules=ignored_modules,
-)
+if USE_FSDP:
+    llm = FSDP(
+        llm,
+        device_id=DEVICE,
+        auto_wrap_policy=my_auto_wrap_policy,
+        cpu_offload=CPUOffload(offload_params=None),
+        mixed_precision=torch.distributed.fsdp.MixedPrecision(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.bfloat16,
+            buffer_dtype=torch.bfloat16,
+        ),
+        use_orig_params=True,
+        ignored_modules=ignored_modules,
+    )
+else:
+    # CPU demo: sharding is a no-op at one rank; the loop below is unchanged.
+    llm = llm.to(DEVICE)
 
 # ====================================================================================
 # 6. LOAD STAGE 2 CHECKPOINT (EXACT PATTERN FROM TRAIN_STAGE_2.PY)
@@ -427,8 +450,7 @@ if checkpoint_found.item() == 1.0:
 
     # Load the state dict into the FSDP model
     # Use rank0_only=True for GPU-count agnostic loading
-    load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-    with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
+    with full_state_dict_context(llm, rank0_only=True):
         missing_keys, unexpected_keys = llm.load_state_dict(state_dict, strict=False)
 
         if local_rank == 0:
@@ -456,8 +478,8 @@ elif local_rank == 0:
 
 dist.barrier()
 
-# Note: Do NOT access llm.module.model.layers after FSDP wrapping!
-# Accessing FSDP internals (even just len(llm.module.model.layers)) can trigger
+# Note: Do NOT access unwrap_model(llm).model.layers after FSDP wrapping!
+# Accessing FSDP internals (even just len(unwrap_model(llm).model.layers)) can trigger
 # collective operations on rank 0 only, corrupting execution order tracking.
 # This causes "newly-added parameter" errors during the first backward pass.
 
@@ -488,7 +510,8 @@ dist.broadcast(connector_found, src=0)
 if connector_found.item() == 1.0:
     if local_rank == 0:
         logger.debug(f"💾 Loading Stage 1 Vision Connector weights from {stage1_weights_path}")
-    map_loc = f"cuda:{DEVICE}"
+    # DEVICE is a CUDA ordinal under FSDP and the string "cpu" otherwise.
+    map_loc = f"cuda:{DEVICE}" if USE_FSDP else DEVICE
     vision_connector.load_state_dict(torch.load(stage1_weights_path, map_location=map_loc))
     if local_rank == 0:
         logger.info("✅ Vision Connector weights loaded successfully on all ranks.")
@@ -573,14 +596,14 @@ train_loader = DataLoader(
     batch_size=train_params["batch_size"],
     sampler=train_sampler,
     num_workers=loader_params["num_workers"],
-    pin_memory=True,
+    pin_memory=USE_FSDP,
 )
 val_loader = DataLoader(
     val_dataset,
     batch_size=train_params["batch_size"],
     sampler=val_sampler,
     num_workers=loader_params["num_workers"],
-    pin_memory=True,
+    pin_memory=USE_FSDP,
 )
 
 accumulation_steps = train_params.get("gradient_accumulation_steps", 1)
@@ -596,7 +619,7 @@ optimizer = optim.AdamW(
 )
 # Note: GradScaler is not compatible with bfloat16 (only float16)
 # Since we use bfloat16, we don't need GradScaler (bfloat16 has better numerical stability)
-scaler = GradScaler(enabled=False)  # Disabled for bfloat16
+scaler = GradScaler(AMP_DEVICE, enabled=False)  # Disabled for bfloat16
 total_steps = (len(train_loader) // accumulation_steps) * NUM_EPOCHS
 scheduler = CosineAnnealingLR(optimizer, T_max=total_steps)
 
@@ -633,8 +656,7 @@ if resume_tensor.item() == 1.0:
     model_state_dict = checkpoint["model_state_dict"]
 
     # Use rank0_only=True for GPU-count agnostic loading
-    load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-    with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, load_policy):
+    with full_state_dict_context(llm, rank0_only=True):
         llm.load_state_dict(model_state_dict, strict=False)
 
     # Load vision connector (not FSDP-wrapped, so normal load)
@@ -778,12 +800,12 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             )
             use_llava_labels = False
 
-        with autocast(device_type="cuda", dtype=torch.bfloat16):
+        with autocast(device_type=AMP_DEVICE, dtype=torch.bfloat16, enabled=USE_FSDP):
             with torch.no_grad():
                 patch_embeddings = vision_encoder(images).last_hidden_state
 
             visual_soft_tokens = vision_connector(patch_embeddings)
-            # Use cached embedding layer to avoid llm.module.* access
+            # Use cached embedding layer to avoid unwrap_model(llm).* access
             text_embeddings = embed_tokens_layer(input_ids)
             combined_embeddings = torch.cat([visual_soft_tokens, text_embeddings], dim=1)
             combined_attention_mask = torch.cat(
@@ -880,9 +902,14 @@ for epoch in range(start_epoch, NUM_EPOCHS):
     # Initialize expert usage tracker (rank 0 only for efficiency)
     expert_tracker = None
     if local_rank == 0:
-        # CLIP ViT-Large/14 produces 257 visual tokens (256 patches + 1 CLS token)
-        # Positions 0-256 are visual, 257+ are text tokens
-        expert_tracker = ExpertUsageTracker(num_layers=32, num_experts=2, visual_token_end=256)
+        # Sized from the loaded backbones rather than the 7B/ViT-L constants
+        # (32 layers, 257 visual tokens), so the tracker is also correct for the
+        # tiny models used by the CPU demo.
+        expert_tracker = ExpertUsageTracker(
+            num_layers=llm.config.num_hidden_layers,
+            num_experts=2,
+            visual_token_end=NUM_VISUAL_TOKENS - 1,
+        )
         logger.debug(
             f"\n📊 Running validation (all ranks, max {MAX_VAL_BATCHES} batches per GPU)..."
         )
@@ -916,10 +943,10 @@ for epoch in range(start_epoch, NUM_EPOCHS):
 
             # Note: Don't use try-except with break - it can cause ranks to diverge
             # Instead, just skip failed batches but continue the loop
-            with autocast(device_type="cuda", dtype=torch.bfloat16):
+            with autocast(device_type=AMP_DEVICE, dtype=torch.bfloat16, enabled=USE_FSDP):
                 patch_embeddings = vision_encoder(images).last_hidden_state
                 visual_soft_tokens = vision_connector(patch_embeddings)
-                # Use cached embedding layer to avoid llm.module.* access
+                # Use cached embedding layer to avoid unwrap_model(llm).* access
                 text_embeddings = embed_tokens_layer(input_ids)
                 combined_embeddings = torch.cat([visual_soft_tokens, text_embeddings], dim=1)
                 combined_attention_mask = torch.cat(
@@ -945,8 +972,8 @@ for epoch in range(start_epoch, NUM_EPOCHS):
                     )
 
                     # Access the unwrapped model to get MoE layers
-                    # For FSDP, the actual model is in llm.module if wrapped, else llm directly
-                    model_to_inspect = llm.module if hasattr(llm, "module") else llm
+                    # For FSDP, the actual model is in unwrap_model(llm) if wrapped, else llm directly
+                    model_to_inspect = unwrap_model(llm) if hasattr(llm, "module") else llm
 
                     # Iterate through layers and collect router logits
                     for layer_idx, layer in enumerate(model_to_inspect.model.layers):
@@ -1032,13 +1059,16 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             for expert, pct in agg["visual_routing"].items():
                 logger.info(f"      {expert}: {pct}%")
         if "text_routing" in agg:
-            logger.info(f"   Text Tokens (positions 257+):")
+            logger.info(f"   Text Tokens (positions {NUM_VISUAL_TOKENS}+):")
             for expert, pct in agg["text_routing"].items():
                 logger.info(f"      {expert}: {pct}%")
 
-        # Sample per-layer metrics (first, middle, last layers)
-        logger.debug(f"\n📋 Sample Per-Layer Metrics (Layers 0, 15, 31):")
-        for layer_idx in [0, 15, 31]:
+        # Sample per-layer metrics: first, middle and last layer of whatever
+        # depth the loaded model actually has.
+        num_reported_layers = len(expert_metrics["per_layer"])
+        sample_layers = sorted({0, num_reported_layers // 2, num_reported_layers - 1})
+        logger.debug(f"\n📋 Sample Per-Layer Metrics (Layers {sample_layers}):")
+        for layer_idx in sample_layers:
             layer_metrics = expert_metrics["per_layer"][layer_idx]
             logger.info(f"\n   Layer {layer_idx}:")
             logger.info(f"      Expert Load: {layer_metrics['expert_load_distribution']}")
@@ -1083,10 +1113,10 @@ for epoch in range(start_epoch, NUM_EPOCHS):
 
     # Force garbage collection and clear cache before checkpoint saving
     gc.collect()
-    torch.cuda.empty_cache()
+    if USE_FSDP:
+        torch.cuda.empty_cache()
 
-    save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-    with FSDP.state_dict_type(llm, StateDictType.FULL_STATE_DICT, save_policy):
+    with full_state_dict_context(llm, rank0_only=True):
         llm_state_dict = llm.state_dict()
 
     connector_state_dict = vision_connector.state_dict()
@@ -1150,7 +1180,8 @@ for epoch in range(start_epoch, NUM_EPOCHS):
 
     # Force memory cleanup after checkpoint operations
     gc.collect()
-    torch.cuda.empty_cache()
+    if USE_FSDP:
+        torch.cuda.empty_cache()
 
     dist.barrier()
 
