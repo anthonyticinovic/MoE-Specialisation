@@ -115,6 +115,10 @@ for name, param in llm.named_parameters():
 # ====================================================================================
 # 5. FSDP WRAPPING & CHECKPOINTING
 # ====================================================================================
+# Number of layers carrying a router gate — used to turn the layer-summed
+# entropy bonus into a reportable mean.
+num_moe_layers = sum(1 for layer in llm.model.layers if hasattr(layer.mlp, "gate"))
+
 my_auto_wrap_policy = partial(transformer_auto_wrap_policy, transformer_layer_cls={MistralMLP})
 ignored_modules = [llm.model.embed_tokens]
 
@@ -380,6 +384,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
         logger.info(f"  Router temperature for epoch {epoch + 1}: {temperature:.3f}")
 
     total_train_loss, total_ce_loss, total_lb_loss = 0, 0, 0
+    epoch_entropy_sum, epoch_entropy_batches = 0.0, 0
     optimizer.zero_grad()
 
     for i, (images, input_ids, attention_mask) in enumerate(train_loader):
@@ -488,12 +493,11 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             if isinstance(total_load_balancing_loss, torch.Tensor):
                 total_lb_loss += total_load_balancing_loss.item()
             if isinstance(total_entropy_bonus, torch.Tensor):
-                # Track average entropy (will be added to metrics later)
-                if not hasattr(torch.cuda, "_total_entropy"):
-                    torch.cuda._total_entropy = 0
-                    torch.cuda._entropy_count = 0
-                torch.cuda._total_entropy += total_entropy_bonus.item()
-                torch.cuda._entropy_count += 1
+                # total_entropy_bonus is summed over layers for the loss term;
+                # divide by the layer count so the *reported* value is a mean
+                # per-layer entropy and stays within [0, ln(num_experts)].
+                epoch_entropy_sum += total_entropy_bonus.item() / num_moe_layers
+                epoch_entropy_batches += 1
 
         # ====================================================================================
         # SOLUTION 3: ROUTER MONITORING (Enhanced with modality-specific routing)
@@ -557,13 +561,8 @@ for epoch in range(start_epoch, NUM_EPOCHS):
     avg_ce_loss = total_ce_loss / len(train_loader)
     avg_lb_loss = total_lb_loss / len(train_loader)
 
-    # Calculate average entropy
-    avg_entropy = 0
-    if hasattr(torch.cuda, "_total_entropy") and torch.cuda._entropy_count > 0:
-        avg_entropy = torch.cuda._total_entropy / torch.cuda._entropy_count
-        # Reset for next epoch
-        torch.cuda._total_entropy = 0
-        torch.cuda._entropy_count = 0
+    # Mean per-layer routing entropy over the epoch, bounded by ln(num_experts).
+    avg_entropy = epoch_entropy_sum / epoch_entropy_batches if epoch_entropy_batches else 0
 
     if local_rank == 0:
         logger.info(

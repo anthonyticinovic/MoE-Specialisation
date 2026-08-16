@@ -115,3 +115,58 @@ class TestTinyModels:
         visual_tokens = (vision.image_size // vision.patch_size) ** 2 + 1
         # COCO_Loader pads captions to max_length=128.
         assert visual_tokens + 128 <= llm.max_position_embeddings
+
+
+class TestRunHygiene:
+    """Regression tests for stale-state bugs in the demo runner."""
+
+    def test_fixtures_are_deterministic(self, tmp_path):
+        """Two builds must produce byte-identical models.
+
+        Without this, consecutive demo runs train against different random
+        weights and their reported numbers cannot be compared.
+        """
+        import torch
+        from safetensors.torch import load_file
+
+        weights = []
+        for build_index in range(2):
+            root = tmp_path / f"build_{build_index}"
+            build_fixtures.build(root, num_images=4)
+            weights.append(load_file(str(root / "fixtures" / "base_llm" / "model.safetensors")))
+
+        first, second = weights
+        assert first, "No weights were compared"
+        assert first.keys() == second.keys()
+        for key in first:
+            assert torch.equal(first[key], second[key]), f"{key} differs between builds"
+
+    def test_reset_removes_previous_run_outputs(self, tmp_path):
+        """Checkpoints must not outlive the fixtures they were trained against.
+
+        The training scripts resume from `*_latest.pth`, so a surviving run
+        directory silently mixes weights from two different models — and,
+        because the epoch loop is range(start_epoch, NUM_EPOCHS), a completed
+        run makes the next one train for zero epochs while reporting success.
+        """
+        from demo.run_demo import _reset_run_artifacts
+
+        for name in ("runs", "figures", "logs"):
+            directory = tmp_path / name
+            directory.mkdir(parents=True)
+            (directory / "stale.txt").write_text("from a previous run")
+        fixtures = tmp_path / "fixtures"
+        fixtures.mkdir()
+        (fixtures / "keep.txt").write_text("rebuilt separately")
+
+        _reset_run_artifacts(tmp_path)
+
+        for name in ("runs", "figures", "logs"):
+            assert not (tmp_path / name).exists(), f"{name}/ survived the reset"
+        assert (fixtures / "keep.txt").exists(), "fixtures/ must be left to build_fixtures"
+
+    def test_reset_is_safe_on_a_clean_directory(self, tmp_path):
+        """First run has nothing to clear."""
+        from demo.run_demo import _reset_run_artifacts
+
+        _reset_run_artifacts(tmp_path)

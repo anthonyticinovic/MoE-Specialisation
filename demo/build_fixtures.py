@@ -203,10 +203,12 @@ def write_config(root: Path, fixtures: Path, output_dir: Path) -> Path:
             "moe_model_path": str(fixtures / "moe_model"),
             "output_dir": str(output_dir),
         },
-        # One epoch, tiny batches: the demo proves the pipeline runs and that
-        # routing metrics are produced, not that the model learns to caption.
+        # A few short epochs, tiny batches: enough for the loss curves to have
+        # a shape worth looking at, while keeping the whole run well under a
+        # minute. The demo proves the pipeline runs and that routing metrics
+        # are produced, not that the model learns to caption.
         "training_stage1": {
-            "num_epochs": 1,
+            "num_epochs": 3,
             "batch_size": 4,
             "learning_rate": 1e-3,
             "subset_fraction": 1.0,
@@ -214,7 +216,7 @@ def write_config(root: Path, fixtures: Path, output_dir: Path) -> Path:
             "gradient_accumulation_steps": 1,
         },
         "training_stage2": {
-            "num_epochs": 1,
+            "num_epochs": 3,
             "batch_size": 4,
             "learning_rate": 1e-3,
             "weight_decay": 0.01,
@@ -222,7 +224,7 @@ def write_config(root: Path, fixtures: Path, output_dir: Path) -> Path:
             "gradient_accumulation_steps": 1,
         },
         "training_stage2.5": {
-            "num_epochs": 1,
+            "num_epochs": 3,
             "batch_size": 4,
             "learning_rate": 1e-3,
             "weight_decay": 0.01,
@@ -231,7 +233,7 @@ def write_config(root: Path, fixtures: Path, output_dir: Path) -> Path:
             "load_balancing_coeff": 0.01,
         },
         "training_stage3": {
-            "num_epochs": 1,
+            "num_epochs": 3,
             "batch_size": 2,
             "learning_rate": 1e-3,
             "weight_decay": 0.01,
@@ -245,7 +247,7 @@ def write_config(root: Path, fixtures: Path, output_dir: Path) -> Path:
             "dataset": "llava",
         },
         "dense_control": {
-            "num_epochs": 1,
+            "num_epochs": 3,
             "batch_size": 4,
             "learning_rate": 1e-3,
             "weight_decay": 0.01,
@@ -264,7 +266,16 @@ def write_config(root: Path, fixtures: Path, output_dir: Path) -> Path:
 
 
 def build(output_root: Path, num_images: int = 24, seed: int = 42) -> Path:
-    """Build every fixture and return the path to the demo config."""
+    """Build every fixture and return the path to the demo config.
+
+    Seeded so repeated builds produce byte-identical models: two demo runs are
+    then directly comparable, and a change in the reported numbers means the
+    code changed rather than the fixtures.
+    """
+    import torch
+
+    torch.manual_seed(seed)
+
     fixtures = output_root / "fixtures"
     fixtures.mkdir(parents=True, exist_ok=True)
 

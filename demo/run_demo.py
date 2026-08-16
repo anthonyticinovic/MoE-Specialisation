@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -44,6 +45,20 @@ STAGES: dict[str, tuple[str, list[str]]] = {
     ),
 }
 DEFAULT_STAGES = ["0", "1", "2", "2.5", "3"]
+
+
+def _reset_run_artifacts(output_root: Path) -> None:
+    """Delete everything produced by a previous run, keeping the directory itself.
+
+    Only the fixtures are rebuilt by ``build_fixtures``; checkpoints, metrics,
+    figures and logs are outputs and must not survive into a run against
+    freshly-built fixtures.
+    """
+    for name in ("runs", "figures", "logs"):
+        target = output_root / name
+        if target.exists():
+            shutil.rmtree(target)
+            logger.info("Cleared stale %s/", name)
 
 
 def _run(label: str, command: list[str], env: dict[str, str], log_path: Path) -> tuple[bool, float]:
@@ -80,15 +95,23 @@ def main() -> int:
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     output_root = (REPO_ROOT / args.output).resolve()
-    logs_dir = output_root / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
+    output_root.mkdir(parents=True, exist_ok=True)
 
     config_path = output_root / "demo_config.yaml"
     if args.keep_fixtures and config_path.exists():
         logger.info("Reusing fixtures in %s", output_root)
     else:
         logger.info("Building synthetic fixtures...")
+        # Checkpoints belong to the fixtures they were trained against. The
+        # training scripts resume from `*_latest.pth` when one exists, so a
+        # stale run directory would either mix weights from two different
+        # models or — because the epoch loop is range(start_epoch, NUM_EPOCHS)
+        # — skip training entirely while still reporting success.
+        _reset_run_artifacts(output_root)
         config_path = build_fixtures.build(output_root, args.num_images)
+
+    logs_dir = output_root / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
 
     fixtures = output_root / "fixtures"
     STAGES["0"] = (
@@ -123,17 +146,31 @@ def main() -> int:
             logger.error("\nPipeline stopped at %s.", label)
             break
 
-    report_path = report.write_report(output_root, results)
+    report_path, check_results = report.write_report(output_root, results)
     total = sum(elapsed for _, _, elapsed in results)
 
-    logger.info("\n%s", "─" * 58)
-    if all(ok for _, ok, _ in results) and len(results) == len(args.stages):
-        logger.info("All %d stages passed in %.1fs", len(results), total)
-        logger.info("Report: %s", report_path)
-        return 0
+    stages_ok = all(ok for _, ok, _ in results) and len(results) == len(args.stages)
+    failed_checks = [check for check in check_results if not check.passed]
 
-    logger.error("Pipeline failed after %.1fs. Report: %s", total, report_path)
-    return 1
+    logger.info("\n%s", "─" * 58)
+    if stages_ok:
+        logger.info("All %d stages passed in %.1fs", len(results), total)
+    else:
+        logger.error("Pipeline failed after %.1fs", total)
+
+    # A stage exiting zero is not the same as the pipeline being correct: the
+    # invariants are what catch a refactor that runs cleanly but behaves wrongly.
+    if failed_checks:
+        logger.error("\n%d invariant(s) FAILED:", len(failed_checks))
+        for check in failed_checks:
+            logger.error("  ✗ %s", check.name)
+            logger.error("      %s", check.detail)
+    else:
+        passed = sum(1 for check in check_results if check.passed and not check.skipped)
+        logger.info("All %d invariants passed", passed)
+
+    logger.info("Report: %s", report_path)
+    return 0 if stages_ok and not failed_checks else 1
 
 
 if __name__ == "__main__":

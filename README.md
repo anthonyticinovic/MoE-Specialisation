@@ -21,8 +21,17 @@ uv sync --group dev
 make demo
 ```
 
-About 15 seconds. It writes checkpoints, routing metrics, two figures and a
+About 17 seconds. It writes checkpoints, routing metrics, four figures and a
 one-page `demo_output/demo_report.md`.
+
+The report leads with **12 executable invariants** — properties that must hold
+for the pipeline to be correct, not just for it to exit zero. Among them: the
+two experts must start bit-identical (Stage 0 copies the base FFN into both) and
+must have diverged after Stage 2; hard routing must dispatch each token to
+exactly the masked expert; Stage 2 must leave every non-expert weight untouched;
+Stage 2.5 must move the gates and *only* the gates; routing entropy must stay
+within `[0, ln N]`. A failing invariant fails the run, so `make check` catches a
+refactor that runs cleanly but behaves wrongly.
 
 This runs the **real training scripts**, not a reimplementation: the same
 `train_stage_*.py` files used on the H100 cluster, pointed at a miniature config
