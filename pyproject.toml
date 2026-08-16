@@ -95,7 +95,6 @@ module = [
     "models.utils.create_moe_model",
     "models.custom_mistral",
     "models.moe_layer",
-    "models.utils.generation",
     "data.LLaVA_loader",
 ]
 ignore_errors = true

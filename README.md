@@ -318,8 +318,7 @@ MoE-Specialisation/
 │   ├── vl_connector.py       # VisionLanguageConnector (CLIP→LLM projection)
 │   └── utils/
 │       ├── create_moe_model.py   # Build MoE model from Mistral-7B
-│       ├── common.py             # Shared helpers (config, seed, logging, registration)
-│       └── generation.py         # CaptionGenerator inference helper
+│       └── common.py             # Shared helpers (config, seed, logging, registration)
 ├── data/
 │   ├── COCO_loader.py        # COCO captions dataset
 │   └── LLaVA_loader.py       # LLaVA-Instruct-150K dataset
