@@ -1,6 +1,8 @@
 """Unit tests for the shared analysis_scripts._lib helpers."""
 
+import ast
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -67,3 +69,49 @@ def test_lib_public_api_imports():
 
     for name in lib.__all__:
         assert hasattr(lib, name), f"_lib missing exported name: {name}"
+
+
+ANALYSIS_DIR = Path(__file__).parent.parent / "analysis_scripts"
+ANALYSIS_MODULES = sorted(ANALYSIS_DIR.rglob("*.py"))
+
+
+class TestLoggingMigration:
+    """The analysis scripts log like the rest of the repo, not via print().
+
+    Before this migration the core used ``logging`` while these 838 call sites
+    used ``print`` — the inconsistency was more noticeable than either choice
+    would have been alone.
+    """
+
+    @pytest.mark.parametrize("path", ANALYSIS_MODULES, ids=lambda p: p.name)
+    def test_no_print_calls(self, path):
+        calls = [
+            node
+            for node in ast.walk(ast.parse(path.read_text()))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "print"
+        ]
+        assert not calls, (
+            f"{path.name}: {len(calls)} print() call(s) at lines "
+            f"{[c.lineno for c in calls]} — use the module logger"
+        )
+
+    @pytest.mark.parametrize("path", ANALYSIS_MODULES, ids=lambda p: p.name)
+    def test_modules_that_log_define_a_logger(self, path):
+        source = path.read_text()
+        if "logger." not in source:
+            return
+        assert "logger = logging.getLogger(__name__)" in source, (
+            f"{path.name} logs without defining a module logger"
+        )
+
+    @pytest.mark.parametrize("path", ANALYSIS_MODULES, ids=lambda p: p.name)
+    def test_entry_points_configure_logging(self, path):
+        """A script that logs but never configures a handler emits nothing."""
+        source = path.read_text()
+        if "__main__" not in source or "logger." not in source:
+            return
+        assert "setup_logging()" in source, (
+            f"{path.name} is an entry point that logs but never calls setup_logging()"
+        )

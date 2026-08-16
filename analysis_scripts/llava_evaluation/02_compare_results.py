@@ -6,12 +6,16 @@ This analysis tests the hypothesis:
 - Stage 3 performs WORSE on out-of-distribution tasks (POPE, COCO captioning)
 """
 
+import logging
 import argparse
 import json
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from models.utils.common import setup_logging
+
+logger = logging.getLogger(__name__)
 
 
 def load_results(json_path):
@@ -25,24 +29,24 @@ def analyze_results(stage2_data, stage3_data):
     """
     Compare Stage 2 vs Stage 3 performance.
     """
-    print("=" * 80)
-    print("LLAVA-WILD EVALUATION COMPARISON")
-    print("=" * 80)
+    logger.info("=" * 80)
+    logger.info("LLAVA-WILD EVALUATION COMPARISON")
+    logger.info("=" * 80)
 
     # Summary metrics
     s2_summary = stage2_data["summary"]
     s3_summary = stage3_data["summary"]
 
-    print("\n📊 OVERALL SCORES:")
-    print(f"{'Metric':<30} {'Stage 2':<15} {'Stage 3':<15} {'Difference':<15}")
-    print("-" * 80)
+    logger.info("\nOVERALL SCORES:")
+    logger.info(f"{'Metric':<30} {'Stage 2':<15} {'Stage 3':<15} {'Difference':<15}")
+    logger.info("-" * 80)
 
     s2_score = s2_summary["average_score"]
     s3_score = s3_summary["average_score"]
     diff = s3_score - s2_score
 
-    print(f"{'Average Score (0-100)':<30} {s2_score:<15.1f} {s3_score:<15.1f} {diff:+.1f}")
-    print(
+    logger.info(f"{'Average Score (0-100)':<30} {s2_score:<15.1f} {s3_score:<15.1f} {diff:+.1f}")
+    logger.info(
         f"{'Samples Evaluated':<30} {s2_summary['num_samples']:<15} {s3_summary['num_samples']:<15}"
     )
 
@@ -51,21 +55,21 @@ def analyze_results(stage2_data, stage3_data):
     s3_scores = [r["score"] for r in stage3_data["results"]]
 
     if len(s2_scores) == 0 or len(s3_scores) == 0:
-        print("\n❌ ERROR: No samples were evaluated!")
-        print(f"   Stage 2: {len(s2_scores)} samples")
-        print(f"   Stage 3: {len(s3_scores)} samples")
-        print("\n   This likely means image files were not found.")
-        print("   Check the image directory path and image filenames.")
+        logger.error("\nERROR: No samples were evaluated!")
+        logger.info(f"   Stage 2: {len(s2_scores)} samples")
+        logger.info(f"   Stage 3: {len(s3_scores)} samples")
+        logger.info("\n   This likely means image files were not found.")
+        logger.info("   Check the image directory path and image filenames.")
         return None
 
-    print("\n📈 SCORE DISTRIBUTION:")
-    print(f"{'Statistic':<30} {'Stage 2':<15} {'Stage 3':<15}")
-    print("-" * 80)
-    print(f"{'Mean':<30} {np.mean(s2_scores):<15.1f} {np.mean(s3_scores):<15.1f}")
-    print(f"{'Median':<30} {np.median(s2_scores):<15.1f} {np.median(s3_scores):<15.1f}")
-    print(f"{'Std Dev':<30} {np.std(s2_scores):<15.1f} {np.std(s3_scores):<15.1f}")
-    print(f"{'Min':<30} {min(s2_scores):<15.1f} {min(s3_scores):<15.1f}")
-    print(f"{'Max':<30} {max(s2_scores):<15.1f} {max(s3_scores):<15.1f}")
+    logger.info("\nSCORE DISTRIBUTION:")
+    logger.info(f"{'Statistic':<30} {'Stage 2':<15} {'Stage 3':<15}")
+    logger.info("-" * 80)
+    logger.info(f"{'Mean':<30} {np.mean(s2_scores):<15.1f} {np.mean(s3_scores):<15.1f}")
+    logger.info(f"{'Median':<30} {np.median(s2_scores):<15.1f} {np.median(s3_scores):<15.1f}")
+    logger.info(f"{'Std Dev':<30} {np.std(s2_scores):<15.1f} {np.std(s3_scores):<15.1f}")
+    logger.info(f"{'Min':<30} {min(s2_scores):<15.1f} {min(s3_scores):<15.1f}")
+    logger.info(f"{'Max':<30} {max(s2_scores):<15.1f} {max(s3_scores):<15.1f}")
 
     # Quality analysis (score ranges)
     def score_category_count(scores):
@@ -78,52 +82,56 @@ def analyze_results(stage2_data, stage3_data):
     s2_exc, s2_good, s2_fair, s2_poor = score_category_count(s2_scores)
     s3_exc, s3_good, s3_fair, s3_poor = score_category_count(s3_scores)
 
-    print("\n🏆 QUALITY DISTRIBUTION:")
-    print(f"{'Category':<30} {'Stage 2':<15} {'Stage 3':<15}")
-    print("-" * 80)
-    print(f"{'Excellent (80-100)':<30} {s2_exc:<15} {s3_exc:<15}")
-    print(f"{'Good (60-79)':<30} {s2_good:<15} {s3_good:<15}")
-    print(f"{'Fair (40-59)':<30} {s2_fair:<15} {s3_fair:<15}")
-    print(f"{'Poor (<40)':<30} {s2_poor:<15} {s3_poor:<15}")
+    logger.info("\nQUALITY DISTRIBUTION:")
+    logger.info(f"{'Category':<30} {'Stage 2':<15} {'Stage 3':<15}")
+    logger.info("-" * 80)
+    logger.info(f"{'Excellent (80-100)':<30} {s2_exc:<15} {s3_exc:<15}")
+    logger.info(f"{'Good (60-79)':<30} {s2_good:<15} {s3_good:<15}")
+    logger.info(f"{'Fair (40-59)':<30} {s2_fair:<15} {s3_fair:<15}")
+    logger.info(f"{'Poor (<40)':<30} {s2_poor:<15} {s3_poor:<15}")
 
     # Sample comparisons
-    print("\n📝 SAMPLE COMPARISONS (First 5):")
-    print("=" * 80)
+    logger.info("\nSAMPLE COMPARISONS (First 5):")
+    logger.info("=" * 80)
 
     for i in range(min(5, len(stage2_data["results"]))):
         s2_result = stage2_data["results"][i]
         s3_result = stage3_data["results"][i]
 
-        print(f"\nSample {i + 1}: {s2_result['image']}")
-        print(f"Question: {s2_result['question'][:80]}...")
-        print(f"Reference: {s2_result['reference_answer'][:80]}...")
-        print(f"\nStage 2 ({s2_result['score']:.0f}): {s2_result['generated_answer'][:100]}...")
-        print(f"Stage 3 ({s3_result['score']:.0f}): {s3_result['generated_answer'][:100]}...")
-        print("-" * 80)
+        logger.info(f"\nSample {i + 1}: {s2_result['image']}")
+        logger.info(f"Question: {s2_result['question'][:80]}...")
+        logger.info(f"Reference: {s2_result['reference_answer'][:80]}...")
+        logger.info(
+            f"\nStage 2 ({s2_result['score']:.0f}): {s2_result['generated_answer'][:100]}..."
+        )
+        logger.info(f"Stage 3 ({s3_result['score']:.0f}): {s3_result['generated_answer'][:100]}...")
+        logger.info("-" * 80)
 
     # Context: POPE and COCO results
-    print("\n🔬 CONTEXT - ALL BENCHMARKS:")
-    print("=" * 80)
-    print("Benchmark               Metric                Stage 2      Stage 3      Change")
-    print("-" * 80)
-    print(f"{'POPE (OOD)':<23} {'Accuracy':<25} {71.5:<12.1f} {30.0:<12.1f} {-41.5:+.1f} ❌")
-    print(f"{'COCO Captions (OOD)':<23} {'CIDEr':<25} {0.76:<12.2f} {0.08:<12.2f} {-0.68:+.2f} ❌")
-    print(
-        f"{'LLaVA-Wild (ID)':<23} {'Quality Score':<25} {s2_score:<12.1f} {s3_score:<12.1f} {diff:+.1f} {'✅' if diff > 0 else '❌'}"
+    logger.info("\nCONTEXT - ALL BENCHMARKS:")
+    logger.info("=" * 80)
+    logger.info("Benchmark               Metric                Stage 2      Stage 3      Change")
+    logger.info("-" * 80)
+    logger.error(f"{'POPE (OOD)':<23} {'Accuracy':<25} {71.5:<12.1f} {30.0:<12.1f} {-41.5:+.1f} ")
+    logger.error(
+        f"{'COCO Captions (OOD)':<23} {'CIDEr':<25} {0.76:<12.2f} {0.08:<12.2f} {-0.68:+.2f} "
+    )
+    logger.info(
+        f"{'LLaVA-Wild (ID)':<23} {'Quality Score':<25} {s2_score:<12.1f} {s3_score:<12.1f} {diff:+.1f} {'' if diff > 0 else ''}"
     )
 
-    print("\n💡 INTERPRETATION:")
+    logger.info("\nINTERPRETATION:")
     if s3_score > s2_score:
-        print("   ✅ Stage 3 OUTPERFORMS Stage 2 on in-distribution task (LLaVA-Wild)")
-        print("   ✅ This confirms Stage 3 learned the training distribution well")
-        print("   ⚠️  But Stage 3 FAILS catastrophically on out-of-distribution tasks")
-        print("   📖 Thesis conclusion: Soft routing + instruction tuning = over-specialization")
+        logger.info("   Stage 3 OUTPERFORMS Stage 2 on in-distribution task (LLaVA-Wild)")
+        logger.info("   This confirms Stage 3 learned the training distribution well")
+        logger.warning("    But Stage 3 FAILS catastrophically on out-of-distribution tasks")
+        logger.info("   Thesis conclusion: Soft routing + instruction tuning = over-specialisation")
     else:
-        print("   ❌ Stage 3 does NOT outperform Stage 2 even on in-distribution task")
-        print("   ⚠️  This suggests Stage 3's issues are more fundamental than expected")
-        print("   📖 Need to investigate: Is LLaVA-Wild actually in-distribution?")
+        logger.error("   Stage 3 does NOT outperform Stage 2 even on in-distribution task")
+        logger.warning("    This suggests Stage 3's issues are more fundamental than expected")
+        logger.info("   Need to investigate: Is LLaVA-Wild actually in-distribution?")
 
-    print("=" * 80)
+    logger.info("=" * 80)
 
     return {
         "stage2_mean": np.mean(s2_scores),
@@ -134,7 +142,7 @@ def analyze_results(stage2_data, stage3_data):
 
 
 def create_plots(stage2_data, stage3_data, output_dir):
-    """Create comparison visualizations."""
+    """Create comparison visualisations."""
     s2_scores = [r["score"] for r in stage2_data["results"]]
     s3_scores = [r["score"] for r in stage3_data["results"]]
 
@@ -227,7 +235,7 @@ def create_plots(stage2_data, stage3_data, output_dir):
     # Save
     output_path = Path(output_dir) / "llava_wild_comparison.png"
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
-    print(f"\n📊 Saved visualization: {output_path}")
+    logger.info(f"\nSaved visualisation: {output_path}")
     plt.close()
 
 
@@ -240,24 +248,25 @@ def main():
     args = parser.parse_args()
 
     # Load results
-    print("\n📂 Loading results...")
+    logger.info("\nLoading results...")
     stage2_data = load_results(args.stage2)
     stage3_data = load_results(args.stage3)
 
-    # Analyze
+    # Analyse
     stats = analyze_results(stage2_data, stage3_data)
 
     if stats is None:
-        print("\n❌ Analysis failed due to missing data. Exiting.")
+        logger.error("\nAnalysis failed due to missing data. Exiting.")
         return
 
     # Create plots
-    print("\n📊 Creating visualizations...")
+    logger.info("\nCreating visualizations...")
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     create_plots(stage2_data, stage3_data, args.output_dir)
 
-    print("\n✅ Analysis complete!\n")
+    logger.info("\nAnalysis complete!\n")
 
 
 if __name__ == "__main__":
+    setup_logging()
     main()

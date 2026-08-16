@@ -1,7 +1,7 @@
 """
 Cross-Modality Purity Analysis for MoE Vision-Language Models
 
-This script analyzes how "pure" expert representations are across modalities
+This script analyses how "pure" expert representations are across modalities
 by comparing vision and text expert activations for the same concept.
 
 Usage:
@@ -9,6 +9,7 @@ Usage:
     python analysis_scripts/cross_modality_purity.py --concepts circle --top-k 20
 """
 
+import logging
 import argparse
 import json
 import os
@@ -24,11 +25,14 @@ from analysis_scripts._lib import (
     load_stage3_models,
     load_training_config,
 )
+from models.utils.common import setup_logging
+
+logger = logging.getLogger(__name__)
 
 
 class CrossModalityPurityAnalyzer:
     """
-    Analyzes cross-modality purity of expert representations.
+    Analyses cross-modality purity of expert representations.
 
     Key Methods:
         - analyze_vocab(): Top-k vocabulary predictions
@@ -56,7 +60,7 @@ class CrossModalityPurityAnalyzer:
         # Cache for storing intermediate results
         self.hidden_states_cache = {}
 
-        print(f"🔧 Initialized analyzer on device: {self.device}")
+        logger.info(f"Initialised analyzer on device: {self.device}")
 
     def _load_config(self, config_path: str) -> dict:
         """Load training configuration (validated, placeholder-checked)."""
@@ -72,9 +76,9 @@ class CrossModalityPurityAnalyzer:
 
     def load_models(self):
         """Load CLIP + connector + Stage-2 MoE LLM (hard routing)."""
-        print("📦 Loading models...")
+        logger.info("Loading models...")
         self._assign(load_stage2_models(self.config, self.device))
-        print("✅ All models loaded successfully")
+        logger.info("All models loaded successfully")
 
     def load_stage3_models(self, checkpoint_path: str, temperature: float = 0.01):
         """Load Stage 3 models with learned soft routing.
@@ -83,7 +87,7 @@ class CrossModalityPurityAnalyzer:
             checkpoint_path: Path to Stage 3 checkpoint (full or portable version)
             temperature: Softmax temperature for routing (default: 0.01 for near-deterministic)
         """
-        print("📦 Loading Stage 3 models with learned routing...")
+        logger.info("Loading Stage 3 models with learned routing...")
         self._assign(load_stage3_models(self.config, self.device, checkpoint_path, temperature))
 
     def _prepare_vision_input(self, concept: str) -> torch.Tensor:
@@ -100,12 +104,14 @@ class CrossModalityPurityAnalyzer:
             # Load image from disk (any size, any format - CLIP processor will resize)
             image = Image.open(concept).convert("RGB")
             concept_name = os.path.splitext(os.path.basename(concept))[0]
-            print(f"      📸 Loaded '{concept_name}' from {concept} (original size: {image.size})")
+            logger.info(
+                f"      Loaded '{concept_name}' from {concept} (original size: {image.size})"
+            )
         else:
             # Generate synthetic image
             image = self.image_generator.generate_concept_image(concept)
 
-        # Process through CLIP (automatically resizes to 224×224 and normalizes)
+        # Process through CLIP (automatically resizes to 224×224 and normalises)
         pixel_values = self.clip_processor(images=image, return_tensors="pt").pixel_values.to(
             self.device
         )
@@ -129,7 +135,7 @@ class CrossModalityPurityAnalyzer:
         # If concept is a file path, extract the concept name from filename
         if os.path.isfile(concept):
             concept_name = os.path.splitext(os.path.basename(concept))[0]
-            print(f"      💬 Extracted text concept '{concept_name}' from image path")
+            logger.info(f"      Extracted text concept '{concept_name}' from image path")
             text = f"{concept_name}"
         else:
             text = f"{concept}"
@@ -149,7 +155,7 @@ class CrossModalityPurityAnalyzer:
             and not hasattr(self, f"_logged_text_{debug_key}")
         ):
             tokens = [self.tokenizer.decode([tid]) for tid in input_ids[0]]
-            print(f"      💬 Text tokenization: '{text}' → {tokens} ({len(tokens)} tokens)")
+            logger.info(f"      Text tokenization: '{text}' → {tokens} ({len(tokens)} tokens)")
             setattr(self, f"_logged_text_{debug_key}", True)
 
         with torch.no_grad():
@@ -320,11 +326,11 @@ class CrossModalityPurityAnalyzer:
             if pooling == "cls":
                 representation = hidden_state[:, 0, :].squeeze(0)
                 if should_debug:
-                    print(f"      🎯 Vision CLS: pos 0 of {hidden_state.shape[1]} tokens")
+                    logger.info(f"      Vision CLS: pos 0 of {hidden_state.shape[1]} tokens")
             else:  # mean pooling
                 representation = hidden_state.mean(dim=1).squeeze(0)
                 if should_debug:
-                    print(f"      🎯 Vision mean: averaged {hidden_state.shape[1]} tokens")
+                    logger.info(f"      Vision mean: averaged {hidden_state.shape[1]} tokens")
         else:  # text modality
             seq_len = hidden_state.shape[1]
             # Always exclude BOS token (position 0)
@@ -334,20 +340,20 @@ class CrossModalityPurityAnalyzer:
                 # Single concept token after BOS: just use position 1
                 representation = hidden_state[:, 1, :].squeeze(0)
                 if should_debug:
-                    print("      🎯 Text single: pos 1 (excluding BOS at pos 0)")
+                    logger.info("      Text single: pos 1 (excluding BOS at pos 0)")
             elif seq_len > 2:
                 # Multi-token concept: average all tokens from position 1 onwards (excluding only BOS)
                 concept_tokens = hidden_state[:, 1:, :]
                 representation = concept_tokens.mean(dim=1).squeeze(0)
                 if should_debug:
-                    print(
-                        f"      🎯 Text multi: pos [1:] of {seq_len} → {concept_tokens.shape[1]} tokens averaged (excluding BOS only)"
+                    logger.info(
+                        f"      Text multi: pos [1:] of {seq_len} → {concept_tokens.shape[1]} tokens averaged (excluding BOS only)"
                     )
             else:
                 # Edge case: only BOS token (shouldn't happen)
                 representation = hidden_state[:, 0, :].squeeze(0)
                 if should_debug:
-                    print("      ⚠️  Text edge case: only BOS token")
+                    logger.warning("       Text edge case: only BOS token")
 
         if should_debug:
             setattr(self, f"_logged_extract_{concept}_{layer}_{modality}_{pooling}", True)
@@ -363,7 +369,7 @@ class CrossModalityPurityAnalyzer:
         top_k: int = 10,
         pooling: str = "cls",
     ) -> dict[str, float]:
-        """Analyze top-k vocabulary predictions for a concept."""
+        """Analyse top-k vocabulary predictions for a concept."""
         hidden_state = self.analyze_representation(concept, expert, layer, modality, pooling)
         hidden_state_tensor = (
             torch.from_numpy(hidden_state).to(self.device, dtype=torch.bfloat16).unsqueeze(0)
@@ -391,7 +397,7 @@ class CrossModalityPurityAnalyzer:
         )
 
         if should_debug:
-            print(f"\n    🔍 Layer {layer} ({pooling}): '{concept}'")
+            logger.info(f"\n    Layer {layer} ({pooling}): '{concept}'")
 
         vision_rep = self.analyze_representation(concept, "vision", layer, "vision", pooling)
         text_rep = self.analyze_representation(concept, "text", layer, "text", pooling)
@@ -402,13 +408,13 @@ class CrossModalityPurityAnalyzer:
         )
 
         if should_debug:
-            print(
-                f"      📊 Vision: norm={np.linalg.norm(vision_rep):.2f}, mean={vision_rep.mean():.4f}"
+            logger.info(
+                f"      Vision: norm={np.linalg.norm(vision_rep):.2f}, mean={vision_rep.mean():.4f}"
             )
-            print(
-                f"      📊 Text:   norm={np.linalg.norm(text_rep):.2f}, mean={text_rep.mean():.4f}"
+            logger.info(
+                f"      Text:   norm={np.linalg.norm(text_rep):.2f}, mean={text_rep.mean():.4f}"
             )
-            print(f"      ➡️  Cosine similarity: {cosine_sim:.4f}")
+            logger.info(f"       Cosine similarity: {cosine_sim:.4f}")
             setattr(self, f"_logged_cosine_{concept}_{layer}_{pooling}", True)
 
         return cosine_sim
@@ -437,9 +443,9 @@ class CrossModalityPurityAnalyzer:
                 - 'caption': Image caption
                 - 'image_path': Relative path to image file
         """
-        print("📚 Extracting concept samples from COCO annotations...")
-        print(f"   Concepts: {concepts}")
-        print(f"   Target: {samples_per_concept} samples per concept")
+        logger.info("Extracting concept samples from COCO annotations...")
+        logger.info(f"   Concepts: {concepts}")
+        logger.info(f"   Target: {samples_per_concept} samples per concept")
 
         # Load COCO annotations
         with open(annotations_file) as f:
@@ -484,15 +490,15 @@ class CrossModalityPurityAnalyzer:
                 )
 
         # Print statistics
-        print("\n   📊 Extracted samples:")
+        logger.info("\n   Extracted samples:")
         for concept, samples in concept_samples.items():
-            print(f"      {concept}: {len(samples)} samples")
+            logger.info(f"      {concept}: {len(samples)} samples")
 
         # Warn if any concept is under-sampled
         for concept, samples in concept_samples.items():
             if len(samples) < samples_per_concept:
-                print(
-                    f"   ⚠️  Warning: Only found {len(samples)} samples for '{concept}' (target: {samples_per_concept})"
+                logger.warning(
+                    f"    Warning: Only found {len(samples)} samples for '{concept}' (target: {samples_per_concept})"
                 )
 
         return concept_samples
@@ -557,11 +563,11 @@ class CrossModalityPurityAnalyzer:
 
         Args:
             concepts: List of exactly 2 concepts to compare
-            layer: Layer index to analyze
+            layer: Layer index to analyse
             pooling: Pooling strategy ("mean" for mean-pooled representations)
 
         Returns:
-            NxN matrix where N = 2 * len(concepts), organized as:
+            NxN matrix where N = 2 * len(concepts), organised as:
             [concept1_vis, concept1_txt, concept2_vis, concept2_txt, ...]
         """
         if len(concepts) != 2:
@@ -618,14 +624,14 @@ class CrossModalityPurityAnalyzer:
             )
 
         pooling_desc = "mean-pooled" if pooling == "mean" else "CLS token"
-        print(f"\n🔬 Comparing CLIP vs connector ({pooling_desc}) for: {concepts}")
+        logger.info(f"\nComparing CLIP vs connector ({pooling_desc}) for: {concepts}")
 
         # Helper function to load image (file path or synthetic)
         def load_image(concept):
             if os.path.isfile(concept):
                 image = Image.open(concept).convert("RGB")
                 label = os.path.splitext(os.path.basename(concept))[0]
-                print(f"      📸 Loaded '{label}' from {concept} (size: {image.size})")
+                logger.info(f"      Loaded '{label}' from {concept} (size: {image.size})")
                 return image, label
             else:
                 image = self.image_generator.generate_concept_image(concept)
@@ -665,11 +671,11 @@ class CrossModalityPurityAnalyzer:
                 connector_embedding = extract_embedding(connector_output)
                 connector_embeddings.append(connector_embedding)
 
-            print(
-                f"  ✓ CLIP ({pooling_desc}) for '{label}': shape={clip_embedding.shape}, norm={np.linalg.norm(clip_embedding):.2f}"
+            logger.info(
+                f"  CLIP ({pooling_desc}) for '{label}': shape={clip_embedding.shape}, norm={np.linalg.norm(clip_embedding):.2f}"
             )
-            print(
-                f"  ✓ Connector ({pooling_desc}) for '{label}': shape={connector_embedding.shape}, norm={np.linalg.norm(connector_embedding):.2f}"
+            logger.info(
+                f"  Connector ({pooling_desc}) for '{label}': shape={connector_embedding.shape}, norm={np.linalg.norm(connector_embedding):.2f}"
             )
 
         # Compute 2×2 similarity matrices
@@ -690,9 +696,11 @@ class CrossModalityPurityAnalyzer:
         clip_matrix = compute_similarity_matrix(clip_embeddings)
         connector_matrix = compute_similarity_matrix(connector_embeddings)
 
-        print(f"\n  📊 CLIP ({pooling_desc}): {labels[0]} vs {labels[1]} = {clip_matrix[0, 1]:.4f}")
-        print(
-            f"  📊 Connector ({pooling_desc}): {labels[0]} vs {labels[1]} = {connector_matrix[0, 1]:.4f}"
+        logger.info(
+            f"\n  CLIP ({pooling_desc}): {labels[0]} vs {labels[1]} = {clip_matrix[0, 1]:.4f}"
+        )
+        logger.info(
+            f"  Connector ({pooling_desc}): {labels[0]} vs {labels[1]} = {connector_matrix[0, 1]:.4f}"
         )
 
         return clip_matrix, connector_matrix, labels
@@ -733,7 +741,7 @@ class CrossModalityPurityAnalyzer:
 
     def analyze_token_variance(self, concepts: list[str]) -> dict:
         """
-        Level 1: Analyze internal token diversity within each image.
+        Level 1: Analyse internal token diversity within each image.
 
         This measures whether the connector is collapsing spatial structure by comparing
         the variance of pairwise similarities between tokens within a single image.
@@ -749,7 +757,7 @@ class CrossModalityPurityAnalyzer:
                 f"Token variance analysis requires exactly 2 concepts, got {len(concepts)}"
             )
 
-        print(f"\n🔬 Level 1: Analyzing token-level variance for {concepts}")
+        logger.info(f"\nLevel 1: Analysing token-level variance for {concepts}")
 
         def load_image(concept):
             if os.path.isfile(concept):
@@ -803,11 +811,11 @@ class CrossModalityPurityAnalyzer:
 
             results[label] = {"clip": clip_variance, "connector": connector_variance}
 
-            print(f"  ✓ {label}:")
-            print(
+            logger.info(f"  {label}:")
+            logger.info(
                 f"      CLIP variance: std={clip_variance['std']:.4f}, range=[{clip_variance['min']:.3f}, {clip_variance['max']:.3f}]"
             )
-            print(
+            logger.info(
                 f"      Connector variance: std={connector_variance['std']:.4f}, range=[{connector_variance['min']:.3f}, {connector_variance['max']:.3f}]"
             )
 
@@ -815,7 +823,7 @@ class CrossModalityPurityAnalyzer:
 
     def analyze_position_specific_similarity(self, concepts: list[str]) -> dict:
         """
-        Level 2: Analyze cat-car similarity at each of the 257 token positions.
+        Level 2: Analyse cat-car similarity at each of the 257 token positions.
 
         This reveals whether certain positions (e.g., CLS token) maintain better
         concept separation than others.
@@ -831,7 +839,7 @@ class CrossModalityPurityAnalyzer:
                 f"Position-specific analysis requires exactly 2 concepts, got {len(concepts)}"
             )
 
-        print(f"\n🔬 Level 2: Analyzing position-specific similarity for {concepts}")
+        logger.info(f"\nLevel 2: Analysing position-specific similarity for {concepts}")
 
         def load_image(concept):
             if os.path.isfile(concept):
@@ -896,11 +904,11 @@ class CrossModalityPurityAnalyzer:
             )
             connector_similarities.append(float(conn_sim))
 
-        print(
-            f"  ✓ Position 0 (CLS): CLIP={clip_similarities[0]:.4f}, Connector={connector_similarities[0]:.4f}"
+        logger.info(
+            f"  Position 0 (CLS): CLIP={clip_similarities[0]:.4f}, Connector={connector_similarities[0]:.4f}"
         )
-        print(
-            f"  ✓ Positions 1-256 (patches): CLIP_mean={np.mean(clip_similarities[1:]):.4f}, Connector_mean={np.mean(connector_similarities[1:]):.4f}"
+        logger.info(
+            f"  Positions 1-256 (patches): CLIP_mean={np.mean(clip_similarities[1:]):.4f}, Connector_mean={np.mean(connector_similarities[1:]):.4f}"
         )
 
         return {
@@ -919,15 +927,15 @@ class CrossModalityPurityAnalyzer:
         Run comprehensive cross-modality purity analysis.
 
         Args:
-            concepts: List of concepts to analyze
+            concepts: List of concepts to analyse
             layers: List of layer indices
             output_dir: Directory to save results
 
         Returns:
             Dictionary containing all analysis results
         """
-        print(
-            f"\n🔬 Running comprehensive analysis on {len(concepts)} concepts across {len(layers)} layers..."
+        logger.info(
+            f"\nRunning comprehensive analysis on {len(concepts)} concepts across {len(layers)} layers..."
         )
 
         os.makedirs(output_dir, exist_ok=True)
@@ -936,7 +944,7 @@ class CrossModalityPurityAnalyzer:
         debug_log_path = None
         if hasattr(self, "_debug_mode") and self._debug_mode:
             debug_log_path = os.path.join(output_dir, "debug_token_analysis.log")
-            print(f"🐛 Debug output will be saved to: {debug_log_path}")
+            logger.info(f"Debug output will be saved to: {debug_log_path}")
 
         results = {
             "concepts": concepts,
@@ -949,11 +957,11 @@ class CrossModalityPurityAnalyzer:
         }
 
         for concept_idx, concept in enumerate(concepts):
-            print(f"\n📊 Analyzing concept: '{concept}'")
+            logger.info(f"\nAnalyzing concept: '{concept}'")
 
             # Add debug summary for first concept only
             if hasattr(self, "_debug_mode") and self._debug_mode and concept_idx == 0:
-                print("   🐛 Debug info will be shown for layers: -1, 0, 15, 31")
+                logger.info("   Debug info will be shown for layers: -1, 0, 15, 31")
 
             results["cosine_similarity"][concept] = {}
             results["euclidean_distance"][concept] = {}
@@ -962,7 +970,7 @@ class CrossModalityPurityAnalyzer:
             results["vocab_predictions"][concept] = {}
 
             for layer in layers:
-                print(f"  - Layer {layer}...", end=" ")
+                logger.info(f"  - Layer {layer}...")
 
                 try:
                     # Cosine similarity (CLS and mean-pooled)
@@ -994,21 +1002,21 @@ class CrossModalityPurityAnalyzer:
                         "text_expert": self.analyze_vocab(concept, "text", layer, "text", top_k=10),
                     }
 
-                    print(
-                        f"✓ (cos_cls={cosine_sim:.3f}, cos_mp={cosine_sim_mp:.3f}, euc_cls={euclidean_dist:.2f}, euc_mp={euclidean_dist_mp:.2f})"
+                    logger.info(
+                        f"(cos_cls={cosine_sim:.3f}, cos_mp={cosine_sim_mp:.3f}, euc_cls={euclidean_dist:.2f}, euc_mp={euclidean_dist_mp:.2f})"
                     )
 
                 except Exception as e:
-                    print(f"✗ Error: {e}")
+                    logger.error(f"Error: {e}")
                     continue
 
         # Save results
         results_path = os.path.join(output_dir, "purity_analysis_results.json")
         with open(results_path, "w") as f:
             json.dump(results, f, indent=2)
-        print(f"\n💾 Results saved to {results_path}")
+        logger.info(f"\nResults saved to {results_path}")
 
-        # Generate visualizations
+        # Generate visualisations
         self._visualize_results(results, output_dir)
 
         return results
@@ -1024,12 +1032,12 @@ class CrossModalityPurityAnalyzer:
         Returns:
             Dictionary containing alignment curves and metadata
         """
-        print("\n" + "=" * 80)
-        print("Stage 3: Layer-by-Layer Cross-Modal Alignment Analysis")
-        print("=" * 80)
+        logger.info("\n" + "=" * 80)
+        logger.info("Stage 3: Layer-by-Layer Cross-Modal Alignment Analysis")
+        logger.info("=" * 80)
 
         # Load config
-        print(f"\n📋 Loading config from {config_path}")
+        logger.info(f"\nLoading config from {config_path}")
         with open(config_path) as f:
             config = json.load(f)["stage3_alignment_analysis"]
 
@@ -1046,12 +1054,12 @@ class CrossModalityPurityAnalyzer:
 
         os.makedirs(output_dir, exist_ok=True)
 
-        print(f"  ✓ Checkpoint: {checkpoint_path}")
-        print(f"  ✓ Temperature: {temperature}")
-        print(f"  ✓ Pooling: {pooling}")
-        print(f"  ✓ Routing: {routing_mode}")
-        print(f"  ✓ Concepts: {concepts}")
-        print(f"  ✓ Samples per concept: {samples_per_concept}")
+        logger.info(f"  Checkpoint: {checkpoint_path}")
+        logger.info(f"  Temperature: {temperature}")
+        logger.info(f"  Pooling: {pooling}")
+        logger.info(f"  Routing: {routing_mode}")
+        logger.info(f"  Concepts: {concepts}")
+        logger.info(f"  Samples per concept: {samples_per_concept}")
 
         # Load Stage 3 models
         self.load_stage3_models(checkpoint_path, temperature)
@@ -1065,20 +1073,21 @@ class CrossModalityPurityAnalyzer:
         )
 
         # Compute alignment curves for each concept
-        print(
-            f"\n🔬 Computing alignment curves (averaging {samples_per_concept} samples per concept)..."
+        logger.info(
+            f"\nComputing alignment curves (averaging {samples_per_concept} samples per concept)..."
         )
         alignment_curves = {}
 
         for idx, concept in enumerate(concepts, 1):
             samples = concept_samples[concept]
             if len(samples) == 0:
-                print(f"  [{idx}/{len(concepts)}] ⚠️  Skipping '{concept}' (no samples found)")
+                logger.warning(
+                    f"  [{idx}/{len(concepts)}]  Skipping '{concept}' (no samples found)"
+                )
                 continue
 
-            print(
-                f"  [{idx}/{len(concepts)}] Processing '{concept}' ({len(samples)} samples)...",
-                end=" ",
+            logger.info(
+                f"  [{idx}/{len(concepts)}] Processing '{concept}' ({len(samples)} samples)..."
             )
 
             try:
@@ -1106,10 +1115,10 @@ class CrossModalityPurityAnalyzer:
                 # Print key layer similarities
                 emb_sim = avg_curve[-1]
                 final_sim = avg_curve[31]
-                print(f"✓ (emb={emb_sim:.3f}, L0={avg_curve[0]:.3f}, L31={final_sim:.3f})")
+                logger.info(f"(emb={emb_sim:.3f}, L0={avg_curve[0]:.3f}, L31={final_sim:.3f})")
 
             except Exception as e:
-                print(f"✗ Error: {e}")
+                logger.error(f"Error: {e}")
                 import traceback
 
                 traceback.print_exc()
@@ -1132,22 +1141,22 @@ class CrossModalityPurityAnalyzer:
         results_path = os.path.join(output_dir, "alignment_curves.json")
         with open(results_path, "w") as f:
             json.dump(results, f, indent=2)
-        print(f"\n💾 Results saved to {results_path}")
+        logger.info(f"\nResults saved to {results_path}")
 
-        # Generate visualization
-        print("\n📈 Generating alignment curve plot...")
+        # Generate visualisation
+        logger.info("\nGenerating alignment curve plot...")
         cmp_plots.plot_alignment_curves(alignment_curves, output_dir, title_suffix="Stage 3")
 
-        print("\n" + "=" * 80)
-        print("✅ Stage 3 alignment analysis complete!")
-        print(f"📁 Results saved to: {output_dir}")
-        print("=" * 80)
+        logger.info("\n" + "=" * 80)
+        logger.info("Stage 3 alignment analysis complete!")
+        logger.info(f"Results saved to: {output_dir}")
+        logger.info("=" * 80)
 
         return results
 
     def _visualize_results(self, results: dict, output_dir: str):
-        """Generate visualization plots from analysis results."""
-        print("\n📈 Generating visualizations...")
+        """Generate visualisation plots from analysis results."""
+        logger.info("\nGenerating visualizations...")
 
         concepts = results["concepts"]
         layers = results["layers"]
@@ -1201,10 +1210,12 @@ class CrossModalityPurityAnalyzer:
 
         # Generate purity matrix and divergence tracking if exactly 2 concepts
         if len(concepts) == 2:
-            print("\n📊 Generating purity matrix and divergence analysis (2 concepts detected)...")
+            logger.info(
+                "\nGenerating purity matrix and divergence analysis (2 concepts detected)..."
+            )
 
             # CLIP vs Connector comparison (diagnostic analysis)
-            print("\n🔬 Running CLIP vs Connector diagnostic...")
+            logger.info("\nRunning CLIP vs Connector diagnostic...")
 
             # Mean-pooled comparison
             try:
@@ -1215,7 +1226,7 @@ class CrossModalityPurityAnalyzer:
                     clip_matrix, connector_matrix, labels, output_dir, pooling="mean"
                 )
             except Exception as e:
-                print(f"  ✗ Error computing mean-pooled CLIP vs connector comparison: {e}")
+                logger.info(f"  Error computing mean-pooled CLIP vs connector comparison: {e}")
 
             # CLS token comparison
             try:
@@ -1226,23 +1237,23 @@ class CrossModalityPurityAnalyzer:
                     clip_matrix_cls, connector_matrix_cls, labels_cls, output_dir, pooling="cls"
                 )
             except Exception as e:
-                print(f"  ✗ Error computing CLS token CLIP vs connector comparison: {e}")
+                logger.info(f"  Error computing CLS token CLIP vs connector comparison: {e}")
 
             # Level 1: Token variance analysis
-            print("\n🔬 Level 1: Analyzing token-level variance...")
+            logger.info("\nLevel 1: Analysing token-level variance...")
             try:
                 variance_results = self.analyze_token_variance(concepts)
                 cmp_plots.plot_token_variance(variance_results, labels_cls, output_dir)
             except Exception as e:
-                print(f"  ✗ Error in token variance analysis: {e}")
+                logger.info(f"  Error in token variance analysis: {e}")
 
             # Level 2: Position-specific similarity
-            print("\n🔬 Level 2: Analyzing position-specific similarity...")
+            logger.info("\nLevel 2: Analysing position-specific similarity...")
             try:
                 position_results = self.analyze_position_specific_similarity(concepts)
                 cmp_plots.plot_position_specific_similarity(position_results, output_dir)
             except Exception as e:
-                print(f"  ✗ Error in position-specific analysis: {e}")
+                logger.info(f"  Error in position-specific analysis: {e}")
 
             # Purity matrices at key layers
             target_layers = [-1, 0, 15, 31]
@@ -1253,12 +1264,12 @@ class CrossModalityPurityAnalyzer:
                         matrix, labels = self.compute_purity_matrix(concepts, layer, pooling="mean")
                         matrices[layer] = (matrix, labels)
                     except Exception as e:
-                        print(f"  ✗ Error computing purity matrix for layer {layer}: {e}")
+                        logger.info(f"  Error computing purity matrix for layer {layer}: {e}")
 
             if matrices:
                 cmp_plots.plot_purity_matrices(matrices, target_layers, output_dir)
 
-        print("✅ Visualization complete!")
+        logger.info("Visualisation complete!")
 
 
 def main():
@@ -1316,12 +1327,12 @@ def main():
     args = parser.parse_args()
 
     # Initialize analyzer
-    print("=" * 80)
+    logger.info("=" * 80)
 
     # Check if running Stage 3 alignment analysis
     if args.stage3_alignment:
-        print("Stage 3: Layer-by-Layer Alignment Analysis")
-        print("=" * 80)
+        logger.info("Stage 3: Layer-by-Layer Alignment Analysis")
+        logger.info("=" * 80)
 
         analyzer = CrossModalityPurityAnalyzer(config_path=args.config, device=args.device)
         results = analyzer.run_stage3_alignment_analysis(config_path=args.stage3_alignment)
@@ -1329,16 +1340,16 @@ def main():
         return  # Exit after Stage 3 analysis
 
     # Otherwise run standard Stage 2 purity analysis
-    print("Cross-Modality Purity Analysis")
+    logger.info("Cross-Modality Purity Analysis")
     if args.debug:
-        print("🐛 DEBUG MODE ENABLED")
-    print("=" * 80)
+        logger.info("DEBUG MODE ENABLED")
+    logger.info("=" * 80)
 
     # Handle --all-layers flag
     if args.all_layers:
         layers = [-1] + list(range(32))
-        print(
-            f"📊 Using --all-layers: analyzing layers {layers[0]} to {layers[-1]} ({len(layers)} total layers)"
+        logger.info(
+            f"Using --all-layers: analysing layers {layers[0]} to {layers[-1]} ({len(layers)} total layers)"
         )
     else:
         layers = args.layers
@@ -1348,7 +1359,9 @@ def main():
     # Enable debug mode if requested
     if args.debug:
         analyzer._debug_mode = True
-        print("🐛 Debug mode: Will show tokenization + detailed stats for layers [-1, 0, 15, 31]")
+        logger.info(
+            "Debug mode: Will show tokenization + detailed stats for layers [-1, 0, 15, 31]"
+        )
 
     # Load models
     analyzer.load_models()
@@ -1358,11 +1371,12 @@ def main():
         concepts=args.concepts, layers=layers, output_dir=args.output_dir
     )
 
-    print("\n" + "=" * 80)
-    print("✅ Analysis complete!")
-    print(f"📁 Results saved to: {args.output_dir}")
-    print("=" * 80)
+    logger.info("\n" + "=" * 80)
+    logger.info("Analysis complete!")
+    logger.info(f"Results saved to: {args.output_dir}")
+    logger.info("=" * 80)
 
 
 if __name__ == "__main__":
+    setup_logging()
     main()

@@ -6,7 +6,7 @@ objects with different attributes (e.g., color, shape, size) using similarity ma
 
 For N stimuli, computes 2N×2N similarity matrices (vision + text representations):
 - Stage 2: Forced routing (vision→expert0, text→expert1)
-- Stage 3: Learned soft routing (natural model behavior)
+- Stage 3: Learned soft routing (natural model behaviour)
 
 Output: One matrix per stage per layer (e.g., stage2_layer31.png, stage3_layer31.png)
 
@@ -35,6 +35,7 @@ Manifest file format (JSON):
     }
 """
 
+import logging
 import argparse
 import json
 import os
@@ -48,6 +49,9 @@ from analysis_scripts._lib import compute_cosine_similarity_matrix, load_analysi
 
 # REUSE: Import existing analyzer class for model loading and representation extraction
 from analysis_scripts.cross_concept_similarity_matrix import CrossConceptSimilarityAnalyzer
+from models.utils.common import setup_logging
+
+logger = logging.getLogger(__name__)
 
 
 class CompositionalCaseStudyAnalyzer:
@@ -58,7 +62,7 @@ class CompositionalCaseStudyAnalyzer:
     - Model loading (Stage 2 and Stage 3)
     - Representation extraction (vision and text, mean pooling)
     - Similarity matrix computation
-    - Visualization
+    - Visualisation
 
     Key differences from CrossConceptSimilarityAnalyzer:
     - Uses pre-specified stimuli from JSON manifest (not COCO sampling)
@@ -80,9 +84,9 @@ class CompositionalCaseStudyAnalyzer:
             device: Device to run on (cuda/cpu)
             temperature: Routing temperature for Stage 3
         """
-        print("🔧 Initializing Compositional Case Study Analyzer")
-        print(f"   Device: {device}")
-        print(f"   Temperature: {temperature}")
+        logger.info("Initialising Compositional Case Study Analyzer")
+        logger.info(f"   Device: {device}")
+        logger.info(f"   Temperature: {temperature}")
 
         self.config_path = config_path
         self.device = device
@@ -102,7 +106,7 @@ class CompositionalCaseStudyAnalyzer:
         Returns:
             List of stimulus dicts with keys: id, image_path, caption
         """
-        print(f"\n📄 Loading stimulus manifest from: {manifest_file}")
+        logger.info(f"\nLoading stimulus manifest from: {manifest_file}")
 
         with open(manifest_file) as f:
             manifest_data = json.load(f)
@@ -119,9 +123,9 @@ class CompositionalCaseStudyAnalyzer:
                         f"Required fields: {required_fields}"
                     )
 
-        print(f"   ✓ Loaded {len(stimuli)} stimuli:")
+        logger.info(f"   Loaded {len(stimuli)} stimuli:")
         for stimulus in stimuli:
-            print(f"      - {stimulus['id']}: {stimulus['caption']}")
+            logger.info(f"      - {stimulus['id']}: {stimulus['caption']}")
 
         return stimuli
 
@@ -135,7 +139,7 @@ class CompositionalCaseStudyAnalyzer:
             stage2_checkpoint: Path to Stage 2 checkpoint
             stage3_checkpoint: Path to Stage 3 checkpoint
         """
-        print("\n🔧 Initializing Stage 2 analyzer...")
+        logger.info("\nInitializing Stage 2 analyzer...")
         self.stage2_analyzer = CrossConceptSimilarityAnalyzer(
             config_path=self.config_path,
             device=self.device,
@@ -144,9 +148,9 @@ class CompositionalCaseStudyAnalyzer:
             temperature=self.temperature,
         )
         self.stage2_analyzer.load_models()
-        print("   ✓ Stage 2 analyzer ready")
+        logger.info("   Stage 2 analyzer ready")
 
-        print("\n🔧 Initializing Stage 3 analyzer...")
+        logger.info("\nInitializing Stage 3 analyzer...")
         self.stage3_analyzer = CrossConceptSimilarityAnalyzer(
             config_path=self.config_path,
             device=self.device,
@@ -155,7 +159,7 @@ class CompositionalCaseStudyAnalyzer:
             temperature=self.temperature,
         )
         self.stage3_analyzer.load_models()
-        print("   ✓ Stage 3 analyzer ready")
+        logger.info("   Stage 3 analyzer ready")
 
     def extract_stimulus_representations(
         self,
@@ -183,16 +187,16 @@ class CompositionalCaseStudyAnalyzer:
                 - labels: List of 2N strings (img:id, txt:id)
         """
         N = len(stimuli)
-        print(f"\n📊 Extracting {stage_name} representations at layer {layer}")
-        print(f"   Stimuli: {N}, Total entries: {2 * N} (vision + text)")
+        logger.info(f"\nExtracting {stage_name} representations at layer {layer}")
+        logger.info(f"   Stimuli: {N}, Total entries: {2 * N} (vision + text)")
 
         representations = []
         labels = []
 
         # Extract vision representations (first N entries)
-        print("\n📸 Extracting vision representations...")
+        logger.info("\nExtracting vision representations...")
         for stimulus in stimuli:
-            print(f"   Processing: {stimulus['id']}")
+            logger.info(f"   Processing: {stimulus['id']}")
 
             # REUSE: analyzer._extract_representation() with vision modality
             img_rep = analyzer._extract_representation(
@@ -205,12 +209,12 @@ class CompositionalCaseStudyAnalyzer:
 
             representations.append(img_rep)
             labels.append(f"img:{stimulus['id']}")
-            print(f"      ✓ Vision: norm={np.linalg.norm(img_rep):.2f}")
+            logger.info(f"      Vision: norm={np.linalg.norm(img_rep):.2f}")
 
         # Extract text representations (next N entries)
-        print("\n💬 Extracting text representations...")
+        logger.info("\nExtracting text representations...")
         for stimulus in stimuli:
-            print(f"   Processing: {stimulus['id']}")
+            logger.info(f"   Processing: {stimulus['id']}")
 
             # REUSE: analyzer._extract_representation() with text modality
             txt_rep = analyzer._extract_representation(
@@ -223,9 +227,9 @@ class CompositionalCaseStudyAnalyzer:
 
             representations.append(txt_rep)
             labels.append(f"txt:{stimulus['id']}")
-            print(f"      ✓ Text: norm={np.linalg.norm(txt_rep):.2f}")
+            logger.info(f"      Text: norm={np.linalg.norm(txt_rep):.2f}")
 
-        print(f"\n   ✓ Extracted {2 * N} representations ({N} vision + {N} text)")
+        logger.info(f"\n   Extracted {2 * N} representations ({N} vision + {N} text)")
         return representations, labels
 
     def compute_similarity_matrix(
@@ -244,13 +248,13 @@ class CompositionalCaseStudyAnalyzer:
             N×N similarity matrix
         """
         n = len(representations)
-        print(f"\n📊 Computing {stage_name} similarity matrix ({n}×{n})...")
+        logger.info(f"\nComputing {stage_name} similarity matrix ({n}×{n})...")
 
         matrix = compute_cosine_similarity_matrix(representations)
 
-        print(f"   ✓ Matrix computed: shape={matrix.shape}")
-        print(f"   ✓ Similarity range: [{matrix.min():.3f}, {matrix.max():.3f}]")
-        print(f"   ✓ Mean similarity: {matrix.mean():.3f}")
+        logger.info(f"   Matrix computed: shape={matrix.shape}")
+        logger.info(f"   Similarity range: [{matrix.min():.3f}, {matrix.max():.3f}]")
+        logger.info(f"   Mean similarity: {matrix.mean():.3f}")
 
         return matrix
 
@@ -282,7 +286,7 @@ class CompositionalCaseStudyAnalyzer:
                 f,
                 indent=2,
             )
-        print(f"   ✓ Saved matrix to: {matrix_path}")
+        logger.info(f"   Saved matrix to: {matrix_path}")
 
         # Save labels
         labels_path = os.path.join(output_dir, f"{stage_name}_layer{layer}_labels.json")
@@ -297,7 +301,7 @@ class CompositionalCaseStudyAnalyzer:
                 f,
                 indent=2,
             )
-        print(f"   ✓ Saved labels to: {labels_path}")
+        logger.info(f"   Saved labels to: {labels_path}")
 
     def visualize_matrix(
         self,
@@ -309,9 +313,9 @@ class CompositionalCaseStudyAnalyzer:
         temperature: float,
     ):
         """
-        Create heatmap visualization of similarity matrix.
+        Create heatmap visualisation of similarity matrix.
 
-        REUSES: Similar visualization style as CrossConceptSimilarityAnalyzer
+        REUSES: Similar visualisation style as CrossConceptSimilarityAnalyzer
 
         Args:
             matrix: Similarity matrix
@@ -377,7 +381,7 @@ class CompositionalCaseStudyAnalyzer:
         plt.savefig(plot_path, dpi=300, bbox_inches="tight")
         plt.close()
 
-        print(f"   ✓ Saved heatmap to: {plot_path}")
+        logger.info(f"   Saved heatmap to: {plot_path}")
 
     def visualize_cross_modal_comparison(
         self,
@@ -410,9 +414,13 @@ class CompositionalCaseStudyAnalyzer:
         img_labels = [l.replace("img:", "") for l in labels[:half_n]]
         txt_labels = [l.replace("txt:", "") for l in labels[half_n:]]
 
-        print("\n📊 Creating cross-modal comparison visualization...")
-        print(f"   Stage 2 cross-modal range: [{stage2_cross.min():.3f}, {stage2_cross.max():.3f}]")
-        print(f"   Stage 3 cross-modal range: [{stage3_cross.min():.3f}, {stage3_cross.max():.3f}]")
+        logger.info("\nCreating cross-modal comparison visualization...")
+        logger.info(
+            f"   Stage 2 cross-modal range: [{stage2_cross.min():.3f}, {stage2_cross.max():.3f}]"
+        )
+        logger.info(
+            f"   Stage 3 cross-modal range: [{stage3_cross.min():.3f}, {stage3_cross.max():.3f}]"
+        )
 
         # Create side-by-side figure
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 9))
@@ -423,8 +431,8 @@ class CompositionalCaseStudyAnalyzer:
         stage3_vmin = stage3_cross.min() - 0.005
         stage3_vmax = stage3_cross.max() + 0.005
 
-        print(f"   Stage 2 color scale: [{stage2_vmin:.3f}, {stage2_vmax:.3f}]")
-        print(f"   Stage 3 color scale: [{stage3_vmin:.3f}, {stage3_vmax:.3f}]")
+        logger.info(f"   Stage 2 color scale: [{stage2_vmin:.3f}, {stage2_vmax:.3f}]")
+        logger.info(f"   Stage 3 color scale: [{stage3_vmin:.3f}, {stage3_vmax:.3f}]")
 
         # Plot Stage 2 with its own scale
         sns.heatmap(
@@ -485,7 +493,7 @@ class CompositionalCaseStudyAnalyzer:
         plt.savefig(plot_path, dpi=300, bbox_inches="tight")
         plt.close()
 
-        print(f"   ✓ Saved comparison plot to: {plot_path}")
+        logger.info(f"   Saved comparison plot to: {plot_path}")
 
     def run_analysis(
         self,
@@ -500,48 +508,48 @@ class CompositionalCaseStudyAnalyzer:
         Run complete compositional case study analysis.
 
         For each layer:
-        1. Extract Stage 2 representations → compute matrix → save/visualize
-        2. Extract Stage 3 representations → compute matrix → save/visualize
-        3. Create comparison visualization
+        1. Extract Stage 2 representations → compute matrix → save/visualise
+        2. Extract Stage 3 representations → compute matrix → save/visualise
+        3. Create comparison visualisation
 
         Args:
             manifest_file: Path to stimulus manifest JSON
-            layers: List of layer indices to analyze
+            layers: List of layer indices to analyse
             pooling: Pooling strategy (mean)
             output_dir: Output directory
             stage2_checkpoint: Path to Stage 2 checkpoint
             stage3_checkpoint: Path to Stage 3 checkpoint
         """
-        print("=" * 80)
-        print("COMPOSITIONAL CASE STUDY: Stage 2 vs Stage 3 Representation Analysis")
-        print("=" * 80)
+        logger.info("=" * 80)
+        logger.info("COMPOSITIONAL CASE STUDY: Stage 2 vs Stage 3 Representation Analysis")
+        logger.info("=" * 80)
 
         # Load stimuli
         stimuli = self.load_manifest(manifest_file)
         num_stimuli = len(stimuli)
 
-        print("\n📋 Analysis Configuration:")
-        print(f"   Number of stimuli: {num_stimuli}")
-        print(f"   Matrix size: {2 * num_stimuli}×{2 * num_stimuli} (vision + text)")
-        print(f"   Layers: {layers}")
-        print(f"   Pooling: {pooling}")
-        print(f"   Output directory: {output_dir}")
-        print("=" * 80)
+        logger.info("\nAnalysis Configuration:")
+        logger.info(f"   Number of stimuli: {num_stimuli}")
+        logger.info(f"   Matrix size: {2 * num_stimuli}×{2 * num_stimuli} (vision + text)")
+        logger.info(f"   Layers: {layers}")
+        logger.info(f"   Pooling: {pooling}")
+        logger.info(f"   Output directory: {output_dir}")
+        logger.info("=" * 80)
 
         # Initialize stage analyzers
         self.initialize_stage_analyzers(stage2_checkpoint, stage3_checkpoint)
 
         # Process each layer
         for layer_idx, layer in enumerate(layers):
-            print(f"\n{'=' * 80}")
-            print(f"LAYER {layer} ({layer_idx + 1}/{len(layers)})")
-            print(f"{'=' * 80}")
+            logger.info(f"\n{'=' * 80}")
+            logger.info(f"LAYER {layer} ({layer_idx + 1}/{len(layers)})")
+            logger.info(f"{'=' * 80}")
 
             # ============================================================
             # STAGE 2 ANALYSIS
             # ============================================================
-            print("\n🔵 STAGE 2 ANALYSIS")
-            print(f"{'─' * 80}")
+            logger.info("\nSTAGE 2 ANALYSIS")
+            logger.info(f"{'─' * 80}")
 
             # Extract representations
             stage2_reps, stage2_labels = self.extract_stimulus_representations(
@@ -556,11 +564,11 @@ class CompositionalCaseStudyAnalyzer:
             stage2_matrix = self.compute_similarity_matrix(stage2_reps, "Stage 2")
 
             # Save results
-            print("\n💾 Saving Stage 2 results...")
+            logger.info("\nSaving Stage 2 results...")
             self.save_results(stage2_matrix, stage2_labels, output_dir, "stage2", layer)
 
-            # Visualize
-            print("\n📈 Creating Stage 2 visualization...")
+            # Visualise
+            logger.info("\nCreating Stage 2 visualization...")
             self.visualize_matrix(
                 stage2_matrix, stage2_labels, output_dir, "stage2", layer, self.temperature
             )
@@ -568,8 +576,8 @@ class CompositionalCaseStudyAnalyzer:
             # ============================================================
             # STAGE 3 ANALYSIS
             # ============================================================
-            print("\n🟢 STAGE 3 ANALYSIS")
-            print(f"{'─' * 80}")
+            logger.info("\nSTAGE 3 ANALYSIS")
+            logger.info(f"{'─' * 80}")
 
             # Extract representations
             stage3_reps, stage3_labels = self.extract_stimulus_representations(
@@ -584,37 +592,37 @@ class CompositionalCaseStudyAnalyzer:
             stage3_matrix = self.compute_similarity_matrix(stage3_reps, "Stage 3")
 
             # Save results
-            print("\n💾 Saving Stage 3 results...")
+            logger.info("\nSaving Stage 3 results...")
             self.save_results(stage3_matrix, stage3_labels, output_dir, "stage3", layer)
 
-            # Visualize
-            print("\n📈 Creating Stage 3 visualization...")
+            # Visualise
+            logger.info("\nCreating Stage 3 visualization...")
             self.visualize_matrix(
                 stage3_matrix, stage3_labels, output_dir, "stage3", layer, self.temperature
             )
 
             # ============================================================
-            # COMPARISON VISUALIZATION
+            # COMPARISON VISUALISATION
             # ============================================================
-            print("\n🔀 COMPARISON ANALYSIS")
-            print(f"{'─' * 80}")
+            logger.info("\nCOMPARISON ANALYSIS")
+            logger.info(f"{'─' * 80}")
 
             self.visualize_cross_modal_comparison(
                 stage2_matrix, stage3_matrix, stage2_labels, output_dir, layer
             )
 
-            print(f"\n✅ Layer {layer} analysis complete!")
+            logger.info(f"\nLayer {layer} analysis complete!")
 
-        print(f"\n{'=' * 80}")
-        print("✅ ANALYSIS COMPLETE!")
-        print(f"   Processed {len(layers)} layers")
-        print(f"   Generated {len(layers) * 5} output files per layer:")
-        print("      - 2 matrices (stage2, stage3)")
-        print("      - 2 labels (stage2, stage3)")
-        print("      - 2 heatmaps (stage2, stage3)")
-        print("      - 1 comparison plot")
-        print(f"   📁 Results saved to: {output_dir}")
-        print("=" * 80)
+        logger.info(f"\n{'=' * 80}")
+        logger.info("ANALYSIS COMPLETE!")
+        logger.info(f"   Processed {len(layers)} layers")
+        logger.info(f"   Generated {len(layers) * 5} output files per layer:")
+        logger.info("      - 2 matrices (stage2, stage3)")
+        logger.info("      - 2 labels (stage2, stage3)")
+        logger.info("      - 2 heatmaps (stage2, stage3)")
+        logger.info("      - 1 comparison plot")
+        logger.info(f"   Results saved to: {output_dir}")
+        logger.info("=" * 80)
 
 
 def load_config(config_file: str) -> dict:
@@ -658,18 +666,18 @@ def main():
     args = parser.parse_args()
 
     # Load config
-    print(f"📄 Loading configuration from: {args.config_file}")
+    logger.info(f"Loading configuration from: {args.config_file}")
     config = load_config(args.config_file)
 
     # Print configuration
-    print("\n📋 Configuration:")
-    print(f"   Manifest file: {config['manifest_file']}")
-    print(f"   Layers: {config['layers']}")
-    print(f"   Pooling: {config['pooling']}")
-    print(f"   Temperature: {config['temperature']}")
-    print(f"   Output directory: {config['output_dir']}")
-    print(f"   Stage 2 checkpoint: {config['stage2_checkpoint']}")
-    print(f"   Stage 3 checkpoint: {config['stage3_checkpoint']}")
+    logger.info("\nConfiguration:")
+    logger.info(f"   Manifest file: {config['manifest_file']}")
+    logger.info(f"   Layers: {config['layers']}")
+    logger.info(f"   Pooling: {config['pooling']}")
+    logger.info(f"   Temperature: {config['temperature']}")
+    logger.info(f"   Output directory: {config['output_dir']}")
+    logger.info(f"   Stage 2 checkpoint: {config['stage2_checkpoint']}")
+    logger.info(f"   Stage 3 checkpoint: {config['stage3_checkpoint']}")
 
     # Initialize analyzer
     analyzer = CompositionalCaseStudyAnalyzer(
@@ -688,4 +696,5 @@ def main():
 
 
 if __name__ == "__main__":
+    setup_logging()
     main()

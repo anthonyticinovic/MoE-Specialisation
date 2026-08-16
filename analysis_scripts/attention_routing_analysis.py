@@ -1,7 +1,7 @@
 """
 MoE Attention-Routing Analysis
 
-Analyzes how attention patterns and expert routing evolve across all layers
+Analyses how attention patterns and expert routing evolve across all layers
 of the MoE model to understand when and how the model transitions from
 modality-specific to multimodal processing.
 
@@ -11,6 +11,7 @@ Usage:
         --device cuda
 """
 
+import logging
 import argparse
 import json
 import os
@@ -23,11 +24,14 @@ from analysis_scripts._lib import majority_vote_expert
 
 # Import base analyzer
 from analysis_scripts.cross_modality_purity import CrossModalityPurityAnalyzer
+from models.utils.common import setup_logging
+
+logger = logging.getLogger(__name__)
 
 
 class AttentionRoutingAnalyzer(CrossModalityPurityAnalyzer):
     """
-    Extends CrossModalityPurityAnalyzer to analyze attention and routing patterns.
+    Extends CrossModalityPurityAnalyzer to analyse attention and routing patterns.
 
     Examines how attention patterns evolve across layers and how they relate to
     expert routing decisions.
@@ -54,8 +58,8 @@ class AttentionRoutingAnalyzer(CrossModalityPurityAnalyzer):
                 - 'caption': Image caption
                 - 'image_path': Image filename
         """
-        print(f"📚 Extracting {num_samples} random samples from COCO...")
-        print(f"   Minimum caption length: {min_caption_length} tokens")
+        logger.info(f"Extracting {num_samples} random samples from COCO...")
+        logger.info(f"   Minimum caption length: {min_caption_length} tokens")
 
         # Load COCO annotations
         with open(annotations_file) as f:
@@ -80,7 +84,7 @@ class AttentionRoutingAnalyzer(CrossModalityPurityAnalyzer):
                     }
                 )
 
-        print(f"   Found {len(valid_samples)} valid samples")
+        logger.info(f"   Found {len(valid_samples)} valid samples")
 
         # Random sample
         np.random.seed(seed)
@@ -89,7 +93,7 @@ class AttentionRoutingAnalyzer(CrossModalityPurityAnalyzer):
         )
         selected_samples = [valid_samples[i] for i in selected_indices]
 
-        print(f"   ✅ Selected {len(selected_samples)} random samples")
+        logger.info(f"   Selected {len(selected_samples)} random samples")
         return selected_samples
 
     def _extract_attention_with_routing(
@@ -206,7 +210,7 @@ class AttentionRoutingAnalyzer(CrossModalityPurityAnalyzer):
 
         Args:
             routing_logits: [seq_len, num_experts] routing logits
-            token_indices: Indices of tokens to analyze (e.g., text tokens only)
+            token_indices: Indices of tokens to analyse (e.g., text tokens only)
             confidence_threshold: Minimum vote fraction for decisive assignment
 
         Returns:
@@ -250,8 +254,8 @@ class AttentionRoutingAnalyzer(CrossModalityPurityAnalyzer):
                 - text_to_text_attention: Mean attention mass within text
                 - text_attention_entropy: Attention focus for text tokens
                 - vision_attention_entropy: Attention focus for vision tokens
-                - vision_routing_entropy: Normalized routing entropy for vision
-                - text_routing_entropy: Normalized routing entropy for text
+                - vision_routing_entropy: Normalised routing entropy for vision
+                - text_routing_entropy: Normalised routing entropy for text
         """
         # Average across heads: [seq_len, seq_len]
         attn = attention_weights.mean(dim=0)
@@ -321,12 +325,12 @@ class AttentionRoutingAnalyzer(CrossModalityPurityAnalyzer):
         else:
             vision_entropy = 0.0
 
-        # Compute routing entropy (normalized)
+        # Compute routing entropy (normalised)
         routing_probs = torch.softmax(routing_logits, dim=-1)  # [seq_len, num_experts]
         num_experts = routing_probs.shape[1]
 
         def routing_entropy_normalized(probs, indices):
-            """Compute normalized Shannon entropy of routing distribution."""
+            """Compute normalised Shannon entropy of routing distribution."""
             if len(indices) == 0:
                 return 0.0
 
@@ -367,7 +371,7 @@ class AttentionRoutingAnalyzer(CrossModalityPurityAnalyzer):
         output_dir: str = "results/attention_routing_analysis",
     ) -> dict[int, dict[str, list[float]]]:
         """
-        Analyze attention and routing patterns across all layers for multiple samples.
+        Analyse attention and routing patterns across all layers for multiple samples.
 
         Args:
             samples: List of sample dicts with 'image_path' and 'caption'
@@ -375,21 +379,21 @@ class AttentionRoutingAnalyzer(CrossModalityPurityAnalyzer):
             num_vision_tokens: Number of vision tokens
             exclude_self_attention: Whether to exclude self-attention
             expert_confidence_threshold: Threshold for expert assignment confidence
-            analyze_expert_correlation: Whether to analyze expert-attention correlation
+            analyze_expert_correlation: Whether to analyse expert-attention correlation
             output_dir: Directory to save plots
 
         Returns:
             Dict mapping layer_idx -> metric_name -> list of values across samples
         """
-        print(f"\n{'=' * 70}")
-        print("🔬 Analyzing Attention-Routing Patterns Across All Layers")
-        print(f"{'=' * 70}")
-        print(f"Samples: {len(samples)}")
-        print(f"Vision tokens: {num_vision_tokens}")
-        print(f"Exclude self-attention: {exclude_self_attention}")
+        logger.info(f"\n{'=' * 70}")
+        logger.info("Analysing Attention-Routing Patterns Across All Layers")
+        logger.info(f"{'=' * 70}")
+        logger.info(f"Samples: {len(samples)}")
+        logger.info(f"Vision tokens: {num_vision_tokens}")
+        logger.info(f"Exclude self-attention: {exclude_self_attention}")
         if analyze_expert_correlation:
-            print(f"Expert correlation: ENABLED (threshold={expert_confidence_threshold})")
-        print(f"{'=' * 70}\n")
+            logger.info(f"Expert correlation: ENABLED (threshold={expert_confidence_threshold})")
+        logger.info(f"{'=' * 70}\n")
 
         # Initialize storage for metrics per layer
         num_layers = 32  # Mistral has 32 layers
@@ -420,7 +424,7 @@ class AttentionRoutingAnalyzer(CrossModalityPurityAnalyzer):
         # Process each sample
         for sample_idx, sample in enumerate(samples):
             if (sample_idx + 1) % 10 == 0:
-                print(f"   Processing sample {sample_idx + 1}/{len(samples)}...")
+                logger.info(f"   Processing sample {sample_idx + 1}/{len(samples)}...")
 
             image_path = os.path.join(image_dir, sample["image_path"])
             caption = sample["caption"]
@@ -462,10 +466,10 @@ class AttentionRoutingAnalyzer(CrossModalityPurityAnalyzer):
                         )
 
             except Exception as e:
-                print(f"      ⚠️  Error processing sample {sample_idx}: {e}")
+                logger.warning(f"       Error processing sample {sample_idx}: {e}")
                 continue
 
-        print(f"\n✅ Processed {len(samples)} samples across {num_layers} layers")
+        logger.info(f"\nProcessed {len(samples)} samples across {num_layers} layers")
 
         # Generate plots
         arp.plot_attention_routing_evolution(layer_metrics, output_dir)
@@ -495,20 +499,20 @@ def main():
     args = parser.parse_args()
 
     # Load config
-    print(f"📋 Loading config from {args.config}")
+    logger.info(f"Loading config from {args.config}")
     with open(args.config) as f:
         config = json.load(f)
 
     # Print configuration
-    print(f"\n{'=' * 70}")
-    print("🔬 MoE Attention-Routing Analysis")
-    print(f"{'=' * 70}")
-    print(f"Checkpoint: {config['checkpoint_path']}")
-    print(f"Number of samples: {config['data']['num_samples']}")
-    print(f"Min caption length: {config['data']['min_caption_length']}")
-    print(f"Exclude self-attention: {config['analysis']['exclude_self_attention']}")
-    print(f"Output directory: {config['output']['save_dir']}")
-    print(f"{'=' * 70}\n")
+    logger.info(f"\n{'=' * 70}")
+    logger.info("MoE Attention-Routing Analysis")
+    logger.info(f"{'=' * 70}")
+    logger.info(f"Checkpoint: {config['checkpoint_path']}")
+    logger.info(f"Number of samples: {config['data']['num_samples']}")
+    logger.info(f"Min caption length: {config['data']['min_caption_length']}")
+    logger.info(f"Exclude self-attention: {config['analysis']['exclude_self_attention']}")
+    logger.info(f"Output directory: {config['output']['save_dir']}")
+    logger.info(f"{'=' * 70}\n")
 
     # Initialize analyzer
     analyzer = AttentionRoutingAnalyzer(device=args.device)
@@ -524,7 +528,7 @@ def main():
         seed=config["data"]["seed"],
     )
 
-    # Analyze attention and routing across all layers
+    # Analyse attention and routing across all layers
     layer_metrics = analyzer.analyze_attention_routing_across_layers(
         samples=samples,
         image_dir=config["data"]["image_dir"],
@@ -535,11 +539,12 @@ def main():
         output_dir=config["output"]["save_dir"],
     )
 
-    print(f"\n{'=' * 70}")
-    print("✅ Attention-routing analysis complete!")
-    print(f"   Results saved to {config['output']['save_dir']}")
-    print(f"{'=' * 70}\n")
+    logger.info(f"\n{'=' * 70}")
+    logger.info("Attention-routing analysis complete!")
+    logger.info(f"   Results saved to {config['output']['save_dir']}")
+    logger.info(f"{'=' * 70}\n")
 
 
 if __name__ == "__main__":
+    setup_logging()
     main()

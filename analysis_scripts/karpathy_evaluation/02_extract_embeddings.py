@@ -4,6 +4,7 @@ Step 2: Extract image and text embeddings for retrieval evaluation.
 Extracts final layer activations from vision and text encoders.
 """
 
+import logging
 import argparse
 import time
 from pathlib import Path
@@ -16,9 +17,12 @@ from karpathy_utils import (
     load_json,
     load_model_checkpoint,
     mean_pool_embeddings,
-    print_banner,
+    log_banner,
 )
 from tqdm import tqdm
+from models.utils.common import setup_logging
+
+logger = logging.getLogger(__name__)
 
 
 def extract_image_embeddings(
@@ -48,9 +52,9 @@ def extract_image_embeddings(
     model.eval()
     all_embeddings = []
 
-    print(f"\n📸 Extracting image embeddings from layer {layer_idx}...")
-    print(f"   Total images: {len(images_data)}")
-    print(f"   Batch size: {batch_size}")
+    logger.info(f"\nExtracting image embeddings from layer {layer_idx}...")
+    logger.info(f"   Total images: {len(images_data)}")
+    logger.info(f"   Batch size: {batch_size}")
 
     start_time = time.time()
 
@@ -68,7 +72,7 @@ def extract_image_embeddings(
                 pixel_values = load_and_preprocess_image(image_path, processor)
                 batch_pixel_values.append(pixel_values)
             except Exception as e:
-                print(f"\n⚠️  Error loading {image_path}: {e}")
+                logger.warning(f"\n Error loading {image_path}: {e}")
                 # Use zero tensor as fallback
                 batch_pixel_values.append(torch.zeros(1, 3, 224, 224))
 
@@ -113,9 +117,9 @@ def extract_image_embeddings(
     embeddings = np.vstack(all_embeddings)
 
     elapsed = time.time() - start_time
-    print(f"   ✅ Extracted {len(embeddings)} image embeddings")
-    print(f"   Shape: {embeddings.shape}")
-    print(f"   Time: {format_time(elapsed)}")
+    logger.info(f"   Extracted {len(embeddings)} image embeddings")
+    logger.info(f"   Shape: {embeddings.shape}")
+    logger.info(f"   Time: {format_time(elapsed)}")
 
     return embeddings
 
@@ -140,9 +144,9 @@ def extract_text_embeddings(
     model.eval()
     all_embeddings = []
 
-    print(f"\n💬 Extracting text embeddings from layer {layer_idx}...")
-    print(f"   Total captions: {len(captions_data)}")
-    print(f"   Batch size: {batch_size}")
+    logger.info(f"\nExtracting text embeddings from layer {layer_idx}...")
+    logger.info(f"   Total captions: {len(captions_data)}")
+    logger.info(f"   Batch size: {batch_size}")
 
     start_time = time.time()
 
@@ -181,9 +185,9 @@ def extract_text_embeddings(
     embeddings = np.vstack(all_embeddings)
 
     elapsed = time.time() - start_time
-    print(f"   ✅ Extracted {len(embeddings)} text embeddings")
-    print(f"   Shape: {embeddings.shape}")
-    print(f"   Time: {format_time(elapsed)}")
+    logger.info(f"   Extracted {len(embeddings)} text embeddings")
+    logger.info(f"   Shape: {embeddings.shape}")
+    logger.info(f"   Time: {format_time(elapsed)}")
 
     return embeddings
 
@@ -220,18 +224,18 @@ def main():
 
     args = parser.parse_args()
 
-    print_banner(f"EXTRACTING EMBEDDINGS: {args.stage_name.upper()}")
+    log_banner(f"EXTRACTING EMBEDDINGS: {args.stage_name.upper()}")
 
     # Load model
     model, processor, tokenizer = load_model_checkpoint(args.checkpoint_path, args.device)
 
     # Load retrieval data
-    print(f"\n📖 Loading retrieval data from: {args.retrieval_json}")
+    logger.info(f"\nLoading retrieval data from: {args.retrieval_json}")
     retrieval_data = load_json(args.retrieval_json)
     images_data = retrieval_data["images"]
     captions_data = retrieval_data["captions"]
-    print(f"   Images: {len(images_data)}")
-    print(f"   Captions: {len(captions_data)}")
+    logger.info(f"   Images: {len(images_data)}")
+    logger.info(f"   Captions: {len(captions_data)}")
 
     # Extract image embeddings
     image_embeddings = extract_image_embeddings(
@@ -264,12 +268,13 @@ def main():
     np.save(image_emb_path, image_embeddings)
     np.save(text_emb_path, text_embeddings)
 
-    print("\n💾 Saved embeddings:")
-    print(f"   Images: {image_emb_path}")
-    print(f"   Text: {text_emb_path}")
+    logger.info("\nSaved embeddings:")
+    logger.info(f"   Images: {image_emb_path}")
+    logger.info(f"   Text: {text_emb_path}")
 
-    print_banner(f"✅ {args.stage_name.upper()} EMBEDDING EXTRACTION COMPLETE")
+    log_banner(f"{args.stage_name.upper()} EMBEDDING EXTRACTION COMPLETE")
 
 
 if __name__ == "__main__":
+    setup_logging()
     main()

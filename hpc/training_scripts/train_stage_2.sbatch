@@ -1,5 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=vlm_stage2_training
+# Stage 2 — expert specialisation under hard routing, 4 GPUs with FSDP.
+#
+# Adapt the #SBATCH header to your cluster; see hpc/README.md. Submit from the
+# repository root so the log paths resolve:
+#   mkdir -p logs/slurm && sbatch hpc/training_scripts/train_stage_2.sbatch
+#SBATCH --job-name=moe_stage2
 #SBATCH -p gpu-h100
 #SBATCH --gres=gpu:4
 #SBATCH --nodes=1
@@ -7,33 +12,17 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=256G
 #SBATCH --time=22:30:00
-#SBATCH --output=../out_slurm/train_stage_2/train_stage_2_%j.out
-#SBATCH --error=../err_slurm/train_stage_2/train_stage_2_%j.err
+#SBATCH --output=logs/slurm/%x_%j.out
+#SBATCH --error=logs/slurm/%x_%j.err
 
-# Load modules
-module purge
-module load GCCcore/11.3.0
-module load Python/3.11.3
-module load CUDA  # Load the default CUDA
+source "${MOE_PROJECT_DIR:-$HOME/MoE-Specialisation}/hpc/cluster_env.sh"
+moe_setup_environment
 
-source ~/pytorch_latest_venv/bin/activate # Activate the new venv
+export NCCL_DEBUG=INFO
+export PYTHONFAULTHANDLER=1        # tracebacks on segfaults
+export TORCH_NCCL_BLOCKING_WAIT=1  # NCCL_TIMEOUT is ignored from PyTorch 2.5
 
-echo "=== VERIFICATION ==="
-# Verify that python is coming from the correct environment
-which python
-# Verify PyTorch can see the GPU
-python -c "import torch; print(f'PyTorch: {torch.__version__}, CUDA available: {torch.cuda.is_available()}')"
-python -c "import transformers; print(f'Transformers: {transformers.__version__}')"
-
-# Rest of your script...
-cd $HOME/MoE-Specialisation
-export PYTHONPATH="${PWD}:${PYTHONPATH}"
-
-echo "Starting training script..."
-export NCCL_DEBUG=INFO # Optional: for debugging network communication
-export PYTHONFAULTHANDLER=1 # Optional: for better tracebacks on segfaults
-export NCCL_TIMEOUT=900    
-
+echo "Starting Stage 2 (experts, hard routing)..."
 srun torchrun --nproc_per_node=4 training_scripts/train_stage_2.py
 
 echo "Job finished."

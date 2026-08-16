@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import os
 
 import matplotlib.pyplot as plt
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 def plot_attention_routing_evolution(
@@ -18,7 +21,7 @@ def plot_attention_routing_evolution(
         layer_metrics: Dict mapping layer_idx -> metric_name -> values
         output_dir: Directory to save plots
     """
-    print("\n📊 Generating attention-routing evolution plots...")
+    logger.info("\nGenerating attention-routing evolution plots...")
     os.makedirs(output_dir, exist_ok=True)
 
     num_layers = len(layer_metrics)
@@ -93,7 +96,7 @@ def plot_attention_routing_evolution(
     plot_path = os.path.join(output_dir, "attention_patterns.png")
     plt.savefig(plot_path, dpi=300, bbox_inches="tight")
     plt.close()
-    print(f"   ✅ Saved: {plot_path}")
+    logger.info(f"   Saved: {plot_path}")
 
     # Plot 3: Attention Focus (Entropy)
     fig, ax = plt.subplots(figsize=(12, 6))
@@ -132,9 +135,9 @@ def plot_attention_routing_evolution(
     plot_path = os.path.join(output_dir, "attention_focus.png")
     plt.savefig(plot_path, dpi=300, bbox_inches="tight")
     plt.close()
-    print(f"   ✅ Saved: {plot_path}")
+    logger.info(f"   Saved: {plot_path}")
 
-    print(f"\n✅ All plots saved to {output_dir}")
+    logger.info(f"\nAll plots saved to {output_dir}")
 
 
 def plot_expert_attention_correlation(
@@ -149,7 +152,7 @@ def plot_expert_attention_correlation(
         layer_token_data: Dict mapping layer_idx -> {'expert0_attentions': [...], 'expert1_attentions': [...]}
         output_dir: Directory to save plot
     """
-    print("\n📊 Generating expert-attention correlation plot (token-level)...")
+    logger.info("\nGenerating expert-attention correlation plot (token-level)...")
 
     num_layers = len(layer_token_data)
     layers = np.arange(num_layers)
@@ -279,21 +282,25 @@ def plot_expert_attention_correlation(
     plot_path = os.path.join(output_dir, "expert_attention_correlation.png")
     plt.savefig(plot_path, dpi=300, bbox_inches="tight")
     plt.close()
-    print(f"   ✅ Saved: {plot_path}")
+    logger.info(f"   Saved: {plot_path}")
 
     # Print summary statistics
-    print("\n📈 Expert-Attention Correlation Summary (Token-Level):")
-    print(f"   Expert 0 tokens per layer: {expert0_counts.mean():.0f} ± {expert0_counts.std():.0f}")
-    print(f"   Expert 1 tokens per layer: {expert1_counts.mean():.0f} ± {expert1_counts.std():.0f}")
-    print(f"   Total tokens analyzed: {expert0_counts.sum() + expert1_counts.sum():.0f}")
+    logger.info("\nExpert-Attention Correlation Summary (Token-Level):")
+    logger.info(
+        f"   Expert 0 tokens per layer: {expert0_counts.mean():.0f} ± {expert0_counts.std():.0f}"
+    )
+    logger.info(
+        f"   Expert 1 tokens per layer: {expert1_counts.mean():.0f} ± {expert1_counts.std():.0f}"
+    )
+    logger.info(f"   Total tokens analysed: {expert0_counts.sum() + expert1_counts.sum():.0f}")
 
     # Report layers with zero tokens for either expert
     zero_e0_layers = np.where(expert0_counts == 0)[0]
     zero_e1_layers = np.where(expert1_counts == 0)[0]
     if len(zero_e0_layers) > 0:
-        print(f"   ⚠️  Layers with ZERO Expert 0 tokens: {list(zero_e0_layers)}")
+        logger.warning(f"    Layers with ZERO Expert 0 tokens: {list(zero_e0_layers)}")
     if len(zero_e1_layers) > 0:
-        print(f"   ⚠️  Layers with ZERO Expert 1 tokens: {list(zero_e1_layers)}")
+        logger.warning(f"    Layers with ZERO Expert 1 tokens: {list(zero_e1_layers)}")
 
     # Report expert balance
     total_e0 = expert0_counts.sum()
@@ -301,7 +308,7 @@ def plot_expert_attention_correlation(
     if total_e0 + total_e1 > 0:
         e0_fraction = total_e0 / (total_e0 + total_e1)
         e1_fraction = total_e1 / (total_e0 + total_e1)
-        print(f"   Expert routing balance: E0={e0_fraction:.1%}, E1={e1_fraction:.1%}")
+        logger.info(f"   Expert routing balance: E0={e0_fraction:.1%}, E1={e1_fraction:.1%}")
 
     # Find layers with largest difference (only layers with data for both experts)
     valid_e0 = ~np.isnan(expert0_means)
@@ -311,6 +318,6 @@ def plot_expert_attention_correlation(
         differences = np.abs(expert0_means[valid_both] - expert1_means[valid_both])
         max_diff_idx = layers[valid_both][np.argmax(differences)]
         max_diff = differences.max()
-        print(f"   Largest attention difference: Layer {max_diff_idx} ({max_diff:.3f})")
-        print(f"      Expert 0: {expert0_means[max_diff_idx]:.3f}")
-        print(f"      Expert 1: {expert1_means[max_diff_idx]:.3f}")
+        logger.info(f"   Largest attention difference: Layer {max_diff_idx} ({max_diff:.3f})")
+        logger.info(f"      Expert 0: {expert0_means[max_diff_idx]:.3f}")
+        logger.info(f"      Expert 1: {expert1_means[max_diff_idx]:.3f}")

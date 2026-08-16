@@ -4,19 +4,23 @@ Step 5: Evaluate generated captions using COCO metrics.
 Computes BLEU-1/2/3/4, CIDEr, METEOR, SPICE, ROUGE-L.
 """
 
+import logging
 import argparse
 import sys
 from pathlib import Path
 
-from karpathy_utils import print_banner, save_json
+from karpathy_utils import log_banner, save_json
+from models.utils.common import setup_logging
+
+logger = logging.getLogger(__name__)
 
 # Import COCO evaluation tools (from pip-installed pycocoevalcap)
 try:
     from pycocoevalcap.eval import COCOEvalCap
     from pycocotools.coco import COCO
 except ImportError:
-    print("ERROR: pycocoevalcap not found. Install with:")
-    print("  pip install pycocoevalcap")
+    logger.error("ERROR: pycocoevalcap not found. Install with:")
+    logger.info("  pip install pycocoevalcap")
     sys.exit(1)
 
 
@@ -31,9 +35,9 @@ def evaluate_captions(references_json: str, generated_json: str) -> dict:
     Returns:
         metrics: Dict with BLEU, CIDEr, METEOR, SPICE, ROUGE-L scores
     """
-    print("\n📊 Evaluating captions...")
-    print(f"   References: {references_json}")
-    print(f"   Generated: {generated_json}")
+    logger.info("\nEvaluating captions...")
+    logger.info(f"   References: {references_json}")
+    logger.info(f"   Generated: {generated_json}")
 
     # Load references
     coco = COCO(references_json)
@@ -58,7 +62,7 @@ def evaluate_captions(references_json: str, generated_json: str) -> dict:
         coco_eval.evaluate()
     except Exception as e:
         # If SPICE fails (Java compatibility), evaluate without it
-        print(f"   ⚠️  SPICE evaluation failed ({str(e)[:100]}), computing other metrics...")
+        logger.warning(f"    SPICE evaluation failed ({str(e)[:100]}), computing other metrics...")
         from pycocoevalcap.bleu.bleu import Bleu
         from pycocoevalcap.cider.cider import Cider
         from pycocoevalcap.meteor.meteor import Meteor
@@ -98,7 +102,7 @@ def evaluate_captions(references_json: str, generated_json: str) -> dict:
     metrics = {}
     for metric, score in coco_eval.eval.items():
         metrics[metric] = float(score)
-        print(f"   {metric}: {score:.4f}")
+        logger.info(f"   {metric}: {score:.4f}")
 
     return metrics
 
@@ -209,21 +213,21 @@ def main():
 
     args = parser.parse_args()
 
-    print_banner("CAPTIONING EVALUATION")
+    log_banner("CAPTIONING EVALUATION")
 
     # Evaluate Stage 2
-    print("\n" + "=" * 80)
-    print("STAGE 2 EVALUATION")
-    print("=" * 80)
+    logger.info("\n" + "=" * 80)
+    logger.info("STAGE 2 EVALUATION")
+    logger.info("=" * 80)
 
     stage2_metrics = evaluate_captions(
         references_json=args.references_json, generated_json=args.stage2_captions
     )
 
     # Evaluate Stage 3
-    print("\n" + "=" * 80)
-    print("STAGE 3 EVALUATION")
-    print("=" * 80)
+    logger.info("\n" + "=" * 80)
+    logger.info("STAGE 3 EVALUATION")
+    logger.info("=" * 80)
 
     stage3_metrics = evaluate_captions(
         references_json=args.references_json, generated_json=args.stage3_captions
@@ -237,20 +241,21 @@ def main():
 
     metrics_path = output_dir / "captioning_metrics.json"
     save_json(all_metrics, str(metrics_path))
-    print(f"\n💾 Saved metrics: {metrics_path}")
+    logger.info(f"\nSaved metrics: {metrics_path}")
 
     # Print comparison table
     comparison = format_comparison_table(stage2_metrics, stage3_metrics)
-    print(comparison)
+    logger.info(comparison)
 
     # Save comparison to text file
     comparison_path = output_dir / "captioning_comparison.txt"
     with open(comparison_path, "w") as f:
         f.write(comparison)
-    print(f"\n💾 Saved comparison: {comparison_path}")
+    logger.info(f"\nSaved comparison: {comparison_path}")
 
-    print_banner("✅ CAPTIONING EVALUATION COMPLETE")
+    log_banner("CAPTIONING EVALUATION COMPLETE")
 
 
 if __name__ == "__main__":
+    setup_logging()
     main()

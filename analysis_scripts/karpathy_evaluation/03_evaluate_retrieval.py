@@ -4,11 +4,15 @@ Step 3: Evaluate retrieval metrics (Image-to-Text and Text-to-Image).
 Computes R@1, R@5, R@10 for both directions.
 """
 
+import logging
 import argparse
 from pathlib import Path
 
 import numpy as np
-from karpathy_utils import print_banner, save_json
+from karpathy_utils import log_banner, save_json
+from models.utils.common import setup_logging
+
+logger = logging.getLogger(__name__)
 
 
 def normalize_embeddings(embeddings: np.ndarray) -> np.ndarray:
@@ -30,9 +34,9 @@ def compute_similarity_matrix(
     Returns:
         similarity: (num_images, num_captions) matrix
     """
-    print("\n📊 Computing similarity matrix...")
-    print(f"   Image embeddings: {image_embeddings.shape}")
-    print(f"   Text embeddings: {text_embeddings.shape}")
+    logger.info("\nComputing similarity matrix...")
+    logger.info(f"   Image embeddings: {image_embeddings.shape}")
+    logger.info(f"   Text embeddings: {text_embeddings.shape}")
 
     # Normalize for cosine similarity
     image_emb_norm = normalize_embeddings(image_embeddings)
@@ -41,9 +45,9 @@ def compute_similarity_matrix(
     # Compute similarity: (num_images, num_captions)
     similarity = image_emb_norm @ text_emb_norm.T
 
-    print(f"   Similarity matrix: {similarity.shape}")
-    print(f"   Range: [{similarity.min():.4f}, {similarity.max():.4f}]")
-    print(f"   Mean: {similarity.mean():.4f}")
+    logger.info(f"   Similarity matrix: {similarity.shape}")
+    logger.info(f"   Range: [{similarity.min():.4f}, {similarity.max():.4f}]")
+    logger.info(f"   Mean: {similarity.mean():.4f}")
 
     return similarity
 
@@ -66,7 +70,7 @@ def evaluate_image_to_text(similarity: np.ndarray, num_captions_per_image: int =
 
     ranks = []
 
-    print("\n📸→💬 Evaluating Image-to-Text retrieval...")
+    logger.info("\n→Evaluating Image-to-Text retrieval...")
 
     for img_idx in range(num_images):
         # Get similarities for this image to all captions
@@ -100,10 +104,10 @@ def evaluate_image_to_text(similarity: np.ndarray, num_captions_per_image: int =
         "mean_rank": float(np.mean(ranks)),
     }
 
-    print(f"   R@1:  {r1:.2f}%")
-    print(f"   R@5:  {r5:.2f}%")
-    print(f"   R@10: {r10:.2f}%")
-    print(f"   Median rank: {metrics['median_rank']:.1f}")
+    logger.info(f"   R@1:  {r1:.2f}%")
+    logger.info(f"   R@5:  {r5:.2f}%")
+    logger.info(f"   R@10: {r10:.2f}%")
+    logger.info(f"   Median rank: {metrics['median_rank']:.1f}")
 
     return metrics
 
@@ -126,7 +130,7 @@ def evaluate_text_to_image(similarity: np.ndarray, num_captions_per_image: int =
 
     ranks = []
 
-    print("\n💬→📸 Evaluating Text-to-Image retrieval...")
+    logger.info("\n→Evaluating Text-to-Image retrieval...")
 
     for cap_idx in range(num_captions):
         # Get similarities for this caption to all images
@@ -157,10 +161,10 @@ def evaluate_text_to_image(similarity: np.ndarray, num_captions_per_image: int =
         "mean_rank": float(np.mean(ranks)),
     }
 
-    print(f"   R@1:  {r1:.2f}%")
-    print(f"   R@5:  {r5:.2f}%")
-    print(f"   R@10: {r10:.2f}%")
-    print(f"   Median rank: {metrics['median_rank']:.1f}")
+    logger.info(f"   R@1:  {r1:.2f}%")
+    logger.info(f"   R@5:  {r5:.2f}%")
+    logger.info(f"   R@10: {r10:.2f}%")
+    logger.info(f"   Median rank: {metrics['median_rank']:.1f}")
 
     return metrics
 
@@ -249,27 +253,27 @@ def main():
 
     args = parser.parse_args()
 
-    print_banner("RETRIEVAL EVALUATION")
+    log_banner("RETRIEVAL EVALUATION")
 
     embeddings_dir = Path(args.embeddings_dir)
 
     # Load embeddings
-    print("\n📂 Loading embeddings...")
+    logger.info("\nLoading embeddings...")
 
     stage2_img = np.load(embeddings_dir / "stage2_image_embeddings.npy")
     stage2_txt = np.load(embeddings_dir / "stage2_text_embeddings.npy")
     stage3_img = np.load(embeddings_dir / "stage3_image_embeddings.npy")
     stage3_txt = np.load(embeddings_dir / "stage3_text_embeddings.npy")
 
-    print(f"   Stage 2 images: {stage2_img.shape}")
-    print(f"   Stage 2 texts: {stage2_txt.shape}")
-    print(f"   Stage 3 images: {stage3_img.shape}")
-    print(f"   Stage 3 texts: {stage3_txt.shape}")
+    logger.info(f"   Stage 2 images: {stage2_img.shape}")
+    logger.info(f"   Stage 2 texts: {stage2_txt.shape}")
+    logger.info(f"   Stage 3 images: {stage3_img.shape}")
+    logger.info(f"   Stage 3 texts: {stage3_txt.shape}")
 
     # Evaluate Stage 2
-    print("\n" + "=" * 80)
-    print("STAGE 2 EVALUATION")
-    print("=" * 80)
+    logger.info("\n" + "=" * 80)
+    logger.info("STAGE 2 EVALUATION")
+    logger.info("=" * 80)
 
     sim_stage2 = compute_similarity_matrix(stage2_img, stage2_txt)
     i2t_stage2 = evaluate_image_to_text(sim_stage2)
@@ -278,9 +282,9 @@ def main():
     stage2_metrics = {"image_to_text": i2t_stage2, "text_to_image": t2i_stage2}
 
     # Evaluate Stage 3
-    print("\n" + "=" * 80)
-    print("STAGE 3 EVALUATION")
-    print("=" * 80)
+    logger.info("\n" + "=" * 80)
+    logger.info("STAGE 3 EVALUATION")
+    logger.info("=" * 80)
 
     sim_stage3 = compute_similarity_matrix(stage3_img, stage3_txt)
     i2t_stage3 = evaluate_image_to_text(sim_stage3)
@@ -299,16 +303,17 @@ def main():
 
     # Print comparison table
     comparison = format_comparison_table(stage2_metrics, stage3_metrics)
-    print(comparison)
+    logger.info(comparison)
 
     # Save comparison to text file
     comparison_path = output_dir / "retrieval_comparison.txt"
     with open(comparison_path, "w") as f:
         f.write(comparison)
-    print(f"\n💾 Saved comparison: {comparison_path}")
+    logger.info(f"\nSaved comparison: {comparison_path}")
 
-    print_banner("✅ RETRIEVAL EVALUATION COMPLETE")
+    log_banner("RETRIEVAL EVALUATION COMPLETE")
 
 
 if __name__ == "__main__":
+    setup_logging()
     main()

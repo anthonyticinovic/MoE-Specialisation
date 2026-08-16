@@ -2,13 +2,14 @@
 """
 Expert Routing Ablation Study for Stage 2 (Hard Routing)
 
-Experiment: Evaluate whether expert specialization is meaningful by comparing
+Experiment: Evaluate whether expert specialisation is meaningful by comparing
 performance with normal routing vs. flipped routing.
 
 Expected: Normal routing (vision=Expert 0, text=Expert 1) should have lower loss
 than flipped routing (vision=Expert 1, text=Expert 0).
 """
 
+import logging
 import json
 from pathlib import Path
 
@@ -18,11 +19,14 @@ import torch
 from tqdm import tqdm
 
 from analysis_scripts._lib import load_stage2_models, load_training_config
+from models.utils.common import setup_logging
+
+logger = logging.getLogger(__name__)
 
 
 def load_stage2_model(checkpoint_path, config, device="cuda"):
     """Load Stage 2 model with hard routing via the shared _lib loader."""
-    print("Loading Stage 2 model...")
+    logger.info("Loading Stage 2 model...")
     models = load_stage2_models(config, device, stage2_checkpoint=checkpoint_path)
     return (
         models.vision_encoder,
@@ -146,13 +150,13 @@ def run_routing_ablation(
     """
     config = load_training_config(training_config or "configs/training_config.yaml")
 
-    print("=" * 80)
-    print("EXPERT ROUTING ABLATION STUDY - STAGE 2")
-    print("=" * 80)
-    print(f"Checkpoint: {checkpoint_path or 'default (from training_config.yaml)'}")
-    print(f"Num samples: {num_samples}")
-    print(f"Device: {device}")
-    print()
+    logger.info("=" * 80)
+    logger.info("EXPERT ROUTING ABLATION STUDY - STAGE 2")
+    logger.info("=" * 80)
+    logger.info(f"Checkpoint: {checkpoint_path or 'default (from training_config.yaml)'}")
+    logger.info(f"Num samples: {num_samples}")
+    logger.info(f"Device: {device}")
+    logger.info("")
 
     # Load model
     clip_model, vision_connector, llm, tokenizer, processor = load_stage2_model(
@@ -169,7 +173,7 @@ def run_routing_ablation(
     if data_path is None:
         data_path = str(Path(config["paths"]["image_dir"]).parent)
     coco_root = Path(data_path)
-    print(f"Loading data from {coco_root}...")
+    logger.info(f"Loading data from {coco_root}...")
     from torch.utils.data import DataLoader
 
     from data.COCO_loader import COCO_Loader
@@ -189,10 +193,10 @@ def run_routing_ablation(
     normal_losses = []  # vision=0, text=1 (trained configuration)
     flipped_losses = []  # vision=1, text=0 (ablation)
 
-    print(f"\nEvaluating {num_samples} samples...")
-    print("  Normal routing: vision → Expert 0, text → Expert 1")
-    print("  Flipped routing: vision → Expert 1, text → Expert 0")
-    print()
+    logger.info(f"\nEvaluating {num_samples} samples...")
+    logger.info("  Normal routing: vision → Expert 0, text → Expert 1")
+    logger.info("  Flipped routing: vision → Expert 1, text → Expert 0")
+    logger.info("")
 
     for i, batch in enumerate(tqdm(val_loader, total=num_samples)):
         if i >= num_samples:
@@ -237,21 +241,21 @@ def run_routing_ablation(
     delta_percent = (delta / normal_mean) * 100
 
     # Results
-    print("\n" + "=" * 80)
-    print("RESULTS")
-    print("=" * 80)
-    print("\nNormal Routing (vision=0, text=1):")
-    print(f"  Mean Loss: {normal_mean:.4f} ± {normal_std:.4f}")
-    print("\nFlipped Routing (vision=1, text=0):")
-    print(f"  Mean Loss: {flipped_mean:.4f} ± {flipped_std:.4f}")
-    print(f"\nΔ Loss (Flipped - Normal): {delta:+.4f} ({delta_percent:+.1f}%)")
+    logger.info("\n" + "=" * 80)
+    logger.info("RESULTS")
+    logger.info("=" * 80)
+    logger.info("\nNormal Routing (vision=0, text=1):")
+    logger.info(f"  Mean Loss: {normal_mean:.4f} ± {normal_std:.4f}")
+    logger.info("\nFlipped Routing (vision=1, text=0):")
+    logger.info(f"  Mean Loss: {flipped_mean:.4f} ± {flipped_std:.4f}")
+    logger.info(f"\nΔ Loss (Flipped - Normal): {delta:+.4f} ({delta_percent:+.1f}%)")
 
     if delta > 0:
-        print(f"\n✅ VALIDATION: Flipped routing has {delta_percent:.1f}% higher loss!")
-        print("   This confirms that expert specialization is meaningful.")
+        logger.info(f"\nVALIDATION: Flipped routing has {delta_percent:.1f}% higher loss!")
+        logger.info("   This confirms that expert specialisation is meaningful.")
     else:
-        print("\n⚠️  UNEXPECTED: Flipped routing has lower loss!")
-        print("   This suggests experts may not be specialized as expected.")
+        logger.warning("\n UNEXPECTED: Flipped routing has lower loss!")
+        logger.info("   This suggests experts may not be specialised as expected.")
 
     # Save results
     results = {
@@ -275,16 +279,16 @@ def run_routing_ablation(
     with open(output_dir / "routing_ablation_results.json", "w") as f:
         json.dump(results, f, indent=2)
 
-    print(f"\n💾 Results saved to: {output_dir / 'routing_ablation_results.json'}")
+    logger.info(f"\nResults saved to: {output_dir / 'routing_ablation_results.json'}")
 
-    # Create visualization
+    # Create visualisation
     create_visualization(normal_losses, flipped_losses, output_dir)
 
     return results
 
 
 def create_visualization(normal_losses, flipped_losses, output_dir):
-    """Create clean box plot visualization comparing normal vs flipped routing."""
+    """Create clean box plot visualisation comparing normal vs flipped routing."""
 
     import numpy as np
 
@@ -330,10 +334,11 @@ def create_visualization(normal_losses, flipped_losses, output_dir):
 
     plt.tight_layout()
     plt.savefig(output_dir / "routing_ablation_comparison.png", dpi=300, bbox_inches="tight")
-    print(f"📊 Visualization saved to: {output_dir / 'routing_ablation_comparison.png'}")
+    logger.info(f"Visualisation saved to: {output_dir / 'routing_ablation_comparison.png'}")
 
 
 if __name__ == "__main__":
+    setup_logging()
     import argparse
 
     parser = argparse.ArgumentParser(description="Expert routing ablation study")

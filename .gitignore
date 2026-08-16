@@ -79,3 +79,6 @@ Thumbs.db
 CLAUDE.md
 environment.yml
 docs/improvement-plan.md
+# Everything the analysis and plotting scripts write. The inputs they read are
+# committed under paper_metrics/; nothing generated belongs in git.
+results/

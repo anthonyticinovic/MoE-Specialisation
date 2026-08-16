@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-Step 6: Visualize evaluation results and generate comprehensive report.
+Step 6: Visualise evaluation results and generate comprehensive report.
 """
 
+import logging
 import argparse
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-from karpathy_utils import load_json, print_banner
+from karpathy_utils import load_json, log_banner
+from models.utils.common import setup_logging
+
+logger = logging.getLogger(__name__)
 
 
 def plot_retrieval_metrics(stage2_metrics: dict, stage3_metrics: dict, output_path: str):
@@ -54,7 +58,7 @@ def plot_retrieval_metrics(stage2_metrics: dict, stage3_metrics: dict, output_pa
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
-    print(f"   Saved: {output_path}")
+    logger.info(f"   Saved: {output_path}")
     plt.close()
 
 
@@ -86,7 +90,7 @@ def plot_captioning_metrics(stage2_metrics: dict, stage3_metrics: dict, output_p
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
-    print(f"   Saved: {output_path}")
+    logger.info(f"   Saved: {output_path}")
     plt.close()
 
 
@@ -165,7 +169,7 @@ def plot_combined_comparison(
     )
 
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
-    print(f"   Saved: {output_path}")
+    logger.info(f"   Saved: {output_path}")
     plt.close()
 
 
@@ -259,7 +263,7 @@ def generate_text_report(retrieval_metrics: dict, captioning_metrics: dict, outp
     with open(output_path, "w") as f:
         f.write(report)
 
-    print(f"   Saved: {output_path}")
+    logger.info(f"   Saved: {output_path}")
 
     return report
 
@@ -287,10 +291,10 @@ def main():
 
     args = parser.parse_args()
 
-    print_banner("VISUALIZATION & REPORTING")
+    log_banner("VISUALIZATION & REPORTING")
 
     # Load metrics
-    print("\n📂 Loading metrics...")
+    logger.info("\nLoading metrics...")
     retrieval_metrics = load_json(args.retrieval_metrics)
     captioning_metrics = load_json(args.captioning_metrics)
 
@@ -298,7 +302,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Generate plots
-    print("\n📊 Generating plots...")
+    logger.info("\nGenerating plots...")
 
     plot_retrieval_metrics(
         retrieval_metrics["stage2"],
@@ -321,16 +325,17 @@ def main():
     )
 
     # Generate text report
-    print("\n📝 Generating text report...")
+    logger.info("\nGenerating text report...")
     report = generate_text_report(
         retrieval_metrics, captioning_metrics, str(output_dir / "evaluation_report.txt")
     )
 
     # Print report
-    print("\n" + report)
+    logger.info("\n" + report)
 
-    print_banner("✅ VISUALIZATION COMPLETE")
+    log_banner("VISUALIZATION COMPLETE")
 
 
 if __name__ == "__main__":
+    setup_logging()
     main()

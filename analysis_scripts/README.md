@@ -72,6 +72,15 @@ Each is a self-contained, ordered pipeline with its own README:
 
 ## Notes
 
+- **Logging**: these scripts use `logging`, like the rest of the repo — every
+  entry point calls `setup_logging()` and every module holds a
+  `logging.getLogger(__name__)`. They differ from the core in one respect: the
+  messages are f-strings rather than the core's lazy `%s` arguments. That is
+  deliberate. The report tables here rely on alignment and percentage format
+  specs (`{value:<15.1f}`, `{share:.1%}`) which have no `%`-formatting
+  equivalent, and a module that mixed both styles would be worse than one that
+  picks either. The lazy-formatting argument — avoid work for a message that is
+  never emitted — does not apply to single-run scripts logging at INFO.
 - **File size**: `cross_modality_purity.py`, `cross_concept_similarity_matrix.py`
   and `expert_metrics_plots.py` remain above the 800-line guideline. They are
   cohesive analyzers / a pure plotting module; further splitting was judged to

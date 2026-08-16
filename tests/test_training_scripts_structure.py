@@ -8,6 +8,8 @@ it cannot regress in one script while the others stay clean.
 
 import ast
 import importlib
+import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -172,3 +174,76 @@ def test_stage_2_5_module_loads_by_path():
         "train_stage_2_5", SCRIPT_DIR / "train_stage_2.5.py"
     )
     assert spec is not None and spec.loader is not None
+
+
+HPC_DIR = SCRIPT_DIR.parent / "hpc"
+SBATCH_SCRIPTS = sorted(HPC_DIR.rglob("*.sbatch"))
+
+
+class TestSlurmScripts:
+    """The batch scripts are the only record of how the paper runs were launched.
+
+    Nothing executes them in CI, so a stale path or a renamed script sits
+    undetected until a job fails on the cluster — which is how
+    ``train_dense.sbatch`` came to invoke ``train_dense_3.py``, a file that has
+    never existed.
+    """
+
+    def test_scripts_were_found(self):
+        assert len(SBATCH_SCRIPTS) == 6, f"expected 6 sbatch scripts, found {len(SBATCH_SCRIPTS)}"
+
+    @pytest.mark.parametrize("script", SBATCH_SCRIPTS, ids=lambda p: p.name)
+    def test_every_python_target_exists(self, script):
+        """Each script must invoke a file or module that is actually present."""
+        source = script.read_text()
+        for match in re.finditer(r"training_scripts/\S+\.py", source):
+            assert (HPC_DIR.parent / match.group()).exists(), (
+                f"{script.name} runs {match.group()}, which does not exist"
+            )
+        for match in re.finditer(r"python -m (\S+)", source):
+            module_path = HPC_DIR.parent / (match.group(1).replace(".", "/") + ".py")
+            assert module_path.exists(), (
+                f"{script.name} runs {match.group(1)}, which is not a module"
+            )
+
+    @pytest.mark.parametrize("script", SBATCH_SCRIPTS, ids=lambda p: p.name)
+    def test_no_personal_paths(self, script):
+        """Paths that only exist on one machine belong in cluster_env.sh."""
+        source = script.read_text()
+        for marker in ("pytorch_latest_venv", "Rest of your script"):
+            assert marker not in source, f"{script.name} still contains {marker!r}"
+        assert "$HOME/MoE-Specialisation" not in source.replace(
+            "${MOE_PROJECT_DIR:-$HOME/MoE-Specialisation}", ""
+        ), f"{script.name} hardcodes the checkout path outside the MOE_PROJECT_DIR default"
+
+    @pytest.mark.parametrize("script", SBATCH_SCRIPTS, ids=lambda p: p.name)
+    def test_sources_the_shared_environment(self, script):
+        source = script.read_text()
+        assert "cluster_env.sh" in source and "moe_setup_environment" in source, (
+            f"{script.name} sets up its own environment instead of sourcing cluster_env.sh"
+        )
+
+    @pytest.mark.parametrize("script", SBATCH_SCRIPTS, ids=lambda p: p.name)
+    def test_gpu_allocation_matches_the_launcher(self, script):
+        """``--gres=gpu:N`` and ``--nproc_per_node=N`` must agree.
+
+        A mismatch silently wastes half the allocation, and nothing in the job
+        output says so.
+        """
+        source = script.read_text()
+        gres = re.search(r"--gres=gpu:(\d+)", source)
+        nproc = re.search(r"--nproc_per_node=(\d+)", source)
+        if gres and nproc:
+            assert gres.group(1) == nproc.group(1), (
+                f"{script.name} requests {gres.group(1)} GPUs but launches "
+                f"{nproc.group(1)} processes"
+            )
+
+    @pytest.mark.parametrize("script", SBATCH_SCRIPTS, ids=lambda p: p.name)
+    def test_is_valid_bash(self, script):
+        assert subprocess.run(["bash", "-n", str(script)], capture_output=True).returncode == 0
+
+    def test_shared_environment_is_valid_bash(self):
+        env = HPC_DIR / "cluster_env.sh"
+        assert env.exists()
+        assert subprocess.run(["bash", "-n", str(env)], capture_output=True).returncode == 0

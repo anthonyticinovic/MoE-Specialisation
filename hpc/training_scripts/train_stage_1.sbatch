@@ -1,5 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=vlm_stage1_training
+# Stage 1 — vision connector, single GPU.
+#
+# Adapt the #SBATCH header to your cluster; see hpc/README.md. Submit from the
+# repository root so the log paths resolve:
+#   mkdir -p logs/slurm && sbatch hpc/training_scripts/train_stage_1.sbatch
+#SBATCH --job-name=moe_stage1
 #SBATCH -p gpu-h100
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
@@ -7,29 +12,13 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=256G
 #SBATCH --time=54:00:00
-#SBATCH --output=../out_slurm/train_stage_1/train_stage_1_%j.out
-#SBATCH --error=../err_slurm/train_stage_1/train_stage_1_%j.err
+#SBATCH --output=logs/slurm/%x_%j.out
+#SBATCH --error=logs/slurm/%x_%j.err
 
-# Load modules
-module purge
-module load GCCcore/11.3.0
-module load Python/3.11.3
-module load CUDA  # Load the default CUDA
+source "${MOE_PROJECT_DIR:-$HOME/MoE-Specialisation}/hpc/cluster_env.sh"
+moe_setup_environment
 
-source ~/pytorch_latest_venv/bin/activate # Activate the new venv
-
-echo "=== VERIFICATION ==="
-# Verify that python is coming from the correct environment
-which python
-# Verify PyTorch can see the GPU
-python -c "import torch; print(f'PyTorch: {torch.__version__}, CUDA available: {torch.cuda.is_available()}')"
-python -c "import transformers; print(f'Transformers: {transformers.__version__}')"
-
-# Rest of your script...
-cd $HOME/MoE-Specialisation
-export PYTHONPATH="${PWD}:${PYTHONPATH}"
-
-echo "Starting training script..."
+echo "Starting Stage 1 (vision connector)..."
 python -u training_scripts/train_stage_1.py
 
 echo "Job finished."

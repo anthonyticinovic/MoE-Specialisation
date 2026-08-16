@@ -1,34 +1,34 @@
 #!/bin/bash
-#SBATCH --job-name=create_moe_model
-#SBATCH -p bigmem                 # Use a CPU partition with high memory
+# Stage 0 — build the MoE model from a Mistral-7B checkpoint. CPU-only, run once.
+#
+# Adapt the #SBATCH header to your cluster; see hpc/README.md. Submit from the
+# repository root so the log paths resolve:
+#   mkdir -p logs/slurm && sbatch hpc/model_scripts/create_moe_model.sbatch
+#SBATCH --job-name=moe_create_model
+#SBATCH -p bigmem
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=256G                 # Keep the high memory request
-#SBATCH --time=00:20:00           # 20 minutes should be more than enough
-#SBATCH --output=../out_slurm/create_moe/create_moe_%j.out
-#SBATCH --error=../err_slurm/create_moe/create_moe_%j.err
+#SBATCH --mem=256G
+#SBATCH --time=00:20:00
+#SBATCH --output=logs/slurm/%x_%j.out
+#SBATCH --error=logs/slurm/%x_%j.err
 
-# Load modules
-module purge
-module load GCCcore/11.3.0
-module load Python/3.11.3
-# No need to load CUDA for this CPU-only task
+# CPU-only: skip the CUDA module. Set before sourcing, which leaves the default
+# in cluster_env.sh alone.
+MOE_MODULES="GCCcore/11.3.0 Python/3.11.3"
 
-# Activate your virtual environment
-source ~/pytorch_latest_venv/bin/activate
+source "${MOE_PROJECT_DIR:-$HOME/MoE-Specialisation}/hpc/cluster_env.sh"
+moe_setup_environment
 
-# --- Verification ---
-echo "--- Environment Verification ---"
-which python
-python -c "import torch; print(f'PyTorch version: {torch.__version__}')"
-echo "--------------------------"
+# Both paths are required by the CLI. Override either when submitting:
+#   MOE_BASE_MODEL=/data/Mistral-7B-v0.3 sbatch hpc/model_scripts/create_moe_model.sbatch
+: "${MOE_BASE_MODEL:=$HOME/models/Mistral-7B-v0.3}"
+: "${MOE_OUTPUT_MODEL:=$HOME/models/Mistral-7B-MoE}"
 
-# --- Add this line to fix the import error ---
-export PYTHONPATH="${PWD}:${PYTHONPATH}"
+echo "Building MoE model: ${MOE_BASE_MODEL} -> ${MOE_OUTPUT_MODEL}"
+python -m models.utils.create_moe_model \
+    --base-model "${MOE_BASE_MODEL}" \
+    --output "${MOE_OUTPUT_MODEL}"
 
-# --- Run the Script ---
-cd $HOME/MoE-Specialisation
-echo "Starting model creation script..."
-python models/utils/create_moe_model.py
-echo "Script finished."
+echo "Job finished."

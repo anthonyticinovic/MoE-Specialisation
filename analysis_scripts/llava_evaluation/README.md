@@ -4,7 +4,7 @@ Lightweight evaluation testing whether Stage 3 performs better on **in-distribut
 
 ## Hypothesis
 
-**Stage 3 learned the training distribution well but over-specialized:**
+**Stage 3 learned the training distribution well but over-specialised:**
 - ✅ Should perform reasonably on LLaVA-Wild (matches training format)
 - ❌ Fails catastrophically on POPE (30% accuracy, 0% "no" predictions)
 - ❌ Fails catastrophically on COCO captioning (0.08 CIDEr vs 0.76 for Stage 2)
@@ -67,7 +67,7 @@ python analysis_scripts/llava_evaluation/02_compare_results.py \
 ### Scenario A: Stage 3 Outperforms Stage 2
 - Stage 3 score: **50-70** (in-distribution advantage)
 - Stage 2 score: **40-60** (generalizes reasonably)
-- **Interpretation**: ✅ Stage 3 learned training distribution well but over-specialized
+- **Interpretation**: ✅ Stage 3 learned training distribution well but over-specialised
 
 ### Scenario B: Stage 3 Performs Similarly to Stage 2
 - Both scores: **40-60** (similar performance)
@@ -104,7 +104,7 @@ python analysis_scripts/llava_evaluation/02_compare_results.py \
 Same format as Stage 2.
 
 ### `llava_wild_comparison.png`
-Visualization with 4 subplots:
+Visualisation with 4 subplots:
 1. **Score Distribution**: Histogram comparing Stage 2 vs Stage 3
 2. **Box Plot**: Statistical comparison (median, quartiles)
 3. **All Benchmarks**: POPE, COCO, LLaVA-Wild performance comparison
@@ -156,10 +156,10 @@ Visualization with 4 subplots:
 ## Thesis Implications
 
 ### If Stage 3 Outperforms Stage 2 on LLaVA-Wild:
-**Narrative**: "Soft routing + instruction tuning caused over-specialization"
+**Narrative**: "Soft routing + instruction tuning caused over-specialisation"
 - Stage 3 learned training distribution extremely well
 - But cannot generalize to other formats
-- Trade-off: Specialization vs Generalization
+- Trade-off: Specialisation vs Generalization
 
 ### If Stage 3 Fails on LLaVA-Wild:
 **Narrative**: "Stage 3's issues are more fundamental"
@@ -172,7 +172,7 @@ Visualization with 4 subplots:
 ```
 analysis_scripts/llava_evaluation/
 ├── 01_llava_wild_eval.py          # Main evaluation script
-├── 02_compare_results.py          # Comparison and visualization
+├── 02_compare_results.py          # Comparison and visualisation
 └── README.md                      # This file
 
 hpc/analysis_scripts/
@@ -183,7 +183,7 @@ hpc/analysis_scripts/
 results/llava_wild_evaluation/
 ├── stage2_results.json            # Stage 2 evaluation results
 ├── stage3_results.json            # Stage 3 evaluation results
-└── llava_wild_comparison.png      # Visualization
+└── llava_wild_comparison.png      # Visualisation
 ```
 
 ## Technical Details

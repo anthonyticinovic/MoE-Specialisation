@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 class ExpertUsageTracker:
     """
-    Lightweight tracker for MoE expert utilization and routing patterns.
+    Lightweight tracker for MoE expert utilisation and routing patterns.
     Collects metrics during validation for research analysis.
 
     Tracks 4 key metrics:

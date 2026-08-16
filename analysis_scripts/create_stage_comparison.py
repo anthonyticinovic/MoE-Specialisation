@@ -1,10 +1,11 @@
 """
-Create side-by-side comparison visualizations of Stage 2 vs Stage 3 similarity matrices.
+Create side-by-side comparison visualisations of Stage 2 vs Stage 3 similarity matrices.
 
 Reads the JSON outputs from cross_concept_similarity_matrix.py for both stages
 and creates comparison plots with independent color scales for better interpretability.
 """
 
+import logging
 import argparse
 import json
 from pathlib import Path
@@ -12,6 +13,9 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
+from models.utils.common import setup_logging
+
+logger = logging.getLogger(__name__)
 
 
 def load_matrix_and_labels(stage_dir: str, layer: int):
@@ -41,7 +45,7 @@ def create_comparison_plot(
 
     # Verify labels match
     if stage2_labels != stage3_labels:
-        print("⚠️  Warning: Labels don't match between stages!")
+        logger.warning(" Warning: Labels don't match between stages!")
 
     n = stage2_matrix.shape[0]
     half_n = n // 2
@@ -55,11 +59,11 @@ def create_comparison_plot(
     txt_labels = [l.replace("txt:", "") for l in stage2_labels[half_n:]]
 
     # Compute statistics
-    print(f"\n📊 Layer {layer} Statistics:")
-    print(f"   Stage 2 range: [{stage2_cross.min():.3f}, {stage2_cross.max():.3f}]")
-    print(f"   Stage 3 range: [{stage3_cross.min():.3f}, {stage3_cross.max():.3f}]")
-    print(f"   Stage 2 mean: {stage2_cross.mean():.3f}")
-    print(f"   Stage 3 mean: {stage3_cross.mean():.3f}")
+    logger.info(f"\nLayer {layer} Statistics:")
+    logger.info(f"   Stage 2 range: [{stage2_cross.min():.3f}, {stage2_cross.max():.3f}]")
+    logger.info(f"   Stage 3 range: [{stage3_cross.min():.3f}, {stage3_cross.max():.3f}]")
+    logger.info(f"   Stage 2 mean: {stage2_cross.mean():.3f}")
+    logger.info(f"   Stage 3 mean: {stage3_cross.mean():.3f}")
 
     # Create side-by-side figure
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 9))
@@ -128,7 +132,7 @@ def create_comparison_plot(
     plt.savefig(plot_path, dpi=300, bbox_inches="tight")
     plt.close()
 
-    print(f"   ✓ Saved comparison plot to: {plot_path}")
+    logger.info(f"   Saved comparison plot to: {plot_path}")
 
 
 def main():
@@ -160,19 +164,19 @@ def main():
 
     args = parser.parse_args()
 
-    print("=" * 80)
-    print("Stage 2 vs Stage 3 Comparison Visualization")
-    print("=" * 80)
-    print(f"Stage 2 directory: {args.stage2_dir}")
-    print(f"Stage 3 directory: {args.stage3_dir}")
-    print(f"Layers: {args.layers}")
-    print(f"Output directory: {args.output_dir}")
-    print("=" * 80)
+    logger.info("=" * 80)
+    logger.info("Stage 2 vs Stage 3 Comparison Visualisation")
+    logger.info("=" * 80)
+    logger.info(f"Stage 2 directory: {args.stage2_dir}")
+    logger.info(f"Stage 3 directory: {args.stage3_dir}")
+    logger.info(f"Layers: {args.layers}")
+    logger.info(f"Output directory: {args.output_dir}")
+    logger.info("=" * 80)
 
     for layer in args.layers:
-        print(f"\n{'=' * 80}")
-        print(f"Processing Layer {layer}")
-        print(f"{'=' * 80}")
+        logger.info(f"\n{'=' * 80}")
+        logger.info(f"Processing Layer {layer}")
+        logger.info(f"{'=' * 80}")
 
         create_comparison_plot(
             stage2_dir=args.stage2_dir,
@@ -182,11 +186,12 @@ def main():
             temperature=args.temperature,
         )
 
-    print(f"\n{'=' * 80}")
-    print("✅ All comparison plots created!")
-    print(f"📁 Saved to: {args.output_dir}")
-    print("=" * 80)
+    logger.info(f"\n{'=' * 80}")
+    logger.info("All comparison plots created!")
+    logger.info(f"Saved to: {args.output_dir}")
+    logger.info("=" * 80)
 
 
 if __name__ == "__main__":
+    setup_logging()
     main()

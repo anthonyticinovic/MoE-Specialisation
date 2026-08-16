@@ -9,21 +9,25 @@ POPE evaluates object hallucination with 3 difficulty levels:
 - Adversarial: Objects that co-occur with image objects
 """
 
+import logging
 import argparse
 import json
 import random
 from collections import Counter
 from pathlib import Path
+from models.utils.common import setup_logging
+
+logger = logging.getLogger(__name__)
 
 
 def load_coco_annotations(annotations_file: str) -> dict:
     """Load COCO annotations."""
-    print(f"\n📂 Loading COCO annotations from: {annotations_file}")
+    logger.info(f"\nLoading COCO annotations from: {annotations_file}")
     with open(annotations_file) as f:
         coco_data = json.load(f)
-    print(f"   Found {len(coco_data['images'])} images")
-    print(f"   Found {len(coco_data['annotations'])} object annotations")
-    print(f"   Found {len(coco_data['categories'])} object categories")
+    logger.info(f"   Found {len(coco_data['images'])} images")
+    logger.info(f"   Found {len(coco_data['annotations'])} object annotations")
+    logger.info(f"   Found {len(coco_data['categories'])} object categories")
     return coco_data
 
 
@@ -264,12 +268,14 @@ def generate_pope_dataset(
     """
     random.seed(seed)
 
-    print("\n🔮 Generating POPE questions...")
-    print(f"   Num images: {num_images}")
-    print(
+    logger.info("\nGenerating POPE questions...")
+    logger.info(f"   Num images: {num_images}")
+    logger.info(
         f"   Questions per image: {questions_per_image} positive + {questions_per_image} negative = {questions_per_image * 2} per difficulty"
     )
-    print(f"   Total questions: {num_images * questions_per_image * 2 * 3} across 3 difficulties")
+    logger.info(
+        f"   Total questions: {num_images * questions_per_image * 2 * 3} across 3 difficulties"
+    )
 
     # Build mappings
     category_mapping = build_category_mapping(coco_data)
@@ -280,18 +286,18 @@ def generate_pope_dataset(
     popular_objects = [obj for obj, _ in object_frequency]  # Sorted by frequency
     all_objects = list(category_mapping.values())
 
-    print(f"   Built mappings: {len(all_objects)} unique objects")
-    print(f"   Top 5 popular objects: {popular_objects[:5]}")
+    logger.info(f"   Built mappings: {len(all_objects)} unique objects")
+    logger.info(f"   Top 5 popular objects: {popular_objects[:5]}")
 
     # Build co-occurrence matrix
-    print("   Building co-occurrence matrix...")
+    logger.info("   Building co-occurrence matrix...")
     cooccurrence = build_cooccurrence_matrix(image_objects, set(all_objects))
 
     # Sample images
     valid_image_ids = [img_id for img_id in image_objects.keys() if len(image_objects[img_id]) > 0]
     sampled_image_ids = random.sample(valid_image_ids, min(num_images, len(valid_image_ids)))
 
-    print(f"   Sampled {len(sampled_image_ids)} images with objects")
+    logger.info(f"   Sampled {len(sampled_image_ids)} images with objects")
 
     # Generate questions for each image
     all_questions = {"random": [], "popular": [], "adversarial": []}
@@ -313,11 +319,11 @@ def generate_pope_dataset(
             all_questions[difficulty].extend(image_questions[difficulty])
 
     # Print statistics
-    print("\n📊 Generated questions:")
+    logger.info("\nGenerated questions:")
     for difficulty in ["random", "popular", "adversarial"]:
         num_yes = sum(1 for q in all_questions[difficulty] if q["answer"] == "yes")
         num_no = sum(1 for q in all_questions[difficulty] if q["answer"] == "no")
-        print(
+        logger.info(
             f"   {difficulty.capitalize():12s}: {len(all_questions[difficulty])} questions ({num_yes} yes, {num_no} no)"
         )
 
@@ -361,9 +367,9 @@ def main():
         coco_root = Path(get_paths()["image_dir"]).parent
         args.annotations_file = str(coco_root / "annotations" / "instances_val2017.json")
 
-    print("=" * 80)
-    print("POPE QUESTION GENERATION".center(80))
-    print("=" * 80)
+    logger.info("=" * 80)
+    logger.info("POPE QUESTION GENERATION".center(80))
+    logger.info("=" * 80)
 
     # Load COCO annotations
     coco_data = load_coco_annotations(args.annotations_file)
@@ -384,12 +390,13 @@ def main():
         output_file = output_dir / f"pope_{difficulty}.json"
         with open(output_file, "w") as f:
             json.dump(pope_questions[difficulty], f, indent=2)
-        print(f"\n💾 Saved {len(pope_questions[difficulty])} questions to: {output_file}")
+        logger.info(f"\nSaved {len(pope_questions[difficulty])} questions to: {output_file}")
 
-    print("\n" + "=" * 80)
-    print("✅ POPE QUESTION GENERATION COMPLETE".center(80))
-    print("=" * 80)
+    logger.info("\n" + "=" * 80)
+    logger.info("POPE QUESTION GENERATION COMPLETE".center(80))
+    logger.info("=" * 80)
 
 
 if __name__ == "__main__":
+    setup_logging()
     main()

@@ -36,7 +36,7 @@ This will:
 3. Evaluate retrieval metrics (~5 min)
 4. Generate captions for Stage 2 and Stage 3 (~2 hours each)
 5. Evaluate captioning metrics (~10 min)
-6. Generate visualizations and report (~1 min)
+6. Generate visualisations and report (~1 min)
 
 **Total runtime**: ~5 hours on H100 GPU
 
@@ -80,7 +80,7 @@ python analysis_scripts/karpathy_evaluation/05_evaluate_captioning.py \
     --stage3_captions results/karpathy_evaluation/captioning/stage3_captions.json \
     --output_dir results/karpathy_evaluation/captioning
 
-# Step 6: Visualize
+# Step 6: Visualise
 python analysis_scripts/karpathy_evaluation/06_visualize_results.py \
     --retrieval_metrics results/karpathy_evaluation/retrieval/retrieval_metrics.json \
     --captioning_metrics results/karpathy_evaluation/captioning/captioning_metrics.json \
@@ -137,7 +137,7 @@ Requires:
 - **Layer extraction**: Uses Layer 31 (final layer) for consistency with compositional analysis
 - **Pooling**: Mean pooling across sequence dimension for both images and text
 - **Generation**: Beam search with 5 beams, max length 20 tokens
-- **Retrieval**: Cosine similarity between normalized embeddings
+- **Retrieval**: Cosine similarity between normalised embeddings
 - **Metrics**: Standard COCO evaluation metrics (via pycocoevalcap)
 
 ## Expected Results

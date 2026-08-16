@@ -4,10 +4,14 @@ Step 1: Preprocess Karpathy COCO split for evaluation.
 Extracts test set and prepares data structures for both retrieval and captioning.
 """
 
+import logging
 import argparse
 import json
 from collections import defaultdict
 from pathlib import Path
+from models.utils.common import setup_logging
+
+logger = logging.getLogger(__name__)
 
 
 def parse_karpathy_split(dataset_json_path: str) -> dict:
@@ -20,22 +24,22 @@ def parse_karpathy_split(dataset_json_path: str) -> dict:
     Returns:
         Dictionary with parsed data
     """
-    print(f"\n📖 Loading Karpathy split from: {dataset_json_path}")
+    logger.info(f"\nLoading Karpathy split from: {dataset_json_path}")
 
     with open(dataset_json_path) as f:
         data = json.load(f)
 
     images = data["images"]
-    print(f"   Total images in dataset: {len(images)}")
+    logger.info(f"   Total images in dataset: {len(images)}")
 
     # Split by dataset split
     split_counts = defaultdict(int)
     for img in images:
         split_counts[img["split"]] += 1
 
-    print("\n   Split distribution:")
+    logger.info("\n   Split distribution:")
     for split_name, count in sorted(split_counts.items()):
-        print(f"      {split_name}: {count:,} images")
+        logger.info(f"      {split_name}: {count:,} images")
 
     return data
 
@@ -48,11 +52,11 @@ def extract_test_set_retrieval(data: dict, output_path: str):
     - images: List of test image metadata
     - captions: List of all captions (5 per image = 25,000 total)
     """
-    print("\n🔍 Extracting test set for retrieval evaluation...")
+    logger.info("\nExtracting test set for retrieval evaluation...")
 
     test_images = [img for img in data["images"] if img["split"] == "test"]
 
-    print(f"   Test images: {len(test_images)}")
+    logger.info(f"   Test images: {len(test_images)}")
 
     # Prepare retrieval data structure
     retrieval_data = {"images": [], "captions": []}
@@ -83,9 +87,9 @@ def extract_test_set_retrieval(data: dict, output_path: str):
     with open(output_path, "w") as f:
         json.dump(retrieval_data, f, indent=2)
 
-    print(f"   ✅ Saved: {output_path}")
-    print(f"      Images: {len(retrieval_data['images'])}")
-    print(f"      Captions: {len(retrieval_data['captions'])}")
+    logger.info(f"   Saved: {output_path}")
+    logger.info(f"      Images: {len(retrieval_data['images'])}")
+    logger.info(f"      Captions: {len(retrieval_data['captions'])}")
 
 
 def extract_test_set_captioning(data: dict, images_output: str, references_output: str):
@@ -96,7 +100,7 @@ def extract_test_set_captioning(data: dict, images_output: str, references_outpu
     1. images JSON: List of images to caption
     2. references JSON: Ground-truth captions in COCO format
     """
-    print("\n📝 Extracting test set for captioning evaluation...")
+    logger.info("\nExtracting test set for captioning evaluation...")
 
     test_images = [img for img in data["images"] if img["split"] == "test"]
 
@@ -129,14 +133,14 @@ def extract_test_set_captioning(data: dict, images_output: str, references_outpu
     Path(images_output).parent.mkdir(parents=True, exist_ok=True)
     with open(images_output, "w") as f:
         json.dump(images_data, f, indent=2)
-    print(f"   ✅ Saved images: {images_output}")
-    print(f"      Images to caption: {len(images_data)}")
+    logger.info(f"   Saved images: {images_output}")
+    logger.info(f"      Images to caption: {len(images_data)}")
 
     # Save references
     with open(references_output, "w") as f:
         json.dump(references_data, f, indent=2)
-    print(f"   ✅ Saved references: {references_output}")
-    print(f"      Reference captions: {len(references_data['annotations'])}")
+    logger.info(f"   Saved references: {references_output}")
+    logger.info(f"      Reference captions: {len(references_data['annotations'])}")
 
 
 def main():
@@ -156,9 +160,9 @@ def main():
 
     args = parser.parse_args()
 
-    print("=" * 80)
-    print("KARPATHY COCO PREPROCESSING")
-    print("=" * 80)
+    logger.info("=" * 80)
+    logger.info("KARPATHY COCO PREPROCESSING")
+    logger.info("=" * 80)
 
     # Parse Karpathy split
     data = parse_karpathy_split(args.karpathy_json)
@@ -172,15 +176,16 @@ def main():
     references_output = f"{args.output_dir}/karpathy_test_references.json"
     extract_test_set_captioning(data, images_output, references_output)
 
-    print("\n" + "=" * 80)
-    print("✅ PREPROCESSING COMPLETE")
-    print("=" * 80)
-    print("\nFiles created:")
-    print(f"  1. {retrieval_output}")
-    print(f"  2. {images_output}")
-    print(f"  3. {references_output}")
-    print()
+    logger.info("\n" + "=" * 80)
+    logger.info("PREPROCESSING COMPLETE")
+    logger.info("=" * 80)
+    logger.info("\nFiles created:")
+    logger.info(f"  1. {retrieval_output}")
+    logger.info(f"  2. {images_output}")
+    logger.info(f"  3. {references_output}")
+    logger.info("")
 
 
 if __name__ == "__main__":
+    setup_logging()
     main()

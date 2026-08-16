@@ -8,6 +8,7 @@ This tests whether Stage 3 performs better on its TRAINING distribution
 (elaborate conversational answers) vs structured tasks (POPE, captioning).
 """
 
+import logging
 import argparse
 import json
 import random
@@ -21,7 +22,10 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "karpathy_evaluation"))
 
-from karpathy_utils import load_and_preprocess_image, load_model_checkpoint, print_banner, save_json
+from karpathy_utils import load_and_preprocess_image, load_model_checkpoint, log_banner, save_json
+from models.utils.common import setup_logging
+
+logger = logging.getLogger(__name__)
 
 
 def generate_conversational_response(
@@ -222,11 +226,11 @@ def load_llava_subset(json_path, num_samples=100, seed=42):
     For each sample, we'll use the FIRST question-answer pair only
     (to keep it simple and fast).
     """
-    print(f"\n📂 Loading LLaVA data from: {json_path}")
+    logger.info(f"\nLoading LLaVA data from: {json_path}")
     with open(json_path) as f:
         data = json.load(f)
 
-    print(f"   Total samples: {len(data)}")
+    logger.info(f"   Total samples: {len(data)}")
 
     # Filter: only samples with valid conversations and images
     valid_samples = []
@@ -249,13 +253,13 @@ def load_llava_subset(json_path, num_samples=100, seed=42):
                     }
                 )
 
-    print(f"   Valid samples: {len(valid_samples)}")
+    logger.info(f"   Valid samples: {len(valid_samples)}")
 
     # Random subset
     random.seed(seed)
     subset = random.sample(valid_samples, min(num_samples, len(valid_samples)))
 
-    print(f"   Selected subset: {len(subset)} samples")
+    logger.info(f"   Selected subset: {len(subset)} samples")
 
     return subset
 
@@ -276,34 +280,34 @@ def main():
 
     args = parser.parse_args()
 
-    print_banner(f"LLAVA-WILD EVALUATION - {args.stage.upper()}")
+    log_banner(f"LLAVA-WILD EVALUATION - {args.stage.upper()}")
 
     # Load subset
     samples = load_llava_subset(args.llava_json, args.num_samples)
 
     # Load model
-    print("\n📦 Loading model...")
+    logger.info("\nLoading model...")
     model, processor, tokenizer = load_model_checkpoint(args.checkpoint, device=args.device)
 
     # Set routing mode
     if args.stage == "stage3":
-        print("   📍 Using Stage 3 (SOFT routing)")
+        logger.info("   Using Stage 3 (SOFT routing)")
         for layer in model.llm.model.layers:
             if hasattr(layer.mlp, "routing_mode"):
                 layer.mlp.routing_mode = "soft"
     else:
-        print("   📍 Using Stage 2 (HARD routing)")
+        logger.info("   Using Stage 2 (HARD routing)")
 
-    print("   ✅ Model loaded\n")
+    logger.info("   Model loaded\n")
 
     # Generate responses
     results = []
     total_score = 0
 
-    print("🔮 Generating conversational responses...")
-    print(f"   Samples: {len(samples)}")
-    print(f"   Max tokens: {args.max_tokens}")
-    print(f"   Temperature: {args.temperature}\n")
+    logger.info("Generating conversational responses...")
+    logger.info(f"   Samples: {len(samples)}")
+    logger.info(f"   Max tokens: {args.max_tokens}")
+    logger.info(f"   Temperature: {args.temperature}\n")
 
     model.eval()
     model.to(args.device)
@@ -324,7 +328,7 @@ def main():
                 break
 
         if image_path is None:
-            print(f"\n⚠️  Image not found: {image_filename}")
+            logger.warning(f"\n Image not found: {image_filename}")
             continue
 
         try:
@@ -357,7 +361,7 @@ def main():
             )
 
         except Exception as e:
-            print(f"\n❌ Error processing {sample['image']}: {e}")
+            logger.error(f"\nError processing {sample['image']}: {e}")
             results.append(
                 {
                     "id": sample["id"],
@@ -372,12 +376,12 @@ def main():
     # Compute final metrics
     avg_score = total_score / len(results) if results else 0
 
-    print(f"\n{'=' * 70}")
-    print(f"RESULTS - {args.stage.upper()}")
-    print(f"{'=' * 70}")
-    print(f"Samples evaluated: {len(results)}")
-    print(f"Average score: {avg_score:.1f}/100")
-    print(f"{'=' * 70}\n")
+    logger.info(f"\n{'=' * 70}")
+    logger.info(f"RESULTS - {args.stage.upper()}")
+    logger.info(f"{'=' * 70}")
+    logger.info(f"Samples evaluated: {len(results)}")
+    logger.info(f"Average score: {avg_score:.1f}/100")
+    logger.info(f"{'=' * 70}\n")
 
     # Add summary to results
     summary = {
@@ -392,10 +396,11 @@ def main():
 
     # Save results
     save_json(output_data, args.output)
-    print(f"💾 Saved results: {args.output}\n")
+    logger.info(f"Saved results: {args.output}\n")
 
-    print_banner(f"✅ EVALUATION COMPLETE - {args.stage.upper()}")
+    log_banner(f"EVALUATION COMPLETE - {args.stage.upper()}")
 
 
 if __name__ == "__main__":
+    setup_logging()
     main()

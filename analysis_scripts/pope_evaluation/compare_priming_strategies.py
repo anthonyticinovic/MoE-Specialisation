@@ -2,12 +2,16 @@
 Compare POPE results across different priming strategies.
 
 Shows whether priming Stage 3 with "fake previous answers" improves performance
-by exploiting its learned multi-turn conversation behavior.
+by exploiting its learned multi-turn conversation behaviour.
 """
 
+import logging
 import argparse
 import json
 from pathlib import Path
+from models.utils.common import setup_logging
+
+logger = logging.getLogger(__name__)
 
 
 def compute_metrics(results):
@@ -104,26 +108,26 @@ def main():
     answers_dir = results_dir / "answers_primed"
 
     if not answers_dir.exists():
-        print(f"❌ Primed answers directory not found: {answers_dir}")
+        logger.error(f"Primed answers directory not found: {answers_dir}")
         return
 
     strategies = ["simple", "conversational", "none"]
     difficulties = ["random", "popular", "adversarial"]
 
-    print("=" * 80)
-    print("POPE EVALUATION - PRIMING STRATEGY COMPARISON")
-    print("=" * 80)
-    print()
-    print("Testing whether priming Stage 3 with 'fake previous answers' improves")
-    print("performance by exploiting learned multi-turn conversation behavior.")
-    print()
-    print("Strategies tested:")
-    print("  - simple: Prime with 'This image has been analyzed.'")
-    print("  - conversational: Prime with full Q&A pair")
-    print("  - none: No priming (baseline)")
-    print()
-    print("=" * 80)
-    print()
+    logger.info("=" * 80)
+    logger.info("POPE EVALUATION - PRIMING STRATEGY COMPARISON")
+    logger.info("=" * 80)
+    logger.info("")
+    logger.info("Testing whether priming Stage 3 with 'fake previous answers' improves")
+    logger.info("performance by exploiting learned multi-turn conversation behavior.")
+    logger.info("")
+    logger.info("Strategies tested:")
+    logger.info("  - simple: Prime with 'This image has been analyzed.'")
+    logger.info("  - conversational: Prime with full Q&A pair")
+    logger.info("  - none: No priming (baseline)")
+    logger.info("")
+    logger.info("=" * 80)
+    logger.info("")
 
     # Collect results for each strategy
     all_results = {}
@@ -135,7 +139,7 @@ def main():
             answer_file = answers_dir / f"stage3_{difficulty}_{strategy}.json"
 
             if not answer_file.exists():
-                print(f"⚠️  Missing: {answer_file.name}")
+                logger.warning(f" Missing: {answer_file.name}")
                 continue
 
             with open(answer_file) as f:
@@ -145,39 +149,39 @@ def main():
             all_results[strategy][difficulty] = metrics
 
     # Print comparison table
-    print()
-    print("RESULTS BY PRIMING STRATEGY")
-    print("=" * 80)
-    print()
+    logger.info("")
+    logger.info("RESULTS BY PRIMING STRATEGY")
+    logger.info("=" * 80)
+    logger.info("")
 
     for difficulty in difficulties:
-        print(f"\n{'=' * 80}")
-        print(f"DIFFICULTY: {difficulty.upper()}")
-        print(f"{'=' * 80}")
-        print()
-        print(
+        logger.info(f"\n{'=' * 80}")
+        logger.info(f"DIFFICULTY: {difficulty.upper()}")
+        logger.info(f"{'=' * 80}")
+        logger.info("")
+        logger.info(
             f"{'Strategy':<20} {'Accuracy':<10} {'Yes%':<10} {'No%':<10} {'Unclear%':<10} {'F1':<10}"
         )
-        print("-" * 80)
+        logger.info("-" * 80)
 
         for strategy in strategies:
             if difficulty not in all_results[strategy]:
-                print(f"{strategy:<20} {'N/A':<10}")
+                logger.info(f"{strategy:<20} {'N/A':<10}")
                 continue
 
             m = all_results[strategy][difficulty]
-            print(
+            logger.info(
                 f"{strategy:<20} {m['accuracy']:>9.1f}% {m['yes_pct']:>9.1f}% {m['no_pct']:>9.1f}% {m['unclear_pct']:>9.1f}% {m['f1']:>9.1f}"
             )
 
-        print()
+        logger.info("")
 
     # Compare best vs worst
-    print()
-    print("=" * 80)
-    print("KEY FINDINGS")
-    print("=" * 80)
-    print()
+    logger.info("")
+    logger.info("=" * 80)
+    logger.info("KEY FINDINGS")
+    logger.info("=" * 80)
+    logger.info("")
 
     # Average accuracy across difficulties for each strategy
     avg_accuracies = {}
@@ -194,18 +198,18 @@ def main():
             avg_unclear[strategy] = sum(unclear_pcts) / len(unclear_pcts)
             avg_no_pct[strategy] = sum(no_pcts) / len(no_pcts)
 
-    print("Average Performance Across All Difficulties:")
-    print()
-    print(f"{'Strategy':<20} {'Avg Accuracy':<15} {'Avg Unclear%':<15} {'Avg No%':<10}")
-    print("-" * 60)
+    logger.info("Average Performance Across All Difficulties:")
+    logger.info("")
+    logger.info(f"{'Strategy':<20} {'Avg Accuracy':<15} {'Avg Unclear%':<15} {'Avg No%':<10}")
+    logger.info("-" * 60)
 
     for strategy in strategies:
         if strategy in avg_accuracies:
-            print(
+            logger.info(
                 f"{strategy:<20} {avg_accuracies[strategy]:>14.1f}% {avg_unclear[strategy]:>14.1f}% {avg_no_pct[strategy]:>9.1f}%"
             )
 
-    print()
+    logger.info("")
 
     # Find best strategy
     if avg_accuracies:
@@ -217,24 +221,25 @@ def main():
             baseline_accuracy = avg_accuracies["none"]
             improvement = best_accuracy - baseline_accuracy
 
-            print(f"🏆 Best Strategy: {best_strategy}")
-            print(f"   Average Accuracy: {best_accuracy:.1f}%")
-            print(f"   Baseline (none): {baseline_accuracy:.1f}%")
-            print(f"   Improvement: {improvement:+.1f}%")
-            print()
+            logger.info(f"Best Strategy: {best_strategy}")
+            logger.info(f"   Average Accuracy: {best_accuracy:.1f}%")
+            logger.info(f"   Baseline (none): {baseline_accuracy:.1f}%")
+            logger.info(f"   Improvement: {improvement:+.1f}%")
+            logger.info("")
 
             if improvement > 5:
-                print("✅ PRIMING WORKS! Significant improvement detected.")
-                print("   Stage 3's learned multi-turn behavior can be exploited.")
+                logger.info("PRIMING WORKS! Significant improvement detected.")
+                logger.info("   Stage 3's learned multi-turn behaviour can be exploited.")
             elif improvement > 1:
-                print("⚠️  MINOR IMPROVEMENT: Priming helps a bit, but not dramatically.")
+                logger.warning(" MINOR IMPROVEMENT: Priming helps a bit, but not dramatically.")
             else:
-                print("❌ NO IMPROVEMENT: Priming doesn't help (or makes it worse).")
-                print("   Stage 3's issues may be too fundamental for priming to fix.")
+                logger.error("NO IMPROVEMENT: Priming doesn't help (or makes it worse).")
+                logger.info("   Stage 3's issues may be too fundamental for priming to fix.")
 
-    print()
-    print("=" * 80)
+    logger.info("")
+    logger.info("=" * 80)
 
 
 if __name__ == "__main__":
+    setup_logging()
     main()

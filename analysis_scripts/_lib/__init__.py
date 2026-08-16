@@ -14,7 +14,7 @@ from analysis_scripts._lib.io import (
     load_and_preprocess_image,
     load_json,
     mean_pool_embeddings,
-    print_banner,
+    log_banner,
     save_json,
 )
 from analysis_scripts._lib.model_loading import (
@@ -43,7 +43,7 @@ __all__ = [
     "load_training_config",
     "majority_vote_expert",
     "mean_pool_embeddings",
-    "print_banner",
+    "log_banner",
     "save_json",
     "set_publication_rcparams",
     "similarity_heatmap",

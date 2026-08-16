@@ -7,11 +7,14 @@ output directory and write PNGs.
 
 from __future__ import annotations
 
+import logging
 import os
 
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
+
+logger = logging.getLogger(__name__)
 
 
 def plot_metric(
@@ -45,7 +48,7 @@ def plot_metric(
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, filename), dpi=300)
     plt.close()
-    print(f"  ✓ Saved {filename}")
+    logger.info(f"  Saved {filename}")
 
 
 def plot_purity_matrices(matrices: dict, target_layers: list[int], output_dir: str):
@@ -87,7 +90,7 @@ def plot_purity_matrices(matrices: dict, target_layers: list[int], output_dir: s
     output_path = os.path.join(output_dir, "purity_matrix_comparison.png")
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close()
-    print("  ✓ Saved purity_matrix_comparison.png")
+    logger.info("  Saved purity_matrix_comparison.png")
 
 
 def plot_clip_connector_comparison(
@@ -159,7 +162,7 @@ def plot_clip_connector_comparison(
     output_path = os.path.join(output_dir, filename)
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close()
-    print(f"  ✓ Saved {filename}")
+    logger.info(f"  Saved {filename}")
 
 
 def plot_token_variance(variance_results: dict, labels: list[str], output_dir: str):
@@ -218,7 +221,7 @@ def plot_token_variance(variance_results: dict, labels: list[str], output_dir: s
     output_path = os.path.join(output_dir, filename)
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close()
-    print(f"  ✓ Saved {filename}")
+    logger.info(f"  Saved {filename}")
 
 
 def plot_position_specific_similarity(position_results: dict, output_dir: str):
@@ -273,7 +276,7 @@ def plot_position_specific_similarity(position_results: dict, output_dir: str):
     output_path = os.path.join(output_dir, filename)
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close()
-    print(f"  ✓ Saved {filename}")
+    logger.info(f"  Saved {filename}")
 
 
 def plot_alignment_curves(
@@ -332,4 +335,4 @@ def plot_alignment_curves(
     output_path = os.path.join(output_dir, "stage3_alignment_curves.png")
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close()
-    print("  ✓ Saved stage3_alignment_curves.png")
+    logger.info("  Saved stage3_alignment_curves.png")

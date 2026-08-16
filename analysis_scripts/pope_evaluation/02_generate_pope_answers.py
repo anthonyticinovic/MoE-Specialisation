@@ -4,6 +4,7 @@ Step 2: Generate POPE answers from Stage 2 or Stage 3 model.
 Generates yes/no answers for POPE questions.
 """
 
+import logging
 import argparse
 import json
 import sys
@@ -22,10 +23,13 @@ from karpathy_utils import (
     format_time,
     load_and_preprocess_image,
     load_model_checkpoint,
-    print_banner,
+    log_banner,
     save_json,
 )
 from pope_utils import extract_yes_no_answer, extract_yes_no_answer_primed
+from models.utils.common import setup_logging
+
+logger = logging.getLogger(__name__)
 
 
 def generate_pope_answers(
@@ -64,22 +68,22 @@ def generate_pope_answers(
     results = []
     num_questions = len(questions)
 
-    print(f"\n🔮 Generating POPE answers for {num_questions} questions...")
-    print(f"   Max tokens: {max_new_tokens}")
-    print(f"   Temperature: {temperature} ({'greedy' if temperature == 0 else 'sampling'})")
-    print(f"   Device: {device}")
-    print(f"   Stage: {stage_name}")
+    logger.info(f"\nGenerating POPE answers for {num_questions} questions...")
+    logger.info(f"   Max tokens: {max_new_tokens}")
+    logger.info(f"   Temperature: {temperature} ({'greedy' if temperature == 0 else 'sampling'})")
+    logger.info(f"   Device: {device}")
+    logger.info(f"   Stage: {stage_name}")
 
     # Detect stage type for routing
     is_stage3 = stage_name == "stage3"
     if is_stage3:
-        print("   📍 Using Stage 3 (SOFT routing)")
+        logger.info("   Using Stage 3 (SOFT routing)")
         # Set all MoE layers to soft routing mode
         for layer in model.llm.model.layers:
             if hasattr(layer.mlp, "routing_mode"):
                 layer.mlp.routing_mode = "soft"
     else:
-        print("   📍 Using Stage 2 (HARD routing)")
+        logger.info("   Using Stage 2 (HARD routing)")
 
     start_time = time.time()
 
@@ -92,7 +96,7 @@ def generate_pope_answers(
         questions_by_image[img_id].append(q)
 
     unique_images = list(questions_by_image.keys())
-    print(f"   Processing {len(unique_images)} unique images")
+    logger.info(f"   Processing {len(unique_images)} unique images")
 
     unclear_count = 0
 
@@ -104,7 +108,7 @@ def generate_pope_answers(
             image_path = Path(image_dir) / image_filename
 
             if not image_path.exists():
-                print(f"\n⚠️  Image not found: {image_path}")
+                logger.warning(f"\n Image not found: {image_path}")
                 # Mark all questions for this image as unclear
                 for question_data in questions_by_image[img_id]:
                     result = question_data.copy()
@@ -247,7 +251,7 @@ def generate_pope_answers(
                     results.append(result)
 
             except Exception as e:
-                print(f"\n❌ Error processing image {img_id}: {e}")
+                logger.error(f"\nError processing image {img_id}: {e}")
                 # Mark all questions for this image as unclear
                 for question_data in questions_by_image[img_id]:
                     result = question_data.copy()
@@ -257,16 +261,18 @@ def generate_pope_answers(
 
     elapsed = time.time() - start_time
 
-    print(f"\n✅ Generated {len(results)} answers in {format_time(elapsed)}")
-    print(f"   Average: {elapsed / len(results):.2f}s per question")
-    print(f"   Unclear answers: {unclear_count} ({unclear_count / len(results) * 100:.1f}%)")
+    logger.info(f"\nGenerated {len(results)} answers in {format_time(elapsed)}")
+    logger.info(f"   Average: {elapsed / len(results):.2f}s per question")
+    logger.info(f"   Unclear answers: {unclear_count} ({unclear_count / len(results) * 100:.1f}%)")
 
     # Show some examples
-    print("\n📝 Sample answers:")
+    logger.info("\nSample answers:")
     for i in range(min(5, len(results))):
         q = results[i]
-        print(f"   Q: {q['question']}")
-        print(f"   A: {q['predicted_answer']} (GT: {q['answer']}) | Raw: {q['raw_output'][:50]}")
+        logger.info(f"   Q: {q['question']}")
+        logger.info(
+            f"   A: {q['predicted_answer']} (GT: {q['answer']}) | Raw: {q['raw_output'][:50]}"
+        )
 
     return results
 
@@ -312,24 +318,24 @@ def generate_answers_primed(
     results = []
     num_questions = len(questions)
 
-    print("\n🔮 Generating POPE answers with PRIMING strategy")
-    print(f"   Questions: {num_questions}")
-    print(f"   Max tokens: {max_new_tokens}")
-    print(f"   Temperature: {temperature} ({'greedy' if temperature == 0 else 'sampling'})")
-    print(f"   Device: {device}")
-    print(f"   Stage: {stage_name}")
-    print(f"   Priming: {priming_strategy}")
+    logger.info("\nGenerating POPE answers with PRIMING strategy")
+    logger.info(f"   Questions: {num_questions}")
+    logger.info(f"   Max tokens: {max_new_tokens}")
+    logger.info(f"   Temperature: {temperature} ({'greedy' if temperature == 0 else 'sampling'})")
+    logger.info(f"   Device: {device}")
+    logger.info(f"   Stage: {stage_name}")
+    logger.info(f"   Priming: {priming_strategy}")
 
     # Detect stage type for routing
     is_stage3 = stage_name == "stage3"
     if is_stage3:
-        print("   📍 Using Stage 3 (SOFT routing)")
+        logger.info("   Using Stage 3 (SOFT routing)")
         # Set all MoE layers to soft routing mode
         for layer in model.llm.model.layers:
             if hasattr(layer.mlp, "routing_mode"):
                 layer.mlp.routing_mode = "soft"
     else:
-        print("   📍 Using Stage 2 (HARD routing)")
+        logger.info("   Using Stage 2 (HARD routing)")
 
     start_time = time.time()
 
@@ -342,7 +348,7 @@ def generate_answers_primed(
         questions_by_image[img_id].append(q)
 
     unique_images = list(questions_by_image.keys())
-    print(f"   Processing {len(unique_images)} unique images")
+    logger.info(f"   Processing {len(unique_images)} unique images")
 
     unclear_count = 0
 
@@ -353,7 +359,7 @@ def generate_answers_primed(
             image_path = Path(image_dir) / image_filename
 
             if not image_path.exists():
-                print(f"\n⚠️  Image not found: {image_path}")
+                logger.warning(f"\n Image not found: {image_path}")
                 for question_data in questions_by_image[img_id]:
                     result = question_data.copy()
                     result["predicted_answer"] = "unclear"
@@ -474,7 +480,7 @@ def generate_answers_primed(
                     results.append(result)
 
             except Exception as e:
-                print(f"\n❌ Error processing image {img_id}: {e}")
+                logger.error(f"\nError processing image {img_id}: {e}")
                 for question_data in questions_by_image[img_id]:
                     result = question_data.copy()
                     result["predicted_answer"] = "unclear"
@@ -484,9 +490,9 @@ def generate_answers_primed(
     elapsed = time.time() - start_time
     unclear_pct = (unclear_count / len(results)) * 100 if results else 0
 
-    print(f"\n✅ Generated {len(results)} answers in {elapsed / 60:.1f} minutes")
-    print(f"   Unclear answers: {unclear_count} ({unclear_pct:.1f}%)")
-    print(f"   Speed: {len(results) / elapsed:.2f} questions/sec")
+    logger.info(f"\nGenerated {len(results)} answers in {elapsed / 60:.1f} minutes")
+    logger.info(f"   Unclear answers: {unclear_count} ({unclear_pct:.1f}%)")
+    logger.info(f"   Speed: {len(results) / elapsed:.2f} questions/sec")
 
     return results
 
@@ -545,18 +551,18 @@ def main():
 
         args.image_dir = str(Path(get_paths()["image_dir"]).parent / "val2017")
 
-    print_banner(f"POPE ANSWER GENERATION - {args.stage_name.upper()}")
+    log_banner(f"POPE ANSWER GENERATION - {args.stage_name.upper()}")
 
     # Load model
-    print("\n📦 Loading model...")
+    logger.info("\nLoading model...")
     model, processor, tokenizer = load_model_checkpoint(args.checkpoint_path, device=args.device)
-    print(f"   Checkpoint: {args.checkpoint_path}")
+    logger.info(f"   Checkpoint: {args.checkpoint_path}")
 
     # Load questions
-    print(f"\n📂 Loading questions from: {args.questions_file}")
+    logger.info(f"\nLoading questions from: {args.questions_file}")
     with open(args.questions_file) as f:
         questions = json.load(f)
-    print(f"   Found {len(questions)} questions")
+    logger.info(f"   Found {len(questions)} questions")
 
     # Generate answers
     if args.use_priming:
@@ -596,10 +602,11 @@ def main():
     output_path = output_dir / f"{args.stage_name}_{difficulty}_answers.json"
     save_json(answers, str(output_path))
 
-    print(f"\n💾 Saved answers: {output_path}")
+    logger.info(f"\nSaved answers: {output_path}")
 
-    print_banner(f"✅ {args.stage_name.upper()} ANSWER GENERATION COMPLETE")
+    log_banner(f"{args.stage_name.upper()} ANSWER GENERATION COMPLETE")
 
 
 if __name__ == "__main__":
+    setup_logging()
     main()

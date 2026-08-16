@@ -1,5 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=stage3_llava
+# Stage 3 — end-to-end soft routing on LLaVA-Instruct, 4 GPUs with FSDP.
+#
+# Adapt the #SBATCH header to your cluster; see hpc/README.md. Submit from the
+# repository root so the log paths resolve:
+#   mkdir -p logs/slurm && sbatch hpc/training_scripts/train_stage_3.sbatch
+#SBATCH --job-name=moe_stage3
 #SBATCH -p gpu-l40s
 #SBATCH --gres=gpu:4
 #SBATCH --nodes=1
@@ -7,47 +12,30 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=256G
 #SBATCH --time=95:00:00
-#SBATCH --output=../out_slurm/train_stage_3/train_stage_3_%j.out
-#SBATCH --error=../err_slurm/train_stage_3/train_stage_3_%j.err
+#SBATCH --output=logs/slurm/%x_%j.out
+#SBATCH --error=logs/slurm/%x_%j.err
 
-# Load modules
-module purge
-module load GCCcore/11.3.0
-module load Python/3.11.3
-module load CUDA  # Load the default CUDA
+source "${MOE_PROJECT_DIR:-$HOME/MoE-Specialisation}/hpc/cluster_env.sh"
+moe_setup_environment
 
-source ~/pytorch_latest_venv/bin/activate # Activate the new venv
+export NCCL_DEBUG=INFO
+export PYTHONFAULTHANDLER=1
+export TORCH_DISTRIBUTED_DEBUG=DETAIL
 
-echo "=== VERIFICATION ==="
-# Verify that python is coming from the correct environment
-which python
-# Verify PyTorch can see the GPU
-python -c "import torch; print(f'PyTorch: {torch.__version__}, CUDA available: {torch.cuda.is_available()}')"
-python -c "import transformers; print(f'Transformers: {transformers.__version__}')"
+# PyTorch 2.5+ reads TORCH_NCCL_*; the older NCCL_TIMEOUT is ignored.
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+export TORCH_NCCL_BLOCKING_WAIT=1
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=3600  # checkpoint gathers are slow
 
-# Rest of your script...
-cd $HOME/MoE-Specialisation
-export PYTHONPATH="${PWD}:${PYTHONPATH}"
-
-echo "Starting training script..."
-export NCCL_DEBUG=INFO # Optional: for debugging network communication
-export PYTHONFAULTHANDLER=1 # Optional: for better tracebacks on segfaults
-
-# CRITICAL: PyTorch 2.5+ uses TORCH_NCCL_* environment variables
-# NCCL_TIMEOUT is deprecated and ignored!
-export TORCH_NCCL_ASYNC_ERROR_HANDLING=1  # Enable async error handling
-export TORCH_NCCL_BLOCKING_WAIT=1          # Wait for collectives to complete
-export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=3600  # 60 minutes for checkpoint loading
-export TORCH_DISTRIBUTED_DEBUG=DETAIL      # Detailed distributed debugging
-
-# CUDA memory management: Reduce fragmentation
+# Reduce allocator fragmentation on the long LLaVA sequences.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# CRITICAL: Use a random port to avoid conflicts with other jobs
-# Port range: 29500-65000 to avoid conflicts
+# A fixed rendezvous port collides with other jobs on the same node.
 RANDOM_PORT=$((29500 + RANDOM % 35500))
-echo "Using random port: $RANDOM_PORT"
+echo "Using rendezvous port ${RANDOM_PORT}"
 
-srun torchrun --nproc_per_node=4 --master_port=$RANDOM_PORT training_scripts/train_stage_3.py
+echo "Starting Stage 3 (end-to-end, soft routing)..."
+srun torchrun --nproc_per_node=4 --master_port="${RANDOM_PORT}" \
+    training_scripts/train_stage_3.py
 
 echo "Job finished."

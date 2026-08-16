@@ -3,6 +3,7 @@
 Step 4: Generate captions for Karpathy test images using beam search.
 """
 
+import logging
 import argparse
 import time
 from pathlib import Path
@@ -13,10 +14,13 @@ from karpathy_utils import (
     load_and_preprocess_image,
     load_json,
     load_model_checkpoint,
-    print_banner,
+    log_banner,
     save_json,
 )
 from tqdm import tqdm
+from models.utils.common import setup_logging
+
+logger = logging.getLogger(__name__)
 
 
 def generate_captions(
@@ -56,11 +60,11 @@ def generate_captions(
     results = []
     num_images = len(images_data)
 
-    print(f"\n🔮 Generating captions for {num_images} images...")
-    print(f"   Beam search: {num_beams} beams")
-    print(f"   Max length: {max_length} tokens")
-    print(f"   Batch size: {batch_size}")
-    print(f"   Device: {device}")
+    logger.info(f"\nGenerating captions for {num_images} images...")
+    logger.info(f"   Beam search: {num_beams} beams")
+    logger.info(f"   Max length: {max_length} tokens")
+    logger.info(f"   Batch size: {batch_size}")
+    logger.info(f"   Device: {device}")
 
     start_time = time.time()
 
@@ -84,7 +88,7 @@ def generate_captions(
                     images.append(image)
                     valid_indices.append(idx)
                 except Exception as e:
-                    print(f"\n⚠️  Error loading {image_path}: {e}")
+                    logger.warning(f"\n Error loading {image_path}: {e}")
                     continue
 
             if not images:
@@ -126,18 +130,22 @@ def generate_captions(
 
             except AttributeError:
                 # Option 2: Manual generation if model doesn't have generate()
-                print("\n⚠️  Model doesn't have generate() method. Using manual generation.")
+                logger.warning("\n Model doesn't have generate() method. Using manual generation.")
 
                 # Detect stage type to use correct routing
                 is_stage3 = stage_name == "stage3"
                 if is_stage3:
-                    print("   📍 Detected Stage 3 checkpoint - using SOFT routing (gating network)")
+                    logger.info(
+                        "   Detected Stage 3 checkpoint - using SOFT routing (gating network)"
+                    )
                     # Set all MoE layers to soft routing mode
                     for layer in model.llm.model.layers:
                         if hasattr(layer.mlp, "routing_mode"):
                             layer.mlp.routing_mode = "soft"
                 else:
-                    print("   📍 Detected Stage 2 checkpoint - using HARD routing (routing masks)")
+                    logger.info(
+                        "   Detected Stage 2 checkpoint - using HARD routing (routing masks)"
+                    )
 
                 # Process vision through encoder and connector (like training script)
                 vision_outputs = model.vision_encoder(pixel_values=pixel_values)
@@ -276,16 +284,16 @@ def generate_captions(
 
     elapsed = time.time() - start_time
 
-    print(f"\n✅ Generated {len(results)} captions in {format_time(elapsed)}")
+    logger.info(f"\nGenerated {len(results)} captions in {format_time(elapsed)}")
     if len(results) > 0:
-        print(f"   Average: {elapsed / len(results):.2f}s per image")
+        logger.info(f"   Average: {elapsed / len(results):.2f}s per image")
 
         # Show some examples
-        print("\n📝 Sample captions:")
+        logger.info("\nSample captions:")
         for i in range(min(5, len(results))):
-            print(f"   Image {results[i]['image_id']}: {results[i]['caption']}")
+            logger.info(f"   Image {results[i]['image_id']}: {results[i]['caption']}")
     else:
-        print("   ⚠️  WARNING: No captions were generated!")
+        logger.warning("    WARNING: No captions were generated!")
 
     return results
 
@@ -334,23 +342,25 @@ def main():
 
     args = parser.parse_args()
 
-    print_banner(f"CAPTION GENERATION - {args.stage_name.upper()}")
+    log_banner(f"CAPTION GENERATION - {args.stage_name.upper()}")
 
     # Load model
-    print("\n📦 Loading model...")
+    logger.info("\nLoading model...")
     model, processor, tokenizer = load_model_checkpoint(args.checkpoint_path, device=args.device)
-    print(f"   Checkpoint: {args.checkpoint_path}")
+    logger.info(f"   Checkpoint: {args.checkpoint_path}")
 
     # Load images data
-    print("\n📂 Loading images data...")
+    logger.info("\nLoading images data...")
     images_data = load_json(args.images_json)
 
     # Optionally limit number of images for testing
     if args.num_images is not None and args.num_images < len(images_data):
-        print(f"   Found {len(images_data)} images, using first {args.num_images} for testing")
+        logger.info(
+            f"   Found {len(images_data)} images, using first {args.num_images} for testing"
+        )
         images_data = images_data[: args.num_images]
     else:
-        print(f"   Found {len(images_data)} images")
+        logger.info(f"   Found {len(images_data)} images")
 
     # Generate captions
     captions = generate_captions(
@@ -374,10 +384,11 @@ def main():
     output_path = output_dir / f"{args.stage_name}_captions.json"
     save_json(captions, str(output_path))
 
-    print(f"\n💾 Saved captions: {output_path}")
+    logger.info(f"\nSaved captions: {output_path}")
 
-    print_banner(f"✅ {args.stage_name.upper()} CAPTION GENERATION COMPLETE")
+    log_banner(f"{args.stage_name.upper()} CAPTION GENERATION COMPLETE")
 
 
 if __name__ == "__main__":
+    setup_logging()
     main()

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import json
 from pathlib import Path
 
 import torch
 from PIL import Image
+
+logger = logging.getLogger(__name__)
 
 
 def load_and_preprocess_image(image_path: str, processor) -> torch.Tensor:
@@ -41,7 +44,7 @@ def save_json(data: dict, filepath: str) -> None:
     Path(filepath).parent.mkdir(parents=True, exist_ok=True)
     with open(filepath, "w") as f:
         json.dump(data, f, indent=2)
-    print(f"✅ Saved: {filepath}")
+    logger.info("Saved: %s", filepath)
 
 
 def load_json(filepath: str) -> dict:
@@ -59,9 +62,12 @@ def format_time(seconds: float) -> str:
     return f"{seconds / 3600:.1f}h"
 
 
-def print_banner(text: str, char: str = "=") -> None:
-    """Print a formatted banner."""
+def log_banner(text: str, char: str = "=") -> None:
+    """Log a section heading as a single record.
+
+    One record rather than three, so the rule/title/rule cannot be split apart
+    by interleaved output from another logger.
+    """
     width = 80
-    print("\n" + char * width)
-    print(text.center(width))
-    print(char * width + "\n")
+    rule = char * width
+    logger.info("\n%s\n%s\n%s\n", rule, text.center(width), rule)

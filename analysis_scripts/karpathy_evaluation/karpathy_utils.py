@@ -8,6 +8,7 @@ scripts (and the POPE/LLaVA scripts that import from this module) keep working
 unchanged. Only Karpathy-specific code lives in this file.
 """
 
+import logging
 import sys
 from pathlib import Path
 
@@ -25,9 +26,12 @@ from analysis_scripts._lib import (  # noqa: E402
     load_and_preprocess_image,
     load_json,
     mean_pool_embeddings,
-    print_banner,
+    log_banner,
     save_json,
 )
+from models.utils.common import setup_logging
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "extract_layer_activations",
@@ -36,7 +40,7 @@ __all__ = [
     "load_json",
     "load_model_checkpoint",
     "mean_pool_embeddings",
-    "print_banner",
+    "log_banner",
     "save_json",
 ]
 
@@ -67,7 +71,7 @@ def load_model_checkpoint(checkpoint_path: str, device: str = "cuda"):
 
     register_moe_model()
 
-    print(f"\n🔄 Loading checkpoint from: {checkpoint_path}")
+    logger.info(f"\nLoading checkpoint from: {checkpoint_path}")
 
     # Load checkpoint
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -79,21 +83,21 @@ def load_model_checkpoint(checkpoint_path: str, device: str = "cuda"):
     connector_path = str(Path(paths["output_dir"]) / "vision_connector_stage1_best.pth")
 
     # Load vision encoder
-    print(f"📦 Loading CLIP vision encoder from {clip_path}...")
+    logger.info(f"Loading CLIP vision encoder from {clip_path}...")
     vision_encoder = CLIPVisionModel.from_pretrained(clip_path, local_files_only=True).to(device)
     vision_encoder.eval()
 
     # Load vision-language connector with trained weights from Stage 1
-    print(f"📦 Loading vision-language connector from {connector_path}...")
+    logger.info(f"Loading vision-language connector from {connector_path}...")
     vision_connector = VisionLanguageConnector()
     connector_state_dict = torch.load(connector_path, map_location="cpu", weights_only=False)
     vision_connector.load_state_dict(connector_state_dict)
     vision_connector = vision_connector.to(device)
     vision_connector.eval()
-    print("✅ Vision connector loaded successfully")
+    logger.info("Vision connector loaded successfully")
 
     # Load base MoE model architecture
-    print(f"📦 Loading base MoE LLM from {moe_model_path}...")
+    logger.info(f"Loading base MoE LLM from {moe_model_path}...")
     llm = AutoModelForCausalLM.from_pretrained(
         moe_model_path,
         trust_remote_code=True,
@@ -120,19 +124,19 @@ def load_model_checkpoint(checkpoint_path: str, device: str = "cuda"):
     llm = llm.to(device)
     llm.eval()
 
-    print("✅ LLM loaded successfully")
-    print(f"   Device: {device}")
-    print(f"   Parameters: {sum(p.numel() for p in llm.parameters()) / 1e9:.2f}B")
+    logger.info("LLM loaded successfully")
+    logger.info(f"   Device: {device}")
+    logger.info(f"   Parameters: {sum(p.numel() for p in llm.parameters()) / 1e9:.2f}B")
 
     # Load processor and tokenizer (same paths as training)
-    print(f"📦 Loading CLIP processor from {clip_path}...")
+    logger.info(f"Loading CLIP processor from {clip_path}...")
     processor = AutoProcessor.from_pretrained(clip_path, local_files_only=True)
 
-    print(f"📦 Loading Mistral tokenizer from {mistral_path}...")
+    logger.info(f"Loading Mistral tokenizer from {mistral_path}...")
     tokenizer = AutoTokenizer.from_pretrained(mistral_path, local_files_only=True)
     tokenizer.pad_token = tokenizer.eos_token
 
-    print("✅ Processor and tokenizer loaded")
+    logger.info("Processor and tokenizer loaded")
 
     # Create a simple wrapper object
     class ModelWrapper:
@@ -217,5 +221,6 @@ def extract_layer_activations(
 
 
 if __name__ == "__main__":
-    print("Testing karpathy_utils.py...")
-    print("✅ Utilities module loaded successfully")
+    setup_logging()
+    logger.info("Testing karpathy_utils.py...")
+    logger.info("Utilities module loaded successfully")

@@ -4,6 +4,7 @@ Step 3: Evaluate POPE answers and compute metrics.
 Computes accuracy, precision, recall, F1 for object hallucination detection.
 """
 
+import logging
 import argparse
 import json
 import sys
@@ -13,26 +14,31 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from pope_utils import compute_metrics  # noqa: E402
+from models.utils.common import setup_logging
+
+logger = logging.getLogger(__name__)
 
 
 def print_metrics(stage_name: str, difficulty: str, metrics: dict):
     """Print metrics in a formatted table."""
-    print(f"\n{'=' * 80}")
-    print(f"{stage_name.upper()} - {difficulty.upper()} DIFFICULTY")
-    print(f"{'=' * 80}")
-    print(f"  Accuracy:    {metrics['accuracy']:.4f} ({metrics['accuracy'] * 100:.2f}%)")
-    print(f"  Precision:   {metrics['precision']:.4f} ({metrics['precision'] * 100:.2f}%)")
-    print(f"  Recall:      {metrics['recall']:.4f} ({metrics['recall'] * 100:.2f}%)")
-    print(f"  F1 Score:    {metrics['f1']:.4f} ({metrics['f1'] * 100:.2f}%)")
-    print(f"  Yes Ratio:   {metrics['yes_ratio']:.4f} ({metrics['yes_ratio'] * 100:.2f}%)")
-    print(f"{'=' * 80}")
-    print("  Confusion Matrix:")
-    print(f"    True Positive:   {metrics['true_positive']:4d} (Correctly said yes)")
-    print(f"    False Positive:  {metrics['false_positive']:4d} (Hallucination - said yes but no)")
-    print(f"    True Negative:   {metrics['true_negative']:4d} (Correctly said no)")
-    print(f"    False Negative:  {metrics['false_negative']:4d} (Missed - said no but yes)")
-    print(f"    Unclear:         {metrics['num_unclear']:4d}")
-    print(f"{'=' * 80}")
+    logger.info(f"\n{'=' * 80}")
+    logger.info(f"{stage_name.upper()} - {difficulty.upper()} DIFFICULTY")
+    logger.info(f"{'=' * 80}")
+    logger.info(f"  Accuracy:    {metrics['accuracy']:.4f} ({metrics['accuracy'] * 100:.2f}%)")
+    logger.info(f"  Precision:   {metrics['precision']:.4f} ({metrics['precision'] * 100:.2f}%)")
+    logger.info(f"  Recall:      {metrics['recall']:.4f} ({metrics['recall'] * 100:.2f}%)")
+    logger.info(f"  F1 Score:    {metrics['f1']:.4f} ({metrics['f1'] * 100:.2f}%)")
+    logger.info(f"  Yes Ratio:   {metrics['yes_ratio']:.4f} ({metrics['yes_ratio'] * 100:.2f}%)")
+    logger.info(f"{'=' * 80}")
+    logger.info("  Confusion Matrix:")
+    logger.info(f"    True Positive:   {metrics['true_positive']:4d} (Correctly said yes)")
+    logger.info(
+        f"    False Positive:  {metrics['false_positive']:4d} (Hallucination - said yes but no)"
+    )
+    logger.info(f"    True Negative:   {metrics['true_negative']:4d} (Correctly said no)")
+    logger.info(f"    False Negative:  {metrics['false_negative']:4d} (Missed - said no but yes)")
+    logger.info(f"    Unclear:         {metrics['num_unclear']:4d}")
+    logger.info(f"{'=' * 80}")
 
 
 def create_comparison_table(
@@ -153,9 +159,9 @@ def main():
 
     args = parser.parse_args()
 
-    print("=" * 100)
-    print("POPE EVALUATION".center(100))
-    print("=" * 100)
+    logger.info("=" * 100)
+    logger.info("POPE EVALUATION".center(100))
+    logger.info("=" * 100)
 
     stage2_metrics = {}
     stage3_metrics = {}
@@ -165,31 +171,31 @@ def main():
         # Stage 2
         stage2_file = Path(args.stage2_dir) / f"stage2_{difficulty}_answers.json"
         if stage2_file.exists():
-            print(f"\n📊 Evaluating Stage 2 - {difficulty.capitalize()}...")
+            logger.info(f"\nEvaluating Stage 2 - {difficulty.capitalize()}...")
             with open(stage2_file) as f:
                 stage2_answers = json.load(f)
 
             stage2_metrics[difficulty] = compute_metrics(stage2_answers)
             print_metrics("stage2", difficulty, stage2_metrics[difficulty])
         else:
-            print(f"\n⚠️  Stage 2 {difficulty} answers not found: {stage2_file}")
+            logger.warning(f"\n Stage 2 {difficulty} answers not found: {stage2_file}")
 
         # Stage 3
         stage3_file = Path(args.stage3_dir) / f"stage3_{difficulty}_answers.json"
         if stage3_file.exists():
-            print(f"\n📊 Evaluating Stage 3 - {difficulty.capitalize()}...")
+            logger.info(f"\nEvaluating Stage 3 - {difficulty.capitalize()}...")
             with open(stage3_file) as f:
                 stage3_answers = json.load(f)
 
             stage3_metrics[difficulty] = compute_metrics(stage3_answers)
             print_metrics("stage3", difficulty, stage3_metrics[difficulty])
         else:
-            print(f"\n⚠️  Stage 3 {difficulty} answers not found: {stage3_file}")
+            logger.warning(f"\n Stage 3 {difficulty} answers not found: {stage3_file}")
 
     # Create comparison if we have both stages
     if stage2_metrics and stage3_metrics:
         comparison = create_comparison_table(stage2_metrics, stage3_metrics, args.difficulties)
-        print(comparison)
+        logger.info(comparison)
 
         # Save comparison
         output_dir = Path(args.output_dir)
@@ -198,7 +204,7 @@ def main():
         comparison_file = output_dir / "pope_comparison.txt"
         with open(comparison_file, "w") as f:
             f.write(comparison)
-        print(f"\n💾 Saved comparison: {comparison_file}")
+        logger.info(f"\nSaved comparison: {comparison_file}")
 
     # Save metrics JSON
     all_metrics = {"stage2": stage2_metrics, "stage3": stage3_metrics}
@@ -206,12 +212,13 @@ def main():
     metrics_file = Path(args.output_dir) / "pope_metrics.json"
     with open(metrics_file, "w") as f:
         json.dump(all_metrics, f, indent=2)
-    print(f"💾 Saved metrics: {metrics_file}")
+    logger.info(f"Saved metrics: {metrics_file}")
 
-    print("\n" + "=" * 100)
-    print("✅ POPE EVALUATION COMPLETE".center(100))
-    print("=" * 100)
+    logger.info("\n" + "=" * 100)
+    logger.info("POPE EVALUATION COMPLETE".center(100))
+    logger.info("=" * 100)
 
 
 if __name__ == "__main__":
+    setup_logging()
     main()

@@ -5,6 +5,7 @@ Extracted verbatim from ``plot_expert_metrics.py`` to keep the CLI/orchestration
 module small. Pure functions: take loaded metrics + an output dir, write files.
 """
 
+import logging
 import json
 import os
 
@@ -13,6 +14,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from analysis_scripts._lib import set_publication_rcparams
+
+logger = logging.getLogger(__name__)
 
 set_publication_rcparams()
 
@@ -157,7 +160,7 @@ def plot_expert_load_distribution(
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "expert_load_distribution.png"))
     plt.close()
-    print("  ✅ Saved: expert_load_distribution.png")
+    logger.info("  Saved: expert_load_distribution.png")
 
 
 def plot_routing_entropy(all_metrics, output_dir, selected_layers=None, selected_epochs=None):
@@ -206,7 +209,7 @@ def plot_routing_entropy(all_metrics, output_dir, selected_layers=None, selected
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "routing_entropy.png"))
     plt.close()
-    print("  ✅ Saved: routing_entropy.png")
+    logger.info("  Saved: routing_entropy.png")
 
 
 def plot_high_confidence_fraction(
@@ -259,7 +262,7 @@ def plot_high_confidence_fraction(
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "high_confidence_fraction.png"))
     plt.close()
-    print("  ✅ Saved: high_confidence_fraction.png")
+    logger.info("  Saved: high_confidence_fraction.png")
 
 
 def plot_visual_vs_text_routing(
@@ -268,7 +271,7 @@ def plot_visual_vs_text_routing(
     """
     Plot visual vs text token routing patterns for specific layers.
     Shows what % of visual tokens go to expert_1 vs % of text tokens go to expert_1.
-    This reveals modality-specific specialization patterns.
+    This reveals modality-specific specialisation patterns.
 
     Args:
         selected_layers: List of layer indices to plot. If None, uses default selection.
@@ -337,12 +340,12 @@ def plot_visual_vs_text_routing(
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "visual_vs_text_routing.png"))
     plt.close()
-    print("  ✅ Saved: visual_vs_text_routing.png")
+    logger.info("  Saved: visual_vs_text_routing.png")
 
 
 def plot_specialization_evolution(all_metrics, output_dir, selected_epochs=None):
     """
-    Plot how expert specialization evolves across epochs.
+    Plot how expert specialisation evolves across epochs.
     Shows aggregate % of visual/text tokens routed to each expert over training.
     """
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
@@ -433,13 +436,13 @@ def plot_specialization_evolution(all_metrics, output_dir, selected_epochs=None)
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "specialization_evolution.png"))
     plt.close()
-    print("  ✅ Saved: specialization_evolution.png")
+    logger.info("  Saved: specialization_evolution.png")
 
 
 def plot_aggregate_summary(all_metrics, output_dir):
     """
     Plot aggregate summary statistics for the latest epoch.
-    Shows overall expert utilization patterns (simplified version).
+    Shows overall expert utilisation patterns (simplified version).
     """
     # Use the latest epoch
     latest_epoch = max(all_metrics.keys())
@@ -520,7 +523,7 @@ def plot_aggregate_summary(all_metrics, output_dir):
     plt.tight_layout(rect=[0, 0, 1, 0.96])  # Leave space for suptitle
     plt.savefig(os.path.join(output_dir, "aggregate_summary.png"))
     plt.close()
-    print("  ✅ Saved: aggregate_summary.png")
+    logger.info("  Saved: aggregate_summary.png")
 
 
 def generate_report(all_metrics, output_dir):
@@ -559,7 +562,7 @@ def generate_report(all_metrics, output_dir):
                 for expert, load in agg["text_routing"].items():
                     f.write(f"   {expert}: {load:.2f}%\n")
 
-            # Compute specialization score
+            # Compute specialisation score
             if "visual_routing" in agg and "text_routing" in agg:
                 visual_e0 = agg["visual_routing"].get("expert_0", 50)
                 text_e0 = agg["text_routing"].get("expert_0", 50)
@@ -577,16 +580,16 @@ def generate_report(all_metrics, output_dir):
 
             f.write("\n" + "=" * 80 + "\n")
 
-    print("  ✅ Saved: expert_metrics_report.txt")
+    logger.info("  Saved: expert_metrics_report.txt")
 
 
 def plot_modality_specialization_divergence(all_metrics, output_dir, selected_epochs=None):
     """
-    Plot modality specialization divergence over epochs.
+    Plot modality specialisation divergence over epochs.
     Shows |Visual_Expert0% - Text_Expert0%| to quantify how differently
     experts handle visual vs text tokens.
 
-    This is THE KEY METRIC for understanding modality-specific specialization.
+    This is THE KEY METRIC for understanding modality-specific specialisation.
     """
     if selected_epochs is None:
         epochs = sorted(all_metrics.keys())
@@ -652,7 +655,7 @@ def plot_modality_specialization_divergence(all_metrics, output_dir, selected_ep
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "specialization_divergence.png"))
     plt.close()
-    print("  ✅ Saved: specialization_divergence.png")
+    logger.info("  Saved: specialization_divergence.png")
 
 
 def plot_routing_confidence_evolution(all_metrics, output_dir, selected_epochs=None):
@@ -700,14 +703,14 @@ def plot_routing_confidence_evolution(all_metrics, output_dir, selected_epochs=N
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "routing_confidence_evolution.png"))
     plt.close()
-    print("  ✅ Saved: routing_confidence_evolution.png")
+    logger.info("  Saved: routing_confidence_evolution.png")
 
 
 def plot_loss_and_specialization(all_metrics, output_dir, metrics_json_path, selected_epochs=None):
     """
-    Dual-axis plot showing training/validation loss and specialization divergence.
+    Dual-axis plot showing training/validation loss and specialisation divergence.
 
-    THE GOLD PLOT for papers: Shows that specialization emerges during training
+    THE GOLD PLOT for papers: Shows that specialisation emerges during training
     and correlates with loss improvement.
 
     Args:
@@ -723,8 +726,8 @@ def plot_loss_and_specialization(all_metrics, output_dir, metrics_json_path, sel
 
     # Load training metrics
     if not os.path.exists(metrics_json_path):
-        print(f"  ⚠️  Warning: Training metrics not found at {metrics_json_path}")
-        print("     Skipping loss_and_specialization plot")
+        logger.warning(f"   Warning: Training metrics not found at {metrics_json_path}")
+        logger.info("     Skipping loss_and_specialization plot")
         return
 
     with open(metrics_json_path) as f:
@@ -745,7 +748,7 @@ def plot_loss_and_specialization(all_metrics, output_dir, metrics_json_path, sel
             train_loss.append(None)
             val_loss.append(None)
 
-        # Compute specialization divergence
+        # Compute specialisation divergence
         metrics = all_metrics[epoch]
         agg = metrics["aggregate"]
 
@@ -768,7 +771,7 @@ def plot_loss_and_specialization(all_metrics, output_dir, metrics_json_path, sel
     valid_divergence = [d for d in divergence_values if d is not None]
 
     if not valid_epochs:
-        print("  ⚠️  Warning: No valid data for loss_and_specialization plot")
+        logger.warning("   Warning: No valid data for loss_and_specialization plot")
         return
 
     fig, ax1 = plt.subplots(figsize=(14, 7))
@@ -802,7 +805,7 @@ def plot_loss_and_specialization(all_metrics, output_dir, metrics_json_path, sel
     ax1.set_xticks(valid_epochs)
     ax1.grid(True, alpha=0.3, axis="y")
 
-    # Right Y-axis: Specialization Divergence
+    # Right Y-axis: Specialisation Divergence
     ax2 = ax1.twinx()
     color_spec = "#2ecc71"
     ax2.set_ylabel("Specialization Divergence (%)", fontsize=13, color=color_spec)
@@ -837,4 +840,4 @@ def plot_loss_and_specialization(all_metrics, output_dir, metrics_json_path, sel
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "loss_and_specialization.png"))
     plt.close()
-    print("  ✅ Saved: loss_and_specialization.png")
+    logger.info("  Saved: loss_and_specialization.png")

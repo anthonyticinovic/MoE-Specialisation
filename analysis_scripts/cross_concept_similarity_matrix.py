@@ -32,6 +32,7 @@ Config file format (JSON):
     }
 """
 
+import logging
 import argparse
 import json
 import os
@@ -48,6 +49,9 @@ from analysis_scripts._lib import (
     load_stage3_models,
 )
 from analysis_scripts.cross_modality_purity import CrossModalityPurityAnalyzer
+from models.utils.common import setup_logging
+
+logger = logging.getLogger(__name__)
 
 
 class CrossConceptSimilarityAnalyzer:
@@ -82,9 +86,9 @@ class CrossConceptSimilarityAnalyzer:
             stage3_checkpoint: Path to Stage 3 portable checkpoint (required if mode="stage3")
             temperature: Routing temperature for Stage 3 (lower = more deterministic)
         """
-        print("🔧 Initializing Cross-Concept Similarity Analyzer")
-        print(f"   Mode: {mode.upper()}")
-        print(f"   Device: {device}")
+        logger.info("Initialising Cross-Concept Similarity Analyzer")
+        logger.info(f"   Mode: {mode.upper()}")
+        logger.info(f"   Device: {device}")
 
         self.mode = mode
         self.device = device
@@ -97,14 +101,14 @@ class CrossConceptSimilarityAnalyzer:
 
         if mode == "stage2":
             # Initialize base analyzer for Stage 2 forced routing
-            print("   Using Stage 2 forced expert routing")
+            logger.info("   Using Stage 2 forced expert routing")
             if stage2_checkpoint:
-                print(f"   Stage 2 checkpoint: {stage2_checkpoint}")
+                logger.info(f"   Stage 2 checkpoint: {stage2_checkpoint}")
             self.base_analyzer = CrossModalityPurityAnalyzer(config_path=config_path, device=device)
         elif mode == "stage3":
             # For Stage 3, we'll load models directly
-            print(f"   Using Stage 3 learned soft routing (temperature={temperature})")
-            print(f"   Checkpoint: {stage3_checkpoint}")
+            logger.info(f"   Using Stage 3 learned soft routing (temperature={temperature})")
+            logger.info(f"   Checkpoint: {stage3_checkpoint}")
             self.config_path = config_path
             self.base_analyzer = None  # No base analyzer for Stage 3
         else:
@@ -119,9 +123,9 @@ class CrossConceptSimilarityAnalyzer:
 
     def _load_stage2_models(self):
         """Load Stage 2 models with forced expert routing via the shared _lib loader."""
-        print("\n📦 Loading Stage 2 models...")
+        logger.info("\nLoading Stage 2 models...")
         if self.stage2_checkpoint:
-            print(f"   Using custom Stage 2 checkpoint: {self.stage2_checkpoint}")
+            logger.info(f"   Using custom Stage 2 checkpoint: {self.stage2_checkpoint}")
             self.base_analyzer._assign(
                 load_stage2_models(
                     self.base_analyzer.config,
@@ -130,12 +134,12 @@ class CrossConceptSimilarityAnalyzer:
                 )
             )
         else:
-            print("   Using default Stage 2 checkpoint from training_config.yaml")
+            logger.info("   Using default Stage 2 checkpoint from training_config.yaml")
             self.base_analyzer.load_models()
 
     def _load_stage3_models(self):
         """Load Stage 3 end-to-end model with learned soft routing via _lib."""
-        print("\n📦 Loading Stage 3 models...")
+        logger.info("\nLoading Stage 3 models...")
         self.base_analyzer = CrossModalityPurityAnalyzer(
             config_path=self.config_path, device=self.device
         )
@@ -147,7 +151,7 @@ class CrossConceptSimilarityAnalyzer:
                 self.temperature,
             )
         )
-        print(f"   ✅ Stage 3 models loaded (soft routing, temperature={self.temperature})")
+        logger.info(f"   Stage 3 models loaded (soft routing, temperature={self.temperature})")
 
     def extract_concept_samples(
         self, annotations_file: str, concepts: list[str], samples_per_concept: int, seed: int = 42
@@ -167,9 +171,9 @@ class CrossConceptSimilarityAnalyzer:
                 - 'caption': Image caption
                 - 'image_path': Relative path to image file
         """
-        print("\n📚 Extracting concept samples from COCO annotations...")
-        print(f"   Concepts: {concepts}")
-        print(f"   Target: {samples_per_concept} samples per concept")
+        logger.info("\nExtracting concept samples from COCO annotations...")
+        logger.info(f"   Concepts: {concepts}")
+        logger.info(f"   Target: {samples_per_concept} samples per concept")
 
         # Load COCO annotations
         with open(annotations_file) as f:
@@ -229,15 +233,15 @@ class CrossConceptSimilarityAnalyzer:
                 )
 
         # Print statistics
-        print("\n   📊 Extracted samples:")
+        logger.info("\n   Extracted samples:")
         for concept, samples in concept_samples.items():
-            print(f"      {concept}: {len(samples)} samples")
+            logger.info(f"      {concept}: {len(samples)} samples")
 
         # Warn if any concept is under-sampled
         for concept, samples in concept_samples.items():
             if len(samples) < samples_per_concept:
-                print(
-                    f"   ⚠️  Warning: Only found {len(samples)} samples for '{concept}' (target: {samples_per_concept})"
+                logger.warning(
+                    f"    Warning: Only found {len(samples)} samples for '{concept}' (target: {samples_per_concept})"
                 )
 
         return concept_samples
@@ -249,7 +253,7 @@ class CrossConceptSimilarityAnalyzer:
         Extract hidden state representation for a concept at a specific layer.
 
         For Stage 2: Uses forced routing (wrapper around base analyzer)
-        For Stage 3: Uses learned soft routing (natural model behavior)
+        For Stage 3: Uses learned soft routing (natural model behaviour)
 
         Args:
             concept: Image path (for vision) or text string (for text)
@@ -303,7 +307,7 @@ class CrossConceptSimilarityAnalyzer:
                 inputs_embeds = text_embeddings
                 # Create attention mask for text (all ones, no padding in single-sample case)
                 attention_mask = torch.ones(text_embeddings.shape[:2], device=self.device)
-                # IMPORTANT: Exclude BOS token (position 0) to match Stage 2 behavior
+                # IMPORTANT: Exclude BOS token (position 0) to match Stage 2 behaviour
                 num_content_tokens = text_embeddings.shape[1]  # Total tokens including BOS
 
             else:
@@ -358,7 +362,7 @@ class CrossConceptSimilarityAnalyzer:
             attention_mask = torch.ones(inputs_embeds.shape[:2], device=self.device)
 
         # Use base analyzer's LLM (loaded with Stage 3 weights)
-        # Forward pass WITHOUT routing masks (soft routing will use learned behavior)
+        # Forward pass WITHOUT routing masks (soft routing will use learned behaviour)
         outputs = self.base_analyzer.llm.model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -405,17 +409,17 @@ class CrossConceptSimilarityAnalyzer:
             [img:cat, img:dog, ..., txt:cat, txt:dog, ...]
         """
         N = len(concept_samples)
-        print(f"\n🔬 Computing {2 * N}×{2 * N} similarity matrix at layer {layer}")
-        print(f"   Pooling strategy: {pooling}")
-        print(f"   Number of concepts: {N}")
+        logger.info(f"\nComputing {2 * N}×{2 * N} similarity matrix at layer {layer}")
+        logger.info(f"   Pooling strategy: {pooling}")
+        logger.info(f"   Number of concepts: {N}")
 
         representations = []
         labels = []
 
         # Extract image representations (first N entries) - averaged per concept
-        print("\n📸 Extracting image representations through vision expert...")
+        logger.info("\nExtracting image representations through vision expert...")
         for concept, samples in concept_samples.items():
-            print(f"   Concept: {concept} ({len(samples)} samples)")
+            logger.info(f"   Concept: {concept} ({len(samples)} samples)")
 
             concept_img_reps = []
 
@@ -423,7 +427,7 @@ class CrossConceptSimilarityAnalyzer:
                 image_path = os.path.join(image_dir, sample["image_path"])
 
                 if idx % 10 == 0 and idx > 0:
-                    print(f"      Progress: {idx}/{len(samples)} samples")
+                    logger.info(f"      Progress: {idx}/{len(samples)} samples")
 
                 try:
                     img_rep = self._extract_representation(
@@ -435,7 +439,7 @@ class CrossConceptSimilarityAnalyzer:
                     )
                     concept_img_reps.append(img_rep)
                 except Exception as e:
-                    print(f"      ⚠️  Error processing {image_path}: {e}")
+                    logger.warning(f"       Error processing {image_path}: {e}")
                     continue
 
             # Average representations across samples
@@ -443,16 +447,16 @@ class CrossConceptSimilarityAnalyzer:
                 avg_img_rep = np.mean(np.stack(concept_img_reps), axis=0)
                 representations.append(avg_img_rep)
                 labels.append(f"img:{concept}")
-                print(
-                    f"       ✓ Averaged {len(concept_img_reps)} samples: norm={np.linalg.norm(avg_img_rep):.2f}"
+                logger.info(
+                    f"       Averaged {len(concept_img_reps)} samples: norm={np.linalg.norm(avg_img_rep):.2f}"
                 )
             else:
-                print(f"       ⚠️  No valid samples for {concept}, skipping")
+                logger.warning(f"        No valid samples for {concept}, skipping")
 
         # Extract text representations (next N entries) - averaged per concept
-        print("\n💬 Extracting text representations through text expert...")
+        logger.info("\nExtracting text representations through text expert...")
         for concept, samples in concept_samples.items():
-            print(f"   Concept: {concept} ({len(samples)} samples)")
+            logger.info(f"   Concept: {concept} ({len(samples)} samples)")
 
             concept_txt_reps = []
 
@@ -460,7 +464,7 @@ class CrossConceptSimilarityAnalyzer:
                 text = sample["caption"]
 
                 if idx % 10 == 0 and idx > 0:
-                    print(f"      Progress: {idx}/{len(samples)} samples")
+                    logger.info(f"      Progress: {idx}/{len(samples)} samples")
 
                 try:
                     txt_rep = self._extract_representation(
@@ -468,7 +472,7 @@ class CrossConceptSimilarityAnalyzer:
                     )
                     concept_txt_reps.append(txt_rep)
                 except Exception as e:
-                    print(f"      ⚠️  Error processing text '{text}': {e}")
+                    logger.warning(f"       Error processing text '{text}': {e}")
                     continue
 
             # Average representations across samples
@@ -476,18 +480,18 @@ class CrossConceptSimilarityAnalyzer:
                 avg_txt_rep = np.mean(np.stack(concept_txt_reps), axis=0)
                 representations.append(avg_txt_rep)
                 labels.append(f"txt:{concept}")
-                print(
-                    f"       ✓ Averaged {len(concept_txt_reps)} samples: norm={np.linalg.norm(avg_txt_rep):.2f}"
+                logger.info(
+                    f"       Averaged {len(concept_txt_reps)} samples: norm={np.linalg.norm(avg_txt_rep):.2f}"
                 )
             else:
-                print(f"       ⚠️  No valid samples for {concept}, skipping")
+                logger.warning(f"        No valid samples for {concept}, skipping")
 
         # Compute pairwise similarity matrix
-        print(f"\n📊 Computing {2 * N}×{2 * N} cosine similarity matrix...")
+        logger.info(f"\nComputing {2 * N}×{2 * N} cosine similarity matrix...")
         matrix = self._compute_cosine_similarity_matrix(representations)
 
-        print(f"   ✓ Matrix computed: shape={matrix.shape}")
-        print(f"   ✓ Similarity range: [{matrix.min():.3f}, {matrix.max():.3f}]")
+        logger.info(f"   Matrix computed: shape={matrix.shape}")
+        logger.info(f"   Similarity range: [{matrix.min():.3f}, {matrix.max():.3f}]")
 
         return matrix, labels
 
@@ -546,7 +550,7 @@ class CrossConceptSimilarityAnalyzer:
         has_colors = any(color is not None for color, _ in parsed_concepts)
 
         if not has_colors:
-            print("\n   ⚠️  No colored concepts detected (format should be 'color_object')")
+            logger.warning("\n    No colored concepts detected (format should be 'color_object')")
             return {
                 "color_coherence_score": None,
                 "same_color_diff_object_mean": None,
@@ -588,7 +592,7 @@ class CrossConceptSimilarityAnalyzer:
 
         # Compute metrics
         if len(same_color_diff_object) == 0 or len(diff_color_same_object) == 0:
-            print("\n   ⚠️  Insufficient color-object pairs for CCS computation")
+            logger.warning("\n    Insufficient color-object pairs for CCS computation")
             return {
                 "color_coherence_score": None,
                 "same_color_diff_object_mean": None,
@@ -621,16 +625,16 @@ class CrossConceptSimilarityAnalyzer:
         os.makedirs(output_dir, exist_ok=True)
 
         # Compute color coherence score
-        print("\n   🎨 Computing Color Coherence Score (CCS)...")
+        logger.info("\n   Computing Color Coherence Score (CCS)...")
         ccs_results = self.compute_color_coherence_score(matrix, labels)
 
         if ccs_results["color_coherence_score"] is not None:
-            print(f"   📊 Color Coherence Score: {ccs_results['color_coherence_score']:.3f}")
-            print(
+            logger.info(f"   Color Coherence Score: {ccs_results['color_coherence_score']:.3f}")
+            logger.info(
                 f"      • Same color, diff object: {ccs_results['same_color_diff_object_mean']:.3f} "
                 f"(n={ccs_results['same_color_diff_object_count']} pairs)"
             )
-            print(
+            logger.info(
                 f"      • Diff color, same object: {ccs_results['diff_color_same_object_mean']:.3f} "
                 f"(n={ccs_results['diff_color_same_object_count']} pairs)"
             )
@@ -638,12 +642,12 @@ class CrossConceptSimilarityAnalyzer:
             # Interpret the score
             ccs = ccs_results["color_coherence_score"]
             if ccs > 1.05:
-                interpretation = "✅ Strong color binding (color disentangled from object)"
+                interpretation = "Strong color binding (color disentangled from object)"
             elif ccs > 0.95:
-                interpretation = "⚠️  Weak/no color binding (color-object entangled)"
+                interpretation = "Weak/no color binding (color-object entangled)"
             else:
-                interpretation = "❌ Category dominance (object identity dominates over color)"
-            print(f"      • Interpretation: {interpretation}")
+                interpretation = "Category dominance (object identity dominates over color)"
+            logger.info(f"      • Interpretation: {interpretation}")
 
         # Save matrix as JSON (convert to list for JSON serialization)
         matrix_path = os.path.join(output_dir, f"similarity_matrix_layer{layer}.json")
@@ -658,7 +662,7 @@ class CrossConceptSimilarityAnalyzer:
                 f,
                 indent=2,
             )
-        print(f"   ✓ Saved matrix to: {matrix_path}")
+        logger.info(f"   Saved matrix to: {matrix_path}")
 
         # Save labels as JSON
         labels_path = os.path.join(output_dir, f"labels_layer{layer}.json")
@@ -666,11 +670,11 @@ class CrossConceptSimilarityAnalyzer:
             json.dump(
                 {"labels": labels, "layer": layer, "num_pairs": len(labels) // 2}, f, indent=2
             )
-        print(f"   ✓ Saved labels to: {labels_path}")
+        logger.info(f"   Saved labels to: {labels_path}")
 
     def visualize_matrix(self, matrix: np.ndarray, labels: list[str], output_dir: str, layer: int):
         """
-        Create and save heatmap visualizations of similarity matrix.
+        Create and save heatmap visualisations of similarity matrix.
 
         Generates two plots:
         1. Standard: Single color scale for all values
@@ -739,7 +743,7 @@ class CrossConceptSimilarityAnalyzer:
         plt.savefig(plot_path, dpi=300, bbox_inches="tight")
         plt.close()
 
-        print(f"   ✓ Saved standard heatmap to: {plot_path}")
+        logger.info(f"   Saved standard heatmap to: {plot_path}")
 
         # ============================================================
         # PLOT 2: Cross-modal only (txt vs img)
@@ -753,7 +757,7 @@ class CrossConceptSimilarityAnalyzer:
         Create focused heatmap showing only cross-modal (txt↔img) similarities.
 
         Extracts the bottom-left quadrant (txt rows × img columns) and displays
-        it with an optimized color scale for maximum sensitivity.
+        it with an optimised color scale for maximum sensitivity.
 
         Args:
             matrix: 2N×2N similarity matrix
@@ -773,16 +777,18 @@ class CrossConceptSimilarityAnalyzer:
         txt_labels = [l.replace("txt:", "") for l in labels[half_n:]]
 
         # Compute statistics
-        print("\n   📊 Cross-modal only statistics:")
-        print(f"      Shape: {cross_modal_matrix.shape} (txt × img)")
-        print(f"      Range: [{cross_modal_matrix.min():.3f}, {cross_modal_matrix.max():.3f}]")
-        print(f"      Mean: {cross_modal_matrix.mean():.3f}")
-        print(f"      Std: {cross_modal_matrix.std():.3f}")
+        logger.info("\n   Cross-modal only statistics:")
+        logger.info(f"      Shape: {cross_modal_matrix.shape} (txt × img)")
+        logger.info(
+            f"      Range: [{cross_modal_matrix.min():.3f}, {cross_modal_matrix.max():.3f}]"
+        )
+        logger.info(f"      Mean: {cross_modal_matrix.mean():.3f}")
+        logger.info(f"      Std: {cross_modal_matrix.std():.3f}")
 
         # Create figure
         fig, ax = plt.subplots(figsize=(10, 10))
 
-        # Create heatmap with optimized color scale
+        # Create heatmap with optimised color scale
         sns.heatmap(
             cross_modal_matrix,
             annot=True,
@@ -821,7 +827,7 @@ class CrossConceptSimilarityAnalyzer:
         plt.savefig(plot_path, dpi=300, bbox_inches="tight")
         plt.close()
 
-        print(f"   ✓ Saved cross-modal heatmap to: {plot_path}")
+        logger.info(f"   Saved cross-modal heatmap to: {plot_path}")
 
     def run_analysis(
         self,
@@ -842,7 +848,7 @@ class CrossConceptSimilarityAnalyzer:
             samples_per_concept: Number of samples to extract per concept
             annotations_file: Path to COCO annotations JSON
             image_dir: Base directory for COCO images
-            layers: List of layer indices to analyze
+            layers: List of layer indices to analyse
             pooling: Pooling strategy
             output_dir: Output directory for results
             seed: Random seed for reproducibility
@@ -850,14 +856,14 @@ class CrossConceptSimilarityAnalyzer:
         Returns:
             Dictionary containing results for each layer
         """
-        print("=" * 80)
-        print("Cross-Concept Similarity Matrix Analysis")
-        print("=" * 80)
-        print(f"Concepts: {concepts}")
-        print(f"Samples per concept: {samples_per_concept}")
-        print(f"Layers to analyze: {layers}")
-        print(f"Total layers: {len(layers)}")
-        print("=" * 80)
+        logger.info("=" * 80)
+        logger.info("Cross-Concept Similarity Matrix Analysis")
+        logger.info("=" * 80)
+        logger.info(f"Concepts: {concepts}")
+        logger.info(f"Samples per concept: {samples_per_concept}")
+        logger.info(f"Layers to analyse: {layers}")
+        logger.info(f"Total layers: {len(layers)}")
+        logger.info("=" * 80)
 
         # Extract concept samples once (shared across all layers)
         concept_samples = self.extract_concept_samples(
@@ -870,60 +876,62 @@ class CrossConceptSimilarityAnalyzer:
         results = {}
 
         # Process each layer
-        print(f"\n🔍 DEBUG: About to iterate through {len(layers)} layers: {layers}")
+        logger.info(f"\nDEBUG: About to iterate through {len(layers)} layers: {layers}")
         for layer_idx, layer in enumerate(layers):
-            print(f"\n{'=' * 80}")
-            print(f"🔍 DEBUG: Starting iteration {layer_idx + 1}/{len(layers)}")
-            print(f"LAYER {layer} ({layer_idx + 1}/{len(layers)})")
-            print(f"{'=' * 80}")
+            logger.info(f"\n{'=' * 80}")
+            logger.info(f"DEBUG: Starting iteration {layer_idx + 1}/{len(layers)}")
+            logger.info(f"LAYER {layer} ({layer_idx + 1}/{len(layers)})")
+            logger.info(f"{'=' * 80}")
 
             try:
                 # Compute similarity matrix
-                print(f"\n🔄 Starting matrix computation for layer {layer}...")
-                print(f"🔍 DEBUG: Calling compute_cross_concept_matrix with layer={layer}")
+                logger.info(f"\nStarting matrix computation for layer {layer}...")
+                logger.info(f"DEBUG: Calling compute_cross_concept_matrix with layer={layer}")
                 matrix, labels = self.compute_cross_concept_matrix(
                     concept_samples=concept_samples,
                     image_dir=image_dir,
                     layer=layer,
                     pooling=pooling,
                 )
-                print(f"✓ Matrix computation complete for layer {layer}")
-                print(f"🔍 DEBUG: Matrix shape: {matrix.shape}, Labels count: {len(labels)}")
+                logger.info(f"Matrix computation complete for layer {layer}")
+                logger.info(f"DEBUG: Matrix shape: {matrix.shape}, Labels count: {len(labels)}")
 
                 # Save results
-                print(f"\n💾 Saving results for layer {layer}...")
-                print("🔍 DEBUG: About to call save_results")
+                logger.info(f"\nSaving results for layer {layer}...")
+                logger.info("DEBUG: About to call save_results")
                 self.save_results(matrix, labels, output_dir, layer)
-                print(f"✓ Results saved for layer {layer}")
+                logger.info(f"Results saved for layer {layer}")
 
-                # Visualize
-                print(f"\n📈 Generating visualization for layer {layer}...")
-                print("🔍 DEBUG: About to call visualize_matrix")
+                # Visualise
+                logger.info(f"\nGenerating visualisation for layer {layer}...")
+                logger.info("DEBUG: About to call visualize_matrix")
                 self.visualize_matrix(matrix, labels, output_dir, layer)
-                print(f"✓ Visualization complete for layer {layer}")
+                logger.info(f"Visualisation complete for layer {layer}")
 
                 results[f"layer_{layer}"] = {"matrix": matrix, "labels": labels}
 
-                print(f"\n✅ Layer {layer} processing complete!")
-                print(
-                    f"🔍 DEBUG: Finished iteration {layer_idx + 1}/{len(layers)}, moving to next layer"
+                logger.info(f"\nLayer {layer} processing complete!")
+                logger.info(
+                    f"DEBUG: Finished iteration {layer_idx + 1}/{len(layers)}, moving to next layer"
                 )
 
             except Exception as e:
-                print(f"\n❌ ERROR processing layer {layer}: {e}")
-                print("   Continuing to next layer...")
+                logger.error(f"\nERROR processing layer {layer}: {e}")
+                logger.info("   Continuing to next layer...")
                 import traceback
 
                 traceback.print_exc()
-                print("🔍 DEBUG: Exception caught, continuing to next layer")
+                logger.info("DEBUG: Exception caught, continuing to next layer")
                 continue
 
-        print(f"\n🔍 DEBUG: Completed all {len(layers)} layer iterations")
+        logger.info(f"\nDEBUG: Completed all {len(layers)} layer iterations")
 
-        print(f"\n{'=' * 80}")
-        print(f"✅ Analysis complete! Processed {len(results)}/{len(layers)} layers successfully")
-        print(f"📁 Results saved to: {output_dir}")
-        print("=" * 80)
+        logger.info(f"\n{'=' * 80}")
+        logger.info(
+            f"Analysis complete! Processed {len(results)}/{len(layers)} layers successfully"
+        )
+        logger.info(f"Results saved to: {output_dir}")
+        logger.info("=" * 80)
 
         return results
 
@@ -986,51 +994,51 @@ def main():
     args = parser.parse_args()
 
     # Load config file
-    print(f"📄 Loading configuration from: {args.config_file}")
+    logger.info(f"Loading configuration from: {args.config_file}")
     config = load_config(args.config_file)
 
     # Override with command-line arguments if provided
     if args.mode:
         config["mode"] = args.mode
-        print(f"   ⚠️  Overriding mode from command line: {args.mode}")
+        logger.warning(f"    Overriding mode from command line: {args.mode}")
 
     if args.stage2_checkpoint:
         config["stage2_checkpoint"] = args.stage2_checkpoint
-        print("   ⚠️  Overriding Stage 2 checkpoint from command line")
+        logger.warning("    Overriding Stage 2 checkpoint from command line")
 
     if args.stage3_checkpoint:
         config["stage3_checkpoint"] = args.stage3_checkpoint
-        print("   ⚠️  Overriding Stage 3 checkpoint from command line")
+        logger.warning("    Overriding Stage 3 checkpoint from command line")
 
     if args.temperature:
         config["temperature"] = args.temperature
-        print(f"   ⚠️  Overriding temperature from command line: {args.temperature}")
+        logger.warning(f"    Overriding temperature from command line: {args.temperature}")
 
     if args.output_dir:
         config["output_dir"] = args.output_dir
-        print(f"   ⚠️  Overriding output directory from command line: {args.output_dir}")
+        logger.warning(f"    Overriding output directory from command line: {args.output_dir}")
 
     # Validate Stage 3 requirements
     if config.get("mode", "stage2") == "stage3" and "stage3_checkpoint" not in config:
         raise ValueError("--stage3-checkpoint required when mode='stage3'")
 
     # Print configuration
-    print("\n📋 Configuration:")
-    print(f"   Mode: {config.get('mode', 'stage2').upper()}")
-    print(f"   Concepts: {config['concepts']}")
-    print(f"   Samples per concept: {config['samples_per_concept']}")
-    print(f"   Layers: {config['layers']}")
-    print(f"   Pooling: {config['pooling']}")
-    print(f"   Output directory: {config.get('output_dir', 'results/similarity_matrix/')}")
-    print(f"   Annotations file: {config['annotations_file']}")
-    print(f"   Image directory: {config['image_dir']}")
+    logger.info("\nConfiguration:")
+    logger.info(f"   Mode: {config.get('mode', 'stage2').upper()}")
+    logger.info(f"   Concepts: {config['concepts']}")
+    logger.info(f"   Samples per concept: {config['samples_per_concept']}")
+    logger.info(f"   Layers: {config['layers']}")
+    logger.info(f"   Pooling: {config['pooling']}")
+    logger.info(f"   Output directory: {config.get('output_dir', 'results/similarity_matrix/')}")
+    logger.info(f"   Annotations file: {config['annotations_file']}")
+    logger.info(f"   Image directory: {config['image_dir']}")
     if config.get("mode", "stage2") == "stage2":
-        print(
+        logger.info(
             f"   Stage 2 checkpoint: {config.get('stage2_checkpoint', 'default (from training_config.yaml)')}"
         )
     elif config.get("mode", "stage2") == "stage3":
-        print(f"   Stage 3 checkpoint: {config.get('stage3_checkpoint', 'N/A')}")
-        print(f"   Temperature: {config.get('temperature', 0.01)}")
+        logger.info(f"   Stage 3 checkpoint: {config.get('stage3_checkpoint', 'N/A')}")
+        logger.info(f"   Temperature: {config.get('temperature', 0.01)}")
 
     # Initialize analyzer
     analyzer = CrossConceptSimilarityAnalyzer(
@@ -1059,4 +1067,5 @@ def main():
 
 
 if __name__ == "__main__":
+    setup_logging()
     main()

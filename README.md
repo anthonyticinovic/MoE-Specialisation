@@ -13,15 +13,15 @@ See the paper for the full method and results.
 
 ## Run it in 30 seconds (no GPU, no data, no downloads)
 
-The full pipeline — Stage 0 → 1 → 2 → 2.5 → 3 — runs on a laptop CPU against
-generated fixtures:
+The full pipeline — Stage 0 → 1 → 2 → 2.5 → 3, plus the dense control — runs on
+a laptop CPU against generated fixtures:
 
 ```bash
 uv sync --group dev
 make demo
 ```
 
-About 17 seconds. It writes checkpoints, routing metrics, four figures and a
+About 20 seconds. It writes 12 checkpoints, routing metrics, four figures and a
 one-page `demo_output/demo_report.md`.
 
 The report leads with **12 executable invariants** — properties that must hold
@@ -44,6 +44,8 @@ caption anything, and the routing metrics sit near an even split. The point is
 that the pipeline, the checkpoint formats and the routing instrumentation are
 verifiably intact — and that a reader can confirm that themselves without a
 cluster.
+
+`make check` runs the lint, the tests and the demo together.
 
 ## Overview
 
@@ -129,8 +131,14 @@ This is refactored research code, not a product. Before anything will run:
   local copies of Mistral-7B-v0.3 and CLIP ViT-L/14, then point
   `configs/training_config.yaml` at them.
 - **Hardware.** Stage 1 trains on a single GPU; Stages 2–3 use FSDP and need
-  ≥4× A100/H100-class GPUs. The SLURM scripts in `hpc/` target an H100 cluster
-  and will need their `--gres`/module lines adapted.
+  ≥4× A100/H100-class GPUs. The SLURM scripts in [`hpc/`](hpc/README.md) target
+  an H100 cluster: paths and modules are set in `hpc/cluster_env.sh` (or
+  overridden by environment variable), while the `#SBATCH` headers must be
+  edited per cluster.
+- **No published metrics yet.** The Stage 3 metric files behind the paper's
+  routing figures are not in the repository. The regeneration path is in place
+  — see [`paper_metrics/`](paper_metrics/README.md) — but until the JSON is
+  added, `make figures` has nothing to plot.
 
 ### Setup
 
@@ -185,7 +193,10 @@ sbatch hpc/training_scripts/train_stage_2.5.sbatch
 sbatch hpc/training_scripts/train_stage_3.sbatch
 ```
 
-> Stages 2–3 require at least 4× A100/H100 GPUs. The SLURM scripts target a Slurm cluster with H100 nodes; adapt `--gres` and module loads for your environment.
+> Stages 2–3 require at least 4× A100/H100 GPUs. Before submitting, set your
+> checkout and virtualenv paths in `hpc/cluster_env.sh` (or export
+> `MOE_PROJECT_DIR` / `MOE_VENV`) and adapt the `#SBATCH` headers. See
+> [`hpc/README.md`](hpc/README.md).
 
 ## Analysis Scripts
 
@@ -201,8 +212,14 @@ python analysis_scripts/routing_ablation_experiment.py \
 
 # Expert utilisation metrics across epochs (reads JSON files from training)
 python analysis_scripts/plot_expert_metrics.py \
-    --metrics_dir /path/to/outputs/expert_metrics
+    --metrics_dir /path/to/outputs/expert_metrics \
+    --layers all_layers
 ```
+
+Analysis scripts write to `results/`, which is git-ignored. `make figures` is a
+shortcut for the command above, reading the committed metrics in
+[`paper_metrics/`](paper_metrics/README.md) instead of a run of your own — once
+those are added.
 
 ### Concept-level analysis
 
@@ -307,15 +324,20 @@ MoE-Specialisation/
 │   ├── COCO_loader.py        # COCO captions dataset
 │   └── LLaVA_loader.py       # LLaVA-Instruct-150K dataset
 ├── training_scripts/         # One script per training stage
+│   └── _lib/                 # Shared runtime, pipeline, checkpoint and metric code
 ├── analysis_scripts/         # Expert analysis and benchmark evaluation
+│   ├── _lib/                 # Shared model loading, I/O and plotting helpers
 │   ├── karpathy_evaluation/  # COCO Karpathy split pipeline
 │   ├── pope_evaluation/      # POPE hallucination benchmark
 │   └── llava_evaluation/     # LLaVA-Wild evaluation
+├── demo/                     # CPU end-to-end demo: fixtures, runner, invariants
 ├── tests/                    # CPU-only pytest suite + behavioural oracle
+├── paper_metrics/            # Committed Stage 3 metrics for `make figures`
 ├── configs/
 │   ├── training_config.yaml  # All paths + hyperparameters (edit this first)
 │   └── *.json                # Per-analysis configs
 └── hpc/
+    ├── cluster_env.sh        # Cluster paths and modules, sourced by every job
     ├── training_scripts/     # SLURM job scripts for training
     └── model_scripts/        # SLURM job script for model creation
 ```
@@ -332,7 +354,10 @@ The full pipeline, in order, with the artifacts each stage produces:
 | 2.5 | `torchrun --nproc_per_node=4 training_scripts/train_stage_2.5.py` | `stage2_5_checkpoints/` (learned router) |
 | 3 | `torchrun --nproc_per_node=4 training_scripts/train_stage_3.py` | `stage3_checkpoints/` + `outputs/expert_metrics/` |
 
-Then run the analysis scripts (see below) against the resulting checkpoints.
+Then run the analysis scripts (see above) against the resulting checkpoints.
+Stage 3's `expert_metrics/` is also what [`paper_metrics/`](paper_metrics/README.md)
+expects, so a completed run makes `make figures` work without a GPU thereafter.
+
 The `uv.lock` pins the exact dependency set; exact paper figures used the
 `transformers` 4.x line (the dependency is capped `<5`).
 
@@ -342,18 +367,27 @@ The `uv.lock` pins the exact dependency set; exact paper figures used the
 uv sync --group dev          # runtime + dev tooling
 uv run pre-commit install
 
-uv run ruff check models/ data/ tests/   # lint the maintained core
-uv run ruff format --check .             # formatting (whole repo)
-uv run mypy                              # type-check models/ + data/
-uv run pytest -q                         # CPU-only suite (~1s)
+make lint     # ruff (correctness repo-wide, style on the core) + mypy
+make format   # apply ruff formatting
+make test     # CPU-only pytest suite (~8s)
+make demo     # the whole pipeline on CPU against synthetic fixtures
+make check    # lint + test + demo
 ```
 
 ruff and mypy are strict on the maintained core (`models/`, `data/`, `tests/`);
 the research scripts (`training_scripts/`, `analysis_scripts/`) are held to
-formatting only, since they reproduce the published paper and are changed
-conservatively. `tests/test_training_dry_run.py` is a behavioural oracle: it
-asserts a tiny synthetic model produces bit-identical loss/grad-norm against a
-recorded baseline — if those numbers move, a refactor changed training numerics.
+formatting plus the correctness rules (`F821`/`F811`/`F822`) that catch
+undefined names — a missing import once left two training scripts unrunnable on
+`main` for months, and the narrower lint scope was why nothing noticed.
+
+The suite covers four levels, deliberately:
+
+| Level | Where | What it protects |
+|---|---|---|
+| Numerics | `tests/test_training_dry_run.py` | A tiny synthetic model must produce bit-identical loss and grad-norm against a recorded baseline. If those move, a refactor changed training numerics. |
+| Behaviour | `tests/test_training_steps.py` | Each stage runs a real epoch and must change **exactly** the parameters it claims to train, with gradients reaching all of them, and must resume from its own checkpoint. |
+| Structure | `tests/test_training_scripts_structure.py` | Every script stays inert on import, reuses `_lib` rather than re-implementing FSDP, and never loads weights with a bare `strict=False`. Also checks the SLURM scripts point at files that exist. |
+| End-to-end | `make demo` | 12 executable invariants over a full CPU pipeline run. |
 
 ## Citation
 

@@ -1,14 +1,14 @@
 """
 MoE Layer Clustering Analysis
 
-Analyzes representation clustering at specific MoE layers to understand
-whether experts specialize by modality and/or concept.
+Analyses representation clustering at specific MoE layers to understand
+whether experts specialise by modality and/or concept.
 
-This script visualizes the representation space created by MoE layers to see
+This script visualises the representation space created by MoE layers to see
 if the router and experts are separating inputs by modality or concept.
 
 Usage:
-    # Analyze using config file
+    # Analyse using config file
     python analysis_scripts/layer_clustering_analysis.py \
         --config configs/clustering_analysis.json
     
@@ -24,7 +24,7 @@ Usage:
         from matplotlib.cm import ScalarMappable
         # Colorbar is just a reference for the confidence gradient
         
-        # Create a colormap that goes from white to gray (for visualization reference)
+        # Create a colormap that goes from white to gray (for visualisation reference)
         # This represents the confidence gradient
         # Use the actual confidence threshold from the config
         norm = Normalize(vmin=self.expert_confidence_threshold, vmax=1.0)
@@ -38,6 +38,7 @@ Usage:
         --reduction-method tsne
 """
 
+import logging
 import argparse
 import json
 import os
@@ -54,13 +55,16 @@ from analysis_scripts._lib import majority_vote_expert
 
 # Import base analyzer
 from analysis_scripts.cross_modality_purity import CrossModalityPurityAnalyzer
+from models.utils.common import setup_logging
+
+logger = logging.getLogger(__name__)
 
 
 class MoEClusteringAnalyzer(CrossModalityPurityAnalyzer):
     """
     Extends CrossModalityPurityAnalyzer to add clustering analysis capabilities.
 
-    Analyzes representation clustering to understand modality and concept specialization
+    Analyses representation clustering to understand modality and concept specialisation
     in MoE layers.
     """
 
@@ -86,9 +90,9 @@ class MoEClusteringAnalyzer(CrossModalityPurityAnalyzer):
                 - 'caption': Image caption
                 - 'image_path': Full path to image file
         """
-        print("📚 Extracting concept samples from COCO annotations...")
-        print(f"   Concepts: {concepts}")
-        print(f"   Target: {samples_per_concept} samples per concept")
+        logger.info("Extracting concept samples from COCO annotations...")
+        logger.info(f"   Concepts: {concepts}")
+        logger.info(f"   Target: {samples_per_concept} samples per concept")
 
         # Load COCO annotations
         with open(annotations_file) as f:
@@ -133,15 +137,15 @@ class MoEClusteringAnalyzer(CrossModalityPurityAnalyzer):
                 )
 
         # Print statistics
-        print("\n   📊 Extracted samples:")
+        logger.info("\n   Extracted samples:")
         for concept, samples in concept_samples.items():
-            print(f"      {concept}: {len(samples)} samples")
+            logger.info(f"      {concept}: {len(samples)} samples")
 
         # Warn if any concept is under-sampled
         for concept, samples in concept_samples.items():
             if len(samples) < samples_per_concept:
-                print(
-                    f"   ⚠️  Warning: Only found {len(samples)} samples for '{concept}' (target: {samples_per_concept})"
+                logger.warning(
+                    f"    Warning: Only found {len(samples)} samples for '{concept}' (target: {samples_per_concept})"
                 )
 
         return concept_samples
@@ -183,7 +187,7 @@ class MoEClusteringAnalyzer(CrossModalityPurityAnalyzer):
         Args:
             concept_samples: Dict mapping concept -> list of samples
             image_dir: Base directory for COCO images
-            target_layers: List of layer indices to analyze
+            target_layers: List of layer indices to analyse
             pooling: Pooling strategy ("mean", "max", "cls", "last")
             confidence_threshold: Threshold for expert choice confidence
 
@@ -197,12 +201,12 @@ class MoEClusteringAnalyzer(CrossModalityPurityAnalyzer):
                 - 'image_id': int (COCO image ID)
                 - 'caption': str (COCO caption)
         """
-        print(
-            f"\n🔬 Collecting representations from {sum(len(s) for s in concept_samples.values())} samples..."
+        logger.info(
+            f"\nCollecting representations from {sum(len(s) for s in concept_samples.values())} samples..."
         )
-        print(f"   Target layers: {target_layers}")
-        print(f"   Pooling: {pooling}")
-        print(f"   Expert confidence threshold: {confidence_threshold}")
+        logger.info(f"   Target layers: {target_layers}")
+        logger.info(f"   Pooling: {pooling}")
+        logger.info(f"   Expert confidence threshold: {confidence_threshold}")
 
         self.expert_confidence_threshold = confidence_threshold
 
@@ -214,7 +218,7 @@ class MoEClusteringAnalyzer(CrossModalityPurityAnalyzer):
         sample_count = 0
 
         for concept, samples in concept_samples.items():
-            print(f"\n   Processing concept: {concept} ({len(samples)} samples)")
+            logger.info(f"\n   Processing concept: {concept} ({len(samples)} samples)")
 
             for sample in samples:
                 sample_count += 1
@@ -223,14 +227,14 @@ class MoEClusteringAnalyzer(CrossModalityPurityAnalyzer):
                 image_id = sample["image_id"]
 
                 if sample_count % 10 == 0:
-                    print(f"      Progress: {sample_count}/{total_samples} samples")
+                    logger.info(f"      Progress: {sample_count}/{total_samples} samples")
 
                 # Prepare vision and text inputs
                 try:
                     visual_tokens = self._prepare_vision_input(image_path)
                     text_embeddings = self._prepare_text_input(caption)
                 except Exception as e:
-                    print(f"      ⚠️  Skipping sample {image_id}: {e}")
+                    logger.warning(f"       Skipping sample {image_id}: {e}")
                     continue
 
                 # CRITICAL: Combine vision and text tokens for a single forward pass
@@ -274,14 +278,14 @@ class MoEClusteringAnalyzer(CrossModalityPurityAnalyzer):
 
                         # Debug: Print shape and sample values for first sample only
                         if sample_count == 1 and layer_idx == target_layers[0]:
-                            print(
+                            logger.info(
                                 f"      DEBUG: all_router_logits shape: {all_router_logits.shape}"
                             )
-                            print(f"      DEBUG: num_vision_tokens: {num_vision_tokens}")
-                            print(
+                            logger.info(f"      DEBUG: num_vision_tokens: {num_vision_tokens}")
+                            logger.info(
                                 f"      DEBUG: Vision router logits sample (first 3 tokens): {all_router_logits[0, :3, :]}"
                             )
-                            print(
+                            logger.info(
                                 f"      DEBUG: Text router logits sample (first 3 tokens): {all_router_logits[0, num_vision_tokens : num_vision_tokens + 3, :]}"
                             )
 
@@ -302,20 +306,20 @@ class MoEClusteringAnalyzer(CrossModalityPurityAnalyzer):
 
                         # Debug: Print probability distributions
                         if sample_count == 1 and layer_idx == target_layers[0]:
-                            print(
+                            logger.info(
                                 f"      DEBUG: Vision probs sample (first 3 tokens): {vision_router_probs[:3, :]}"
                             )
-                            print(
+                            logger.info(
                                 f"      DEBUG: Text probs sample (first 3 tokens): {text_router_probs[:3, :]}"
                             )
                             vision_expert0_count = (
                                 (vision_router_probs.argmax(dim=1) == 0).sum().item()
                             )
                             text_expert0_count = (text_router_probs.argmax(dim=1) == 0).sum().item()
-                            print(
+                            logger.info(
                                 f"      DEBUG: Vision tokens → Expert 0: {vision_expert0_count}/{len(vision_router_probs)}"
                             )
-                            print(
+                            logger.info(
                                 f"      DEBUG: Text tokens → Expert 0: {text_expert0_count}/{len(text_router_probs)}"
                             )
 
@@ -389,7 +393,7 @@ class MoEClusteringAnalyzer(CrossModalityPurityAnalyzer):
         for layer_idx in target_layers:
             layer_dataframes[layer_idx] = pd.DataFrame(layer_dataframes[layer_idx])
 
-        print(f"\n✅ Collected {sample_count} samples across {len(target_layers)} layers")
+        logger.info(f"\nCollected {sample_count} samples across {len(target_layers)} layers")
         return layer_dataframes
 
     def run_dimensionality_reduction(
@@ -400,7 +404,7 @@ class MoEClusteringAnalyzer(CrossModalityPurityAnalyzer):
         perplexity: int = 30,
     ) -> np.ndarray:
         """
-        Reduce high-dimensional representations to 2D for visualization.
+        Reduce high-dimensional representations to 2D for visualisation.
 
         Args:
             representations: Array of shape [n_samples, hidden_dim]
@@ -411,8 +415,8 @@ class MoEClusteringAnalyzer(CrossModalityPurityAnalyzer):
         Returns:
             2D coordinates array of shape [n_samples, 2]
         """
-        print(f"   🔄 Running {method.upper()} dimensionality reduction...")
-        print(f"      Input shape: {representations.shape}")
+        logger.info(f"   Running {method.upper()} dimensionality reduction...")
+        logger.info(f"      Input shape: {representations.shape}")
 
         if method.lower() == "tsne":
             reducer = TSNE(n_components=2, perplexity=perplexity, random_state=42, n_jobs=-1)
@@ -425,14 +429,14 @@ class MoEClusteringAnalyzer(CrossModalityPurityAnalyzer):
                 reducer = pacmap.PaCMAP(n_components=2, n_neighbors=n_neighbors, random_state=42)
                 coords_2d = reducer.fit_transform(representations)
             except ImportError:
-                print("      ⚠️  PaCMAP not installed. Falling back to t-SNE...")
+                logger.warning("       PaCMAP not installed. Falling back to t-SNE...")
                 reducer = TSNE(n_components=2, perplexity=perplexity, random_state=42)
                 coords_2d = reducer.fit_transform(representations)
 
         else:
             raise ValueError(f"Unknown reduction method: {method}. Use 'tsne' or 'pacmap'")
 
-        print(f"      Output shape: {coords_2d.shape}")
+        logger.info(f"      Output shape: {coords_2d.shape}")
         return coords_2d
 
     def compute_clustering_metrics(
@@ -517,7 +521,7 @@ def main():
     args = parser.parse_args()
 
     # Load config
-    print(f"📋 Loading config from {args.config}")
+    logger.info(f"Loading config from {args.config}")
     with open(args.config) as f:
         config = json.load(f)
 
@@ -528,17 +532,17 @@ def main():
         config["analysis"]["reduction_method"] = args.reduction_method
 
     # Print configuration
-    print(f"\n{'=' * 70}")
-    print("🔬 MoE Layer Clustering Analysis")
-    print(f"{'=' * 70}")
-    print(f"Checkpoint: {config['checkpoint_path']}")
-    print(f"Concepts: {config['data']['concepts']}")
-    print(f"Samples per concept: {config['data']['samples_per_concept']}")
-    print(f"Target layers: {config['analysis']['target_layers']}")
-    print(f"Reduction method: {config['analysis']['reduction_method']}")
-    print(f"Expert confidence threshold: {config['analysis']['expert_confidence_threshold']}")
-    print(f"Output directory: {config['output']['save_dir']}")
-    print(f"{'=' * 70}\n")
+    logger.info(f"\n{'=' * 70}")
+    logger.info("MoE Layer Clustering Analysis")
+    logger.info(f"{'=' * 70}")
+    logger.info(f"Checkpoint: {config['checkpoint_path']}")
+    logger.info(f"Concepts: {config['data']['concepts']}")
+    logger.info(f"Samples per concept: {config['data']['samples_per_concept']}")
+    logger.info(f"Target layers: {config['analysis']['target_layers']}")
+    logger.info(f"Reduction method: {config['analysis']['reduction_method']}")
+    logger.info(f"Expert confidence threshold: {config['analysis']['expert_confidence_threshold']}")
+    logger.info(f"Output directory: {config['output']['save_dir']}")
+    logger.info(f"{'=' * 70}\n")
 
     # Initialize analyzer
     analyzer = MoEClusteringAnalyzer(device=args.device)
@@ -563,14 +567,14 @@ def main():
         confidence_threshold=config["analysis"]["expert_confidence_threshold"],
     )
 
-    # Analyze each layer
+    # Analyse each layer
     for layer_idx in config["analysis"]["target_layers"]:
-        print(f"\n{'=' * 70}")
-        print(f"📊 Analyzing Layer {layer_idx}")
-        print(f"{'=' * 70}")
+        logger.info(f"\n{'=' * 70}")
+        logger.info(f"Analysing Layer {layer_idx}")
+        logger.info(f"{'=' * 70}")
 
         df = layer_dataframes[layer_idx]
-        print(f"   Samples: {len(df)} ({df['modality'].value_counts().to_dict()})")
+        logger.info(f"   Samples: {len(df)} ({df['modality'].value_counts().to_dict()})")
 
         # Stack representations
         representations = np.stack(df["representation"].values)
@@ -600,7 +604,7 @@ def main():
             metrics[label_type] = analyzer.compute_clustering_metrics(
                 coords_2d=coords_2d, labels=df[column_name].values, label_type=label_type
             )
-            print(
+            logger.info(
                 f"   {label_type.capitalize()} clustering - Silhouette: {metrics[label_type]['silhouette_score']:.4f}, Davies-Bouldin: {metrics[label_type]['davies_bouldin_index']:.4f}"
             )
 
@@ -623,12 +627,13 @@ def main():
                 expert_choices=df["expert_choice"].values,
                 routing_confidences=df["routing_confidence"].values,
             )
-            print(f"   💾 Saved representations: {repr_path}")
+            logger.info(f"   Saved representations: {repr_path}")
 
-    print(f"\n{'=' * 70}")
-    print(f"✅ Analysis complete! Results saved to {config['output']['save_dir']}")
-    print(f"{'=' * 70}\n")
+    logger.info(f"\n{'=' * 70}")
+    logger.info(f"Analysis complete! Results saved to {config['output']['save_dir']}")
+    logger.info(f"{'=' * 70}\n")
 
 
 if __name__ == "__main__":
+    setup_logging()
     main()

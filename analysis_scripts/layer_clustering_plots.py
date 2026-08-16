@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import os
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+
+logger = logging.getLogger(__name__)
 
 
 def plot_clustering_analysis(
@@ -21,12 +24,12 @@ def plot_clustering_analysis(
     Generate 3 scatter plots with identical layout but different coloring.
 
     Args:
-        layer_idx: Layer index being visualized
+        layer_idx: Layer index being visualised
         df: DataFrame with metadata (concept, modality, expert_choice)
         coords_2d: 2D coordinates from dimensionality reduction [n_samples, 2]
         output_dir: Directory to save plots
     """
-    print(f"   📊 Generating plots for Layer {layer_idx}...")
+    logger.info(f"   Generating plots for Layer {layer_idx}...")
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -63,7 +66,7 @@ def plot_clustering_analysis(
     concept_path = os.path.join(output_dir, f"layer_{layer_idx}_concept.png")
     plt.savefig(concept_path, dpi=300, bbox_inches="tight")
     plt.close()
-    print(f"      ✅ Saved: {concept_path}")
+    logger.info(f"      Saved: {concept_path}")
 
     # Plot 2: Color by Modality
     fig, ax = plt.subplots(figsize=figsize)
@@ -96,7 +99,7 @@ def plot_clustering_analysis(
     modality_path = os.path.join(output_dir, f"layer_{layer_idx}_modality.png")
     plt.savefig(modality_path, dpi=300, bbox_inches="tight")
     plt.close()
-    print(f"      ✅ Saved: {modality_path}")
+    logger.info(f"      Saved: {modality_path}")
 
     # Plot 3: Color by Expert Choice with Confidence
     fig, ax = plt.subplots(figsize=figsize)
@@ -159,7 +162,7 @@ def plot_clustering_analysis(
     from matplotlib.cm import ScalarMappable
     from matplotlib.colors import Normalize
 
-    # Create a colormap that goes from white to gray (for visualization reference)
+    # Create a colormap that goes from white to gray (for visualisation reference)
     # This represents the confidence gradient
     # Use the actual confidence threshold from the config
     norm = Normalize(vmin=expert_confidence_threshold, vmax=1.0)
@@ -174,7 +177,7 @@ def plot_clustering_analysis(
     expert_path = os.path.join(output_dir, f"layer_{layer_idx}_expert.png")
     plt.savefig(expert_path, dpi=300, bbox_inches="tight")
     plt.close()
-    print(f"      ✅ Saved: {expert_path}")
+    logger.info(f"      Saved: {expert_path}")
 
 
 def generate_clustering_report(
@@ -192,7 +195,7 @@ def generate_clustering_report(
         metrics: Dict mapping label_type -> metrics dict
         output_dir: Directory to save report
     """
-    print(f"   📝 Generating report for Layer {layer_idx}...")
+    logger.info(f"   Generating report for Layer {layer_idx}...")
 
     report_path = os.path.join(output_dir, f"layer_{layer_idx}_report.md")
 
@@ -274,7 +277,7 @@ def generate_clustering_report(
             )
             f.write(f"- Text tokens: {text_to_0:.1f}% → Expert 0, {text_to_1:.1f}% → Expert 1\n\n")
 
-            # Determine specialization pattern
+            # Determine specialisation pattern
             if vision_to_0 > 70 and text_to_1 > 70:
                 f.write(
                     "**Strong modality specialization detected**: Vision → Expert 0, Text → Expert 1\n"
@@ -292,4 +295,4 @@ def generate_clustering_report(
                     "**Moderate modality specialization**: Some preference but not strongly separated\n"
                 )
 
-    print(f"      ✅ Saved: {report_path}")
+    logger.info(f"      Saved: {report_path}")
