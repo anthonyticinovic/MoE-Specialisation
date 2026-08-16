@@ -20,11 +20,12 @@ import shutil
 from transformers import MistralForCausalLM
 
 from models.custom_mistral import MistralMoEConfig, MistralMoEForCausalLM
+from models.utils.common import set_seed, setup_logging
 
 logger = logging.getLogger(__name__)
 
 
-def create_moe_model(base_model_path: str, output_path: str) -> None:
+def create_moe_model(base_model_path: str, output_path: str, seed: int = 42) -> None:
     """Build and save an MoE checkpoint from a base Mistral-7B model (Stage 0).
 
     Loads the base model, constructs a :class:`MistralMoEForCausalLM` with the
@@ -38,7 +39,16 @@ def create_moe_model(base_model_path: str, output_path: str) -> None:
     Args:
         base_model_path: Local path to the base Mistral-7B-v0.3 checkpoint.
         output_path: Directory to write the MoE checkpoint to.
+        seed: Seed for the router gate's initialisation.
+
+    The experts are copied from the base FFN, but each ``MoELayer`` also creates
+    a router gate with ``nn.init.normal_``. That draw is the only randomness in
+    Stage 0, and without seeding it every invocation produces a different
+    checkpoint — invisible in Stage 2, where hard routing never reads the gate,
+    but not in the later stages that do.
     """
+    set_seed(seed)
+
     logger.info("Loading base model from %s...", base_model_path)
     llm_base = MistralForCausalLM.from_pretrained(base_model_path)
 
@@ -90,5 +100,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-model", required=True, help="Path to Mistral-7B-v0.3")
     parser.add_argument("--output", required=True, help="Output path for MoE model")
+    parser.add_argument("--seed", type=int, default=42, help="Seed for router gate initialisation")
     args = parser.parse_args()
-    create_moe_model(args.base_model, args.output)
+    # Without this the module's logger has no handler and the CLI runs silently.
+    setup_logging()
+    create_moe_model(args.base_model, args.output, args.seed)

@@ -40,6 +40,7 @@ from models.utils.common import (
     init_distributed,
     load_config,
     register_moe_model,
+    set_seed,
     setup_logging,
     supports_fsdp,
     unwrap_model,
@@ -256,6 +257,12 @@ else:
     DEVICE = "cpu"
 # autocast/GradScaler take a device *type* string; DEVICE may be an ordinal.
 AMP_DEVICE = "cuda" if USE_FSDP else "cpu"
+
+# Seed every RNG, as Stage 1 already does. Without this the run is not
+# reproducible: dropout, the Gumbel noise in soft routing and the shuffled
+# sampler all draw from an unseeded stream, so two identical invocations
+# produce different losses and different routing metrics.
+set_seed(loader_params.get("data_seed", 42))
 
 if local_rank == 0:
     # CHANGED: Print statement for Stage 3

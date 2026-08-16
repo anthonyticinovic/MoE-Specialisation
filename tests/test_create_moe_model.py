@@ -116,6 +116,46 @@ class TestCreateMoEModel:
         assert cfg["architectures"] == ["MistralMoEForCausalLM"]
 
 
+class TestReproducibility:
+    """Stage 0 must be deterministic given the same base model and seed."""
+
+    def _build(self, tiny_base_model, tmp_path, name, seed=42):
+        from safetensors.torch import load_file
+
+        import models.utils.create_moe_model as cmm
+
+        base_dir = tmp_path / f"base_{name}"
+        tiny_base_model.save_pretrained(str(base_dir))
+        out_dir = tmp_path / f"moe_{name}"
+        cmm.create_moe_model(str(base_dir), str(out_dir), seed=seed)
+        return load_file(str(out_dir / "model.safetensors"))
+
+    def test_same_seed_gives_identical_gates(self, tiny_base_model, tmp_path):
+        """The router gate is the only random draw in Stage 0.
+
+        Regression: it was initialised from the unseeded global RNG, so every
+        invocation produced a different checkpoint. Hard routing never reads the
+        gate, so Stage 2 losses matched and the drift only surfaced downstream.
+        """
+        first = self._build(tiny_base_model, tmp_path, "a")
+        second = self._build(tiny_base_model, tmp_path, "b")
+
+        gate_keys = [key for key in first if ".mlp.gate." in key]
+        assert gate_keys, "No router gate weights found in the Stage 0 checkpoint"
+        for key in gate_keys:
+            assert torch.equal(first[key], second[key]), f"{key} differs between identical builds"
+
+    def test_different_seed_gives_different_gates(self, tiny_base_model, tmp_path):
+        """The seed must actually be wired through, not ignored."""
+        first = self._build(tiny_base_model, tmp_path, "c", seed=1)
+        second = self._build(tiny_base_model, tmp_path, "d", seed=2)
+
+        gate_keys = [key for key in first if ".mlp.gate." in key]
+        assert any(not torch.equal(first[key], second[key]) for key in gate_keys), (
+            "Changing the seed did not change the gate initialisation"
+        )
+
+
 class TestCheckpointReload:
     """The saved checkpoint must come back as a real MoE model."""
 

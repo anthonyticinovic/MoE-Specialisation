@@ -37,6 +37,7 @@ from models.utils.common import (
     init_distributed,
     load_config,
     register_moe_model,
+    set_seed,
     setup_logging,
     supports_fsdp,
 )
@@ -73,6 +74,11 @@ else:
 # autocast/GradScaler take a device *type* string, whereas DEVICE is an ordinal
 # under FSDP.
 AMP_DEVICE = "cuda" if USE_FSDP else "cpu"
+
+# Seed every RNG, as Stage 1 already does. Without this the run is not
+# reproducible: dropout, the shuffled sampler and (under soft routing) the
+# Gumbel noise all draw from an unseeded stream.
+set_seed(loader_params.get("data_seed", 42))
 
 if local_rank == 0:
     logger.info("--- Initializing Stage 2 Training ---")
