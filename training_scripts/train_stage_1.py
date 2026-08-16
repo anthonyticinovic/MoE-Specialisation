@@ -1,5 +1,6 @@
 import gc
 import json
+import logging
 import os
 
 import torch
@@ -17,7 +18,6 @@ from transformers import (
 
 from data import COCO_Loader
 from models import VisionLanguageConnector
-import logging
 from models.utils.common import get_device, load_config, set_seed, setup_logging
 
 logger = logging.getLogger(__name__)

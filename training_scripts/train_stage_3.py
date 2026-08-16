@@ -1,23 +1,38 @@
+"""Stage 3: end-to-end fine-tuning of self-attention, router and experts.
+
+The final training stage. Starting from the Stage 2 experts and the Stage 1
+vision connector, this trains self-attention, the router gate and the experts
+together under learned soft routing on LLaVA-Instruct data, and records the
+per-layer routing metrics the paper's analysis is built on.
+
+Run from the repo root::
+
+    torchrun --nproc_per_node=4 training_scripts/train_stage_3.py
+
+A single-process CPU run (used by the demo) works too: FSDP, mixed precision
+and FlashAttention are all skipped when CUDA is unavailable. Paths come from
+``configs/training_config.yaml`` unless ``MOE_CONFIG`` points elsewhere.
+"""
+
+from __future__ import annotations
+
+import datetime
 import gc
 import json
+import logging
 import os
 import time
+from dataclasses import dataclass
 from functools import partial
+from typing import Any
 
-import numpy as np
 import torch
-
-# Para GPU imports
 import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
 from torch.amp import GradScaler, autocast
-from torch.distributed.fsdp import (
-    CPUOffload,
-)
-from torch.distributed.fsdp import (
-    FullyShardedDataParallel as FSDP,
-)
+from torch.distributed.fsdp import CPUOffload
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
@@ -32,7 +47,6 @@ from transformers.models.mistral.modeling_mistral import MistralMLP
 
 from data import COCO_Loader, LLaVA_Loader
 from models import VisionLanguageConnector
-import logging
 from models.utils.common import (
     full_state_dict_context,
     get_attn_implementation,
@@ -45,371 +59,179 @@ from models.utils.common import (
     supports_fsdp,
     unwrap_model,
 )
+from training_scripts._lib import ExpertUsageTracker, save_expert_metrics
 
 logger = logging.getLogger(__name__)
 
+# NCCL default is 10 minutes, which is too short for FSDP checkpoint loading.
+DIST_TIMEOUT = datetime.timedelta(minutes=60)
+# Validation is capped so an epoch stays a sensible length on the full dataset.
+MAX_VAL_BATCHES = 300
+NUM_EXPERTS = 2
+
 
 # ====================================================================================
-# EXPERT USAGE TRACKER FOR RESEARCH METRICS
-# ====================================================================================
-class ExpertUsageTracker:
+@dataclass(frozen=True)
+class RunContext:
+    """Where this process runs and how it talks to its peers."""
+
+    device: str | int
+    amp_device: str
+    use_fsdp: bool
+    local_rank: int
+
+    @property
+    def is_main(self) -> bool:
+        return self.local_rank == 0
+
+
+@dataclass
+class TrainingSetup:
+    """Everything the epoch loop needs, assembled once before training."""
+
+    llm: nn.Module
+    vision_encoder: nn.Module
+    vision_connector: nn.Module
+    embed_tokens_layer: nn.Module
+    train_loader: DataLoader
+    val_loader: DataLoader
+    train_sampler: DistributedSampler
+    optimizer: optim.Optimizer
+    scheduler: CosineAnnealingLR
+    scaler: GradScaler
+    loss_fn: nn.Module
+    trainable_params: list[torch.Tensor]
+    vocab_size: int
+    num_visual_tokens: int
+    accumulation_steps: int
+
+
+def build_backbones(paths: dict[str, Any], ctx: RunContext) -> tuple[Any, Any, Any, int]:
+    """Load the frozen CLIP tower, its processor and the tokenizer.
+
+    Returns the vision encoder, CLIP processor, tokenizer and the number of
+    visual tokens the tower emits (patch grid plus CLS — 257 for ViT-L/14 at
+    224px, fewer for the demo's tiny tower).
     """
-    Lightweight tracker for MoE expert utilization and routing patterns.
-    Collects metrics during validation for research analysis.
+    if ctx.is_main:
+        logger.info("Loading foundational models...")
 
-    Tracks 4 key metrics:
-    1. Expert Load Distribution: How evenly work is distributed across experts
-    2. Routing Entropy: Uncertainty in routing decisions
-    3. Routing Confidence: Fraction of high-confidence routing decisions
-    4. Visual vs Text Routing: Routing pattern differences by modality
+    vision_encoder = CLIPVisionModel.from_pretrained(paths["clip_local_path"]).to(ctx.device)
+    num_visual_tokens = (
+        vision_encoder.config.image_size // vision_encoder.config.patch_size
+    ) ** 2 + 1
+    # The encoder is frozen, so eval mode keeps its dropout deterministic.
+    vision_encoder.eval()
+
+    clip_processor = AutoProcessor.from_pretrained(paths["clip_local_path"])
+    tokenizer = AutoTokenizer.from_pretrained(paths["mistral_local_path"])
+    tokenizer.pad_token = tokenizer.eos_token
+
+    return vision_encoder, clip_processor, tokenizer, num_visual_tokens
+
+
+def build_llm(paths: dict[str, Any], train_params: dict[str, Any], ctx: RunContext) -> nn.Module:
+    """Load the MoE model and put it into soft routing with Stage 3 dropout.
+
+    Gradient checkpointing is deliberately left off: under FSDP it interacts
+    badly with the MoE layer's per-rank dummy expert pass and destabilises
+    activations.
     """
-
-    def __init__(self, num_layers=32, num_experts=2, visual_token_end=255):
-        self.num_layers = num_layers
-        self.num_experts = num_experts
-        self.visual_token_end = visual_token_end  # Tokens 0 to visual_token_end are visual
-
-        # Per-layer accumulators (memory efficient - just sums and counts)
-        self.layer_expert_loads = [np.zeros(num_experts) for _ in range(num_layers)]
-        self.layer_entropies = [[] for _ in range(num_layers)]
-        self.layer_high_conf_counts = [0 for _ in range(num_layers)]
-        self.layer_total_tokens = [0 for _ in range(num_layers)]
-
-        # Visual vs Text routing (per-layer)
-        self.layer_visual_expert_loads = [np.zeros(num_experts) for _ in range(num_layers)]
-        self.layer_text_expert_loads = [np.zeros(num_experts) for _ in range(num_layers)]
-        self.layer_visual_tokens = [0 for _ in range(num_layers)]
-        self.layer_text_tokens = [0 for _ in range(num_layers)]
-
-    def update(self, layer_idx, router_probs, token_positions):
-        """
-        Update metrics for a single layer.
-
-        Args:
-            layer_idx: Layer index (0-31)
-            router_probs: [batch_size, seq_len, num_experts] routing probabilities
-            token_positions: [batch_size, seq_len] absolute token positions in sequence
-        """
-        # Flatten to [total_tokens, num_experts]
-        probs = router_probs.reshape(-1, self.num_experts)
-        positions = token_positions.reshape(-1)
-
-        # 1. Expert Load Distribution (how much work each expert gets)
-        expert_loads = probs.sum(dim=0).cpu().numpy()  # [num_experts]
-        self.layer_expert_loads[layer_idx] += expert_loads
-
-        # 2. Routing Entropy (uncertainty in routing decisions)
-        # H = -sum(p * log(p)) for each token, then average
-        eps = 1e-10
-        token_entropies = -(probs * torch.log(probs + eps)).sum(dim=1)  # [total_tokens]
-        self.layer_entropies[layer_idx].extend(token_entropies.cpu().numpy().tolist())
-
-        # 3. Routing Confidence (fraction with prob > 0.7 for any expert)
-        max_probs = probs.max(dim=1)[0]  # [total_tokens]
-        high_conf = (max_probs > 0.7).sum().item()
-        self.layer_high_conf_counts[layer_idx] += high_conf
-        self.layer_total_tokens[layer_idx] += probs.shape[0]
-
-        # 4. Visual vs Text Routing
-        visual_mask = positions <= self.visual_token_end
-        text_mask = positions > self.visual_token_end
-
-        if visual_mask.any():
-            visual_loads = probs[visual_mask].sum(dim=0).cpu().numpy()
-            self.layer_visual_expert_loads[layer_idx] += visual_loads
-            self.layer_visual_tokens[layer_idx] += visual_mask.sum().item()
-
-        if text_mask.any():
-            text_loads = probs[text_mask].sum(dim=0).cpu().numpy()
-            self.layer_text_expert_loads[layer_idx] += text_loads
-            self.layer_text_tokens[layer_idx] += text_mask.sum().item()
-
-    def compute_metrics(self):
-        """
-        Compute final metrics from accumulated data.
-        Returns dict with per-layer and aggregate metrics.
-        """
-        metrics = {"per_layer": [], "aggregate": {}}
-
-        # Compute per-layer metrics
-        for layer_idx in range(self.num_layers):
-            layer_metrics = {
-                "layer": layer_idx,
-                "expert_load_distribution": {},
-                "avg_routing_entropy": 0.0,
-                "high_confidence_fraction": 0.0,
-                "visual_vs_text_routing": {},
-            }
-
-            # 1. Expert Load Distribution (normalize to percentages)
-            total_load = self.layer_expert_loads[layer_idx].sum()
-            if total_load > 0:
-                load_pcts = (self.layer_expert_loads[layer_idx] / total_load * 100).tolist()
-                layer_metrics["expert_load_distribution"] = {
-                    f"expert_{i}": round(pct, 2) for i, pct in enumerate(load_pcts)
-                }
-
-            # 2. Average Routing Entropy
-            if self.layer_entropies[layer_idx]:
-                layer_metrics["avg_routing_entropy"] = round(
-                    np.mean(self.layer_entropies[layer_idx]), 4
-                )
-
-            # 3. High Confidence Fraction
-            if self.layer_total_tokens[layer_idx] > 0:
-                layer_metrics["high_confidence_fraction"] = round(
-                    self.layer_high_conf_counts[layer_idx] / self.layer_total_tokens[layer_idx], 4
-                )
-
-            # 4. Visual vs Text Routing
-            visual_total = self.layer_visual_expert_loads[layer_idx].sum()
-            text_total = self.layer_text_expert_loads[layer_idx].sum()
-
-            if visual_total > 0:
-                visual_pcts = (
-                    self.layer_visual_expert_loads[layer_idx] / visual_total * 100
-                ).tolist()
-                layer_metrics["visual_vs_text_routing"]["visual"] = {
-                    f"expert_{i}": round(pct, 2) for i, pct in enumerate(visual_pcts)
-                }
-
-            if text_total > 0:
-                text_pcts = (self.layer_text_expert_loads[layer_idx] / text_total * 100).tolist()
-                layer_metrics["visual_vs_text_routing"]["text"] = {
-                    f"expert_{i}": round(pct, 2) for i, pct in enumerate(text_pcts)
-                }
-
-            metrics["per_layer"].append(layer_metrics)
-
-        # Compute aggregate metrics (average across all layers)
-        all_expert_loads = np.sum(self.layer_expert_loads, axis=0)
-        total_load = all_expert_loads.sum()
-        if total_load > 0:
-            metrics["aggregate"]["expert_load_distribution"] = {
-                f"expert_{i}": round(pct, 2)
-                for i, pct in enumerate((all_expert_loads / total_load * 100).tolist())
-            }
-
-        all_entropies = [e for layer in self.layer_entropies for e in layer]
-        if all_entropies:
-            metrics["aggregate"]["avg_routing_entropy"] = round(np.mean(all_entropies), 4)
-
-        total_high_conf = sum(self.layer_high_conf_counts)
-        total_tokens = sum(self.layer_total_tokens)
-        if total_tokens > 0:
-            metrics["aggregate"]["high_confidence_fraction"] = round(
-                total_high_conf / total_tokens, 4
-            )
-
-        # Aggregate visual vs text
-        all_visual_loads = np.sum(self.layer_visual_expert_loads, axis=0)
-        all_text_loads = np.sum(self.layer_text_expert_loads, axis=0)
-
-        visual_total = all_visual_loads.sum()
-        text_total = all_text_loads.sum()
-
-        if visual_total > 0:
-            metrics["aggregate"]["visual_routing"] = {
-                f"expert_{i}": round(pct, 2)
-                for i, pct in enumerate((all_visual_loads / visual_total * 100).tolist())
-            }
-
-        if text_total > 0:
-            metrics["aggregate"]["text_routing"] = {
-                f"expert_{i}": round(pct, 2)
-                for i, pct in enumerate((all_text_loads / text_total * 100).tolist())
-            }
-
-        return metrics
-
-
-register_moe_model()
-
-# ====================================================================================
-# 2. SETUP AND CONFIGURATION
-# ====================================================================================
-config = load_config()
-
-paths = config["paths"]
-# CHANGED: Use training_stage3 parameters from config
-train_params = config["training_stage3"]
-loader_params = config["dataloader"]
-NUM_EPOCHS = train_params["num_epochs"]
-OUTPUT_DIR = paths["output_dir"]
-# CHANGED: Define all necessary checkpoint directories
-STAGE2_CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "stage2_checkpoints")
-STAGE3_CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "stage3_checkpoints")
-
-# --- Initialize the distributed environment with extended timeout ---
-import datetime
-
-# Note: Set timeout to 60 minutes for large checkpoint loading operations
-# Default is 10 minutes which is too short for FSDP checkpoint loading
-timeout = datetime.timedelta(minutes=60)
-USE_FSDP = supports_fsdp()
-local_rank = int(os.environ.get("LOCAL_RANK", 0))
-init_distributed(local_rank, timeout=timeout)
-setup_logging(local_rank)
-if USE_FSDP:
-    torch.cuda.set_device(local_rank)
-    DEVICE = local_rank
-else:
-    DEVICE = "cpu"
-# autocast/GradScaler take a device *type* string; DEVICE may be an ordinal.
-AMP_DEVICE = "cuda" if USE_FSDP else "cpu"
-
-# Seed every RNG, as Stage 1 already does. Without this the run is not
-# reproducible: dropout, the Gumbel noise in soft routing and the shuffled
-# sampler all draw from an unseeded stream, so two identical invocations
-# produce different losses and different routing metrics.
-set_seed(loader_params.get("data_seed", 42))
-
-if local_rank == 0:
-    # CHANGED: Print statement for Stage 3
-    logger.info("--- Initializing Stage 3 Training (End-to-End) ---")
-    logger.debug(f"🕐 NCCL timeout set to: {timeout} (60 minutes)")
-
-# ====================================================================================
-# 3. MODEL LOADING
-# ====================================================================================
-if local_rank == 0:
-    logger.info("Loading foundational models...")
-vision_encoder = CLIPVisionModel.from_pretrained(paths["clip_local_path"]).to(DEVICE)
-# Patch grid plus the CLS token: 257 for CLIP ViT-L/14 at 224px, smaller for the
-# demo's tiny tower. Drives the visual/text split in the routing metrics.
-NUM_VISUAL_TOKENS = (vision_encoder.config.image_size // vision_encoder.config.patch_size) ** 2 + 1
-# Note: Set vision encoder to eval mode since it's frozen - prevents dropout/stochastic behavior
-vision_encoder.eval()
-clip_processor = AutoProcessor.from_pretrained(paths["clip_local_path"])
-tokenizer = AutoTokenizer.from_pretrained(paths["mistral_local_path"])
-tokenizer.pad_token = tokenizer.eos_token
-
-moe_model_path = paths["moe_model_path"]
-
-llm = AutoModelForCausalLM.from_pretrained(
-    moe_model_path,
-    trust_remote_code=True,
-    local_files_only=True,
-    torch_dtype=get_model_dtype(),
-    attn_implementation=get_attn_implementation(),
-    low_cpu_mem_usage=True,
-)
-
-# Gradient checkpointing is intentionally left disabled: under FSDP it
-# interacts badly with the MoE layer's per-rank dummy expert pass and
-# destabilises activations. Left as a documented, deliberate trade-off.
-# llm.gradient_checkpointing_enable()
-
-# Explicitly set all MoE layers to use soft routing for training
-if local_rank == 0:
-    logger.info("Setting MoE layers to 'soft' routing mode for Stage 3.")
-for layer in llm.model.layers:
-    if hasattr(layer.mlp, "routing_mode"):
-        layer.mlp.routing_mode = "soft"
-
-# Configure dropout for regularization (Stage 3 only)
-if local_rank == 0:
-    logger.info("Configuring dropout for Stage 3 regularization...")
-
-attention_dropout = train_params.get("attention_dropout", 0.0)
-expert_dropout = train_params.get("expert_dropout", 0.0)
-
-# Enable attention dropout in self-attention layers
-for layer in llm.model.layers:
-    # Mistral uses 'attention_dropout' in self_attn
-    if hasattr(layer.self_attn, "attention_dropout"):
-        layer.self_attn.attention_dropout = attention_dropout
-    # Some models use 'dropout' attribute
-    if hasattr(layer.self_attn, "dropout") and isinstance(layer.self_attn.dropout, (int, float)):
-        layer.self_attn.dropout = attention_dropout
-
-# Enable expert dropout in MoE layers
-for layer in llm.model.layers:
-    if hasattr(layer.mlp, "experts"):
-        # Add expert dropout module if not already present
-        if not hasattr(layer.mlp, "expert_dropout"):
-            layer.mlp.expert_dropout = nn.Dropout(expert_dropout)
-        else:
-            layer.mlp.expert_dropout.p = expert_dropout
-
-if local_rank == 0:
-    logger.info(f"  ✅ Attention dropout: {attention_dropout}")
-    logger.info(f"  ✅ Expert dropout: {expert_dropout}")
-    logger.info(f"  ✅ Router dropout: 0.1 (pre-configured in MoE layer)")
-
-# ====================================================================================
-# 4. TRAINING SETUP (PART 1 - Parameter Freezing)
-# ====================================================================================
-if local_rank == 0:
-    logger.info("Preparing model for Stage 3: Selective unfreezing (self-attn, router, MLP only).")
-    logger.info("Vision connector will remain frozen (using Stage 1 weights).")
-
-# Freeze all LLM parameters first
-for param in llm.parameters():
-    param.requires_grad = False
-
-# Selectively unfreeze: self-attention, router (gate), and MLP layers
-for name, param in llm.named_parameters():
-    if any(x in name for x in ["self_attn", "mlp.gate", "mlp.experts"]):
-        param.requires_grad = True
-        if local_rank == 0 and "layers.0" in name:  # Print first layer as example
-            logger.info(f"  Unfrozen: {name}")
-
-vision_connector = VisionLanguageConnector(
-    clip_hidden_size=vision_encoder.config.hidden_size,
-    llm_hidden_size=llm.config.hidden_size,
-).to(DEVICE)
-# Keep vision connector frozen (already trained in Stage 1)
-for param in vision_connector.parameters():
-    param.requires_grad = False
-
-# Ensure the vision encoder remains frozen
-for param in vision_encoder.parameters():
-    param.requires_grad = False
-
-if local_rank == 0:
-    trainable_count = sum(p.numel() for p in llm.parameters() if p.requires_grad)
-    total_count = sum(p.numel() for p in llm.parameters())
-    logger.info(
-        f"LLM: {trainable_count:,} / {total_count:,} parameters trainable ({100 * trainable_count / total_count:.1f}%)"
+    llm = AutoModelForCausalLM.from_pretrained(
+        paths["moe_model_path"],
+        trust_remote_code=True,
+        local_files_only=True,
+        torch_dtype=get_model_dtype(),
+        attn_implementation=get_attn_implementation(),
+        low_cpu_mem_usage=True,
     )
 
-# ====================================================================================
-# 5. FSDP WRAPPING & CHECKPOINTING
-# ====================================================================================
+    if ctx.is_main:
+        logger.info("Setting MoE layers to 'soft' routing mode for Stage 3.")
+    for layer in llm.model.layers:
+        if hasattr(layer.mlp, "routing_mode"):
+            layer.mlp.routing_mode = "soft"
 
-# Note: Cache vocab_size BEFORE FSDP wrapping to avoid accessing llm.config later
-# Accessing FSDP-wrapped model config can trigger collective operations
-VOCAB_SIZE = llm.config.vocab_size
+    attention_dropout = train_params.get("attention_dropout", 0.0)
+    expert_dropout = train_params.get("expert_dropout", 0.0)
 
-my_auto_wrap_policy = partial(
-    transformer_auto_wrap_policy,
-    transformer_layer_cls={
-        MistralMLP,
-    },
-)
+    for layer in llm.model.layers:
+        # Mistral names this `attention_dropout`; other variants use `dropout`.
+        if hasattr(layer.self_attn, "attention_dropout"):
+            layer.self_attn.attention_dropout = attention_dropout
+        if hasattr(layer.self_attn, "dropout") and isinstance(
+            layer.self_attn.dropout, (int, float)
+        ):
+            layer.self_attn.dropout = attention_dropout
 
-# Prevent FSDP from sharding the embedding layer (accessed directly in training loop)
-ignored_modules = [llm.model.embed_tokens]
+        if hasattr(layer.mlp, "experts"):
+            if not hasattr(layer.mlp, "expert_dropout"):
+                layer.mlp.expert_dropout = nn.Dropout(expert_dropout)
+            else:
+                layer.mlp.expert_dropout.p = expert_dropout
 
-# Note: Ignored modules must be on the correct device BEFORE FSDP wrapping
-# Moving them after wrapping causes FSDP to detect "newly-added parameters"
-if local_rank == 0:
-    logger.info(f"Placing ignored modules on device {DEVICE} before FSDP wrapping")
-llm.model.embed_tokens.to(DEVICE)
+    if ctx.is_main:
+        logger.info("  ✅ Attention dropout: %s", attention_dropout)
+        logger.info("  ✅ Expert dropout: %s", expert_dropout)
+        logger.info("  ✅ Router dropout: 0.1 (pre-configured in MoE layer)")
 
-# Note: Cache embedding layer reference before FSDP wrapping to avoid accessing
-# unwrap_model(llm).* in the training loop (safer and avoids potential FSDP interactions)
-embed_tokens_layer = llm.model.embed_tokens
+    return llm
 
-# Note: FSDP configuration mirrors Stage 2.5 exactly (kept identical on purpose)
-# device_id must be DEVICE (local_rank as int), NOT torch.cuda.current_device()
-# cpu_offload must be CPUOffload(offload_params=None), NOT False
-if USE_FSDP:
-    llm = FSDP(
+
+def configure_trainable_parameters(
+    llm: nn.Module, vision_encoder: nn.Module, ctx: RunContext
+) -> None:
+    """Unfreeze self-attention, the router gate and the experts; freeze the rest.
+
+    The vision connector stays frozen at its Stage 1 weights and the CLIP tower
+    is never trained, so Stage 3 only moves the language-side parameters.
+    """
+    if ctx.is_main:
+        logger.info("Preparing model for Stage 3: unfreezing self-attn, router and experts.")
+
+    for param in llm.parameters():
+        param.requires_grad = False
+
+    for name, param in llm.named_parameters():
+        if any(token in name for token in ("self_attn", "mlp.gate", "mlp.experts")):
+            param.requires_grad = True
+            if ctx.is_main and "layers.0" in name:
+                logger.info("  Unfrozen: %s", name)
+
+    for param in vision_encoder.parameters():
+        param.requires_grad = False
+
+    if ctx.is_main:
+        trainable = sum(p.numel() for p in llm.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in llm.parameters())
+        logger.info(
+            "LLM: %s / %s parameters trainable (%.1f%%)",
+            f"{trainable:,}",
+            f"{total:,}",
+            100 * trainable / total,
+        )
+
+
+def wrap_with_fsdp(llm: nn.Module, ctx: RunContext) -> nn.Module:
+    """Shard the model across ranks, or return it unchanged on CPU.
+
+    The embedding layer is excluded from sharding because the training loop
+    calls it directly; it must already be on the target device before wrapping,
+    or FSDP reports it as a newly-added parameter.
+    """
+    llm.model.embed_tokens.to(ctx.device)
+
+    if not ctx.use_fsdp:
+        # CPU demo: sharding is a no-op at one rank; the loop below is unchanged.
+        return llm.to(ctx.device)
+
+    auto_wrap_policy = partial(transformer_auto_wrap_policy, transformer_layer_cls={MistralMLP})
+    # Mirrors Stage 2.5 exactly, on purpose: device_id must be the local rank as
+    # an int, and cpu_offload must be CPUOffload(offload_params=None), not False.
+    return FSDP(
         llm,
-        device_id=DEVICE,
-        auto_wrap_policy=my_auto_wrap_policy,
+        device_id=ctx.device,
+        auto_wrap_policy=auto_wrap_policy,
         cpu_offload=CPUOffload(offload_params=None),
         mixed_precision=torch.distributed.fsdp.MixedPrecision(
             param_dtype=torch.bfloat16,
@@ -417,731 +239,465 @@ if USE_FSDP:
             buffer_dtype=torch.bfloat16,
         ),
         use_orig_params=True,
-        ignored_modules=ignored_modules,
+        ignored_modules=[llm.model.embed_tokens],
     )
-else:
-    # CPU demo: sharding is a no-op at one rank; the loop below is unchanged.
-    llm = llm.to(DEVICE)
 
-# ====================================================================================
-# 6. LOAD STAGE 2 CHECKPOINT (EXACT PATTERN FROM TRAIN_STAGE_2.PY)
-# ====================================================================================
-# This matches train_stage_2.py lines 178-194 EXACTLY
-checkpoint_found = torch.tensor(0.0, device=DEVICE)
-stage2_checkpoint_path = os.path.join(STAGE2_CHECKPOINT_DIR, "llm_stage2_best.pth")
 
-if local_rank == 0:
-    if os.path.exists(stage2_checkpoint_path):
+def load_stage2_experts(llm: nn.Module, checkpoint_dir: str, ctx: RunContext) -> None:
+    """Load the specialised experts produced by Stage 2.
+
+    Rank 0 decides whether the file exists and broadcasts that decision, so no
+    rank can take a different branch and desynchronise the collectives.
+    """
+    checkpoint_found = torch.tensor(0.0, device=ctx.device)
+    checkpoint_path = os.path.join(checkpoint_dir, "llm_stage2_best.pth")
+
+    if ctx.is_main and os.path.exists(checkpoint_path):
         checkpoint_found.fill_(1.0)
-    else:
-        logger.info("❌ CRITICAL: Stage 2 checkpoint not found!")
-        logger.info(f"   Expected path: {stage2_checkpoint_path}")
+    dist.broadcast(checkpoint_found, src=0)
 
-dist.broadcast(checkpoint_found, src=0)
+    if checkpoint_found.item() != 1.0:
+        raise FileNotFoundError(
+            f"Stage 2 checkpoint not found: {checkpoint_path}. "
+            "Stage 3 cannot start without the trained experts."
+        )
 
-if checkpoint_found.item() == 1.0:
-    if local_rank == 0:
-        logger.debug(f"💾 Loading Stage 2 (Expert) checkpoint: {stage2_checkpoint_path}")
+    if ctx.is_main:
+        logger.debug("💾 Loading Stage 2 (expert) checkpoint: %s", checkpoint_path)
 
-    # EXACT COPY from train_stage_2.5.py (WORKING VERSION)
-    # Load the state dict directly (Stage 2's 'best' checkpoint saves state_dict directly)
-    state_dict = torch.load(stage2_checkpoint_path, map_location="cpu")
-
-    if local_rank == 0:
-        logger.debug(f"  🔍 Checkpoint type: {type(state_dict)}")
-        logger.debug(f"  📊 Checkpoint contains {len(state_dict)} keys")
-
-        # Sample some keys to verify structure
-        sample_keys = list(state_dict.keys())[:5]
-        logger.debug(f"  📋 Sample keys: {sample_keys}")
-
-    # Load the state dict into the FSDP model
-    # Use rank0_only=True for GPU-count agnostic loading
+    state_dict = torch.load(checkpoint_path, map_location="cpu")
+    # rank0_only keeps loading agnostic to the number of GPUs.
     with full_state_dict_context(llm, rank0_only=True):
         missing_keys, unexpected_keys = llm.load_state_dict(state_dict, strict=False)
-
-        if local_rank == 0:
+        if ctx.is_main:
             if missing_keys:
-                logger.debug(f"  ⚠️  Missing keys ({len(missing_keys)}): {missing_keys[:5]}...")
+                logger.debug("  ⚠️  Missing keys (%d): %s...", len(missing_keys), missing_keys[:5])
             if unexpected_keys:
                 logger.debug(
-                    f"  ⚠️  Unexpected keys ({len(unexpected_keys)}): {unexpected_keys[:5]}..."
+                    "  ⚠️  Unexpected keys (%d): %s...", len(unexpected_keys), unexpected_keys[:5]
                 )
             if not missing_keys and not unexpected_keys:
-                logger.info(f"  ✅ All keys matched perfectly!")
+                logger.info("  ✅ All keys matched perfectly!")
 
     del state_dict
     gc.collect()
-
-    # Barrier to ensure all processes have loaded before continuing
     dist.barrier()
 
-    if local_rank == 0:
+    if ctx.is_main:
         logger.info("✅ Stage 2 checkpoint loaded successfully on all ranks.")
-        logger.debug("ℹ️  Stage 3: Using loaded router weights (will be fine-tuned end-to-end)")
-elif local_rank == 0:
-    logger.info("❌ CRITICAL: Cannot proceed without Stage 2 expert weights!")
-    raise FileNotFoundError(f"Stage 2 checkpoint not found: {stage2_checkpoint_path}")
 
-dist.barrier()
 
-# Note: Do NOT access unwrap_model(llm).model.layers after FSDP wrapping!
-# Accessing FSDP internals (even just len(unwrap_model(llm).model.layers)) can trigger
-# collective operations on rank 0 only, corrupting execution order tracking.
-# This causes "newly-added parameter" errors during the first backward pass.
+def load_stage1_connector(vision_connector: nn.Module, output_dir: str, ctx: RunContext) -> None:
+    """Load the Stage 1 vision connector, warning loudly if it is absent."""
+    connector_found = torch.tensor(0.0, device=ctx.device)
+    weights_path = os.path.join(output_dir, "vision_connector_stage1_best.pth")
 
-if local_rank == 0:
-    logger.info("✅ Stage 2 checkpoint loaded and ready for training.\n")
-
-dist.barrier()
-
-# ====================================================================================
-# 7. LOAD STAGE 1 VISION CONNECTOR
-# ====================================================================================
-# Note: Use same synchronization pattern as Stage 2 checkpoint loading
-# to prevent race conditions on distributed file systems
-connector_found = torch.tensor(0.0, device=DEVICE)
-stage1_weights_path = os.path.join(OUTPUT_DIR, "vision_connector_stage1_best.pth")
-
-if local_rank == 0:
-    if os.path.exists(stage1_weights_path):
+    if ctx.is_main and os.path.exists(weights_path):
         connector_found.fill_(1.0)
-    else:
-        logger.debug(
-            f"⚠️  Warning: Stage 1 Vision Connector weights not found at {stage1_weights_path}"
+    dist.broadcast(connector_found, src=0)
+
+    if connector_found.item() != 1.0:
+        if ctx.is_main:
+            logger.warning(
+                "Stage 1 connector not found at %s — proceeding with a randomly "
+                "initialised connector, which is not recommended for Stage 3.",
+                weights_path,
+            )
+        return
+
+    # device is a CUDA ordinal under FSDP and the string "cpu" otherwise.
+    map_location = f"cuda:{ctx.device}" if ctx.use_fsdp else ctx.device
+    vision_connector.load_state_dict(torch.load(weights_path, map_location=map_location))
+    if ctx.is_main:
+        logger.info("✅ Vision connector weights loaded successfully on all ranks.")
+
+
+def build_datasets(
+    paths: dict[str, Any],
+    train_params: dict[str, Any],
+    loader_params: dict[str, Any],
+    clip_processor: Any,
+    tokenizer: Any,
+    ctx: RunContext,
+) -> tuple[Any, Any]:
+    """Build the train/val datasets for the configured dataset type."""
+    dataset_type = train_params.get("dataset", "coco")
+    seed = loader_params.get("data_seed", 42)
+
+    if dataset_type == "llava":
+        if ctx.is_main:
+            logger.info("📚 Using LLaVA-Instruct-150K dataset (all Q&A pairs, multi-turn)")
+        common = dict(
+            annotations_file=paths["llava_annotations_file"],
+            image_dir=paths["llava_image_dir"],
+            clip_processor=clip_processor,
+            tokenizer=tokenizer,
+            val_fraction=0.2,
+            seed=seed,
         )
-        logger.info(f"   Vision connector will use random initialization.")
-
-dist.broadcast(connector_found, src=0)
-
-if connector_found.item() == 1.0:
-    if local_rank == 0:
-        logger.debug(f"💾 Loading Stage 1 Vision Connector weights from {stage1_weights_path}")
-    # DEVICE is a CUDA ordinal under FSDP and the string "cpu" otherwise.
-    map_loc = f"cuda:{DEVICE}" if USE_FSDP else DEVICE
-    vision_connector.load_state_dict(torch.load(stage1_weights_path, map_location=map_loc))
-    if local_rank == 0:
-        logger.info("✅ Vision Connector weights loaded successfully on all ranks.")
-else:
-    if local_rank == 0:
-        logger.info(
-            "⚠️  Proceeding with randomly initialized Vision Connector (not recommended for Stage 3)"
+        train_dataset = LLaVA_Loader(
+            split="train", subset_fraction=train_params["subset_fraction"], **common
         )
+        val_dataset = LLaVA_Loader(
+            split="val",
+            subset_fraction=train_params.get("val_subset_fraction", 1.0),
+            **common,
+        )
+        return train_dataset, val_dataset
 
-dist.barrier()
-
-# ====================================================================================
-# 8. DATA & OPTIMIZER
-# ====================================================================================
-if local_rank == 0:
-    logger.info("Creating datasets and dataloaders...")
-
-# Conditional dataset loading based on config
-dataset_type = train_params.get("dataset", "coco")  # Default to COCO for backward compatibility
-
-if dataset_type == "llava":
-    if local_rank == 0:
-        logger.info("📚 Using LLaVA-Instruct-150K dataset (ALL Q&A pairs, multi-turn)")
-
-    train_dataset = LLaVA_Loader(
-        annotations_file=paths["llava_annotations_file"],
-        image_dir=paths["llava_image_dir"],
-        clip_processor=clip_processor,
-        tokenizer=tokenizer,
-        split="train",
-        subset_fraction=train_params["subset_fraction"],
-        val_fraction=0.2,  # 80/20 train/val split
-        seed=loader_params.get("data_seed", 42),
-    )
-    val_dataset = LLaVA_Loader(
-        annotations_file=paths["llava_annotations_file"],
-        image_dir=paths["llava_image_dir"],
-        clip_processor=clip_processor,
-        tokenizer=tokenizer,
-        split="val",
-        subset_fraction=train_params.get(
-            "val_subset_fraction", 1.0
-        ),  # Further subsample val if needed
-        val_fraction=0.2,  # Same 80/20 split
-        seed=loader_params.get("data_seed", 42),
-    )
-else:  # "coco"
-    if local_rank == 0:
+    if ctx.is_main:
         logger.info("📚 Using COCO captions dataset")
-
-    train_dataset = COCO_Loader(
+    common = dict(
         image_dir=paths["image_dir"],
         annotations_file=paths["annotations_file"],
         clip_processor=clip_processor,
         tokenizer=tokenizer,
         subset_fraction=train_params["subset_fraction"],
-        split="train",
-        seed=loader_params.get("data_seed", 42),  # Fixed seed for reproducibility
+        seed=seed,
     )
+    train_dataset = COCO_Loader(split="train", **common)
     val_dataset = COCO_Loader(
-        image_dir=paths["image_dir"],
-        annotations_file=paths["annotations_file"],
-        clip_processor=clip_processor,
-        tokenizer=tokenizer,
-        subset_fraction=train_params["subset_fraction"],
         split="val",
-        val_subset_fraction=train_params.get(
-            "val_subset_fraction", 0.2
-        ),  # Subsample validation to 20% by default
-        seed=loader_params.get("data_seed", 42),  # Same seed ensures consistent splits
+        val_subset_fraction=train_params.get("val_subset_fraction", 0.2),
+        **common,
     )
+    return train_dataset, val_dataset
 
-# Note: Use drop_last=True for training to ensure deterministic batch counts
-# With large datasets not perfectly divisible by world_size, padding can cause
-# rank-specific execution paths that FSDP detects as execution order divergence.
-# drop_last=False for validation is fine since validation doesn't update FSDP state.
-train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=True)
-val_sampler = DistributedSampler(val_dataset, shuffle=False, drop_last=False)
 
-train_loader = DataLoader(
-    train_dataset,
-    batch_size=train_params["batch_size"],
-    sampler=train_sampler,
-    num_workers=loader_params["num_workers"],
-    pin_memory=USE_FSDP,
-)
-val_loader = DataLoader(
-    val_dataset,
-    batch_size=train_params["batch_size"],
-    sampler=val_sampler,
-    num_workers=loader_params["num_workers"],
-    pin_memory=USE_FSDP,
-)
+def build_dataloaders(
+    train_dataset: Any,
+    val_dataset: Any,
+    train_params: dict[str, Any],
+    loader_params: dict[str, Any],
+    ctx: RunContext,
+) -> tuple[DataLoader, DataLoader, DistributedSampler]:
+    """Wrap the datasets in distributed samplers and loaders.
 
-accumulation_steps = train_params.get("gradient_accumulation_steps", 1)
+    drop_last=True on training keeps the batch count identical on every rank;
+    a padded final batch produces rank-specific execution paths that FSDP flags
+    as execution-order divergence. Validation does not update FSDP state, so it
+    can keep its remainder.
+    """
+    train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=True)
+    val_sampler = DistributedSampler(val_dataset, shuffle=False, drop_last=False)
 
-# Only include LLM trainable parameters for the optimizer (vision connector is frozen)
-# Filter to only include parameters that require gradients
-trainable_params = [p for p in llm.parameters() if p.requires_grad]
-optimizer = optim.AdamW(
-    trainable_params,
-    lr=train_params["learning_rate"],
-    weight_decay=train_params["weight_decay"],
-    fused=False,
-)
-# Note: GradScaler is not compatible with bfloat16 (only float16)
-# Since we use bfloat16, we don't need GradScaler (bfloat16 has better numerical stability)
-scaler = GradScaler(AMP_DEVICE, enabled=False)  # Disabled for bfloat16
-total_steps = (len(train_loader) // accumulation_steps) * NUM_EPOCHS
-scheduler = CosineAnnealingLR(optimizer, T_max=total_steps)
+    loader_kwargs = dict(
+        batch_size=train_params["batch_size"],
+        num_workers=loader_params["num_workers"],
+        pin_memory=ctx.use_fsdp,
+    )
+    train_loader = DataLoader(train_dataset, sampler=train_sampler, **loader_kwargs)
+    val_loader = DataLoader(val_dataset, sampler=val_sampler, **loader_kwargs)
+    return train_loader, val_loader, train_sampler
 
-# Add label smoothing for better generalization
-label_smoothing = train_params.get("label_smoothing", 0.0)
-loss_fn = nn.CrossEntropyLoss(
-    ignore_index=-100,  # Standard ignore index for masked tokens
-    label_smoothing=label_smoothing,
-)
 
-if local_rank == 0 and label_smoothing > 0:
-    logger.info(f"  ✅ Label smoothing: {label_smoothing}")
+def maybe_resume(
+    llm: nn.Module,
+    vision_connector: nn.Module,
+    checkpoint_dir: str,
+    ctx: RunContext,
+) -> int:
+    """Resume from the portable checkpoint if one exists; return the next epoch.
 
-# --- Resumption logic for Stage 3 ---
-# CHANGED: Always use portable checkpoint (model weights only) for clean resumption
-# This allows changing dataset size, learning rate, or GPU count without issues
-start_epoch = 0
-best_val_loss = float("inf")
-portable_checkpoint_path = os.path.join(STAGE3_CHECKPOINT_DIR, "llm_stage3_latest_portable.pth")
+    Only model weights are restored. The optimiser and scheduler start fresh so
+    the run can change dataset size, learning rate or GPU count without hitting
+    state-shape mismatches.
+    """
+    portable_path = os.path.join(checkpoint_dir, "llm_stage3_latest_portable.pth")
+    should_resume = 1.0 if ctx.is_main and os.path.exists(portable_path) else 0.0
+    resume_tensor = torch.tensor([should_resume], dtype=torch.float32).to(ctx.device)
+    dist.broadcast(resume_tensor, src=0)
 
-should_resume = 1.0 if local_rank == 0 and os.path.exists(portable_checkpoint_path) else 0.0
-resume_tensor = torch.tensor([should_resume], dtype=torch.float32).to(DEVICE)
-dist.broadcast(resume_tensor, src=0)
+    if resume_tensor.item() != 1.0:
+        if ctx.is_main:
+            logger.info("🏁 No portable checkpoint found. Starting training from scratch.")
+        return 0
 
-if resume_tensor.item() == 1.0:
-    if local_rank == 0:
-        logger.debug(
-            f"💾 Resuming Stage 3 training from portable checkpoint: {portable_checkpoint_path}"
-        )
-        logger.info(f"   (Model weights only - optimizer/scheduler will use fresh config settings)")
+    if ctx.is_main:
+        logger.debug("💾 Resuming Stage 3 from portable checkpoint: %s", portable_path)
 
-    # All ranks load the checkpoint
-    checkpoint = torch.load(portable_checkpoint_path, map_location="cpu")
-    model_state_dict = checkpoint["model_state_dict"]
-
-    # Use rank0_only=True for GPU-count agnostic loading
+    checkpoint = torch.load(portable_path, map_location="cpu")
     with full_state_dict_context(llm, rank0_only=True):
-        llm.load_state_dict(model_state_dict, strict=False)
-
-    # Load vision connector (not FSDP-wrapped, so normal load)
+        llm.load_state_dict(checkpoint["model_state_dict"], strict=False)
     vision_connector.load_state_dict(checkpoint["connector_state_dict"])
 
-    # Update epoch tracking (but optimizer/scheduler start fresh with new config)
     start_epoch = checkpoint["epoch"] + 1
-    checkpoint_val_loss = checkpoint.get("val_loss", float("inf"))
-
-    # Don't update best_val_loss - let the new training run establish its own best
-    # This prevents issues if validation set size changed
-    if local_rank == 0:
+    if ctx.is_main:
         logger.info(
-            f"   📊 Checkpoint was at epoch {checkpoint['epoch']} with val_loss {checkpoint_val_loss:.4f}"
+            "   📊 Checkpoint was at epoch %s with val_loss %.4f",
+            checkpoint["epoch"],
+            checkpoint.get("val_loss", float("inf")),
         )
-        logger.info(f"   🔄 Optimizer and scheduler initialized with NEW config:")
-        logger.info(f"      - Learning rate: {train_params['learning_rate']:.2e}")
-        logger.info(f"      - Total steps: {total_steps} (based on current dataset size)")
-        logger.debug(
-            f"   ⚠️  Epoch counter continuing from {start_epoch}, but optimizer state is fresh"
-        )
+        logger.info("   🔄 Optimizer and scheduler initialised fresh from the current config.")
 
     del checkpoint
-    del model_state_dict
     gc.collect()
-
     dist.barrier()
-    if local_rank == 0:
-        logger.info(
-            f"✅ Resumed successfully with fresh optimizer. Starting from epoch {start_epoch}."
-        )
-else:
-    if local_rank == 0:
-        logger.info("🏁 No portable checkpoint found. Starting training from scratch.")
+
+    if ctx.is_main:
+        logger.info("✅ Resumed with fresh optimiser. Starting from epoch %d.", start_epoch)
+    return start_epoch
 
 
-if local_rank == 0:
-    logger.info(f"Optimizing {sum(p.numel() for p in trainable_params)} trainable parameters.")
+def _move_batch(batch: tuple, device: str | int) -> tuple[tuple, bool]:
+    """Move a batch to the device and report whether it carries LLaVA labels.
 
-metrics_path = os.path.join(OUTPUT_DIR, "training_metrics_stage3.json")
-metrics_history = {"epoch": [], "train_loss": [], "val_loss": [], "learning_rate": []}
-if local_rank == 0 and start_epoch > 0 and os.path.exists(metrics_path):
-    with open(metrics_path, "r") as f:
-        metrics_history = json.load(f)
+    LLaVA yields four tensors (the labels have question tokens masked to -100);
+    COCO yields three and the loss is computed over all text.
+    """
+    moved = tuple(tensor.to(device) for tensor in batch)
+    return moved, len(batch) == 4
 
-# ====================================================================================
-# 9. TRAINING LOOP
-# ====================================================================================
-# NOTE: Model verification removed - FSDP is extremely sensitive to execution order.
-# Any forward pass before training (even in eval mode) can corrupt FSDP's internal
-# execution graph tracking, causing collective operation mismatches during training.
-# The successful checkpoint loading above is sufficient validation.
-if local_rank == 0:
-    world_size = dist.get_world_size()
-    label_smoothing = train_params.get("label_smoothing", 0.0)
-    attention_dropout = train_params.get("attention_dropout", 0.0)
-    expert_dropout = train_params.get("expert_dropout", 0.0)
-    dataset_type = train_params.get("dataset", "coco")
 
-    # Check if we resumed from checkpoint
-    resumed_from_checkpoint = start_epoch > 0
+def _forward(
+    setup: TrainingSetup,
+    ctx: RunContext,
+    images: torch.Tensor,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> tuple[torch.Tensor, int]:
+    """Project the image, prepend it to the text embeddings and run the LLM.
 
-    logger.info("\n" + "=" * 70)
-    logger.info("🚀 STAGE 3 TRAINING CONFIGURATION")
-    logger.info("=" * 70)
-    logger.info(f"Dataset:               {dataset_type.upper()}")
-    logger.info(f"Epochs:                {NUM_EPOCHS} (starting from epoch {start_epoch})")
-    if resumed_from_checkpoint:
-        logger.info(f"Resume mode:           Portable checkpoint (model weights only)")
-        logger.info(f"                       Optimizer/scheduler: FRESH with new config")
-    logger.info(f"Training samples:      {len(train_dataset)}")
-    logger.info(f"Validation samples:    {len(val_dataset)}")
-    logger.info(f"Batch size per GPU:    {train_params['batch_size']}")
-    logger.info(f"Gradient accumulation: {accumulation_steps}")
-    logger.info(
-        f"Effective batch size:  {train_params['batch_size'] * world_size * accumulation_steps} (batch_size × {world_size} GPUs × accum_steps)"
+    The vision tower is frozen, so its forward runs under no_grad in both
+    training and validation — building a graph through it would waste memory
+    without producing any gradient.
+    """
+    with torch.no_grad():
+        patch_embeddings = setup.vision_encoder(images).last_hidden_state
+    visual_soft_tokens = setup.vision_connector(patch_embeddings)
+    # The cached embedding layer avoids touching FSDP internals in the loop.
+    text_embeddings = setup.embed_tokens_layer(input_ids)
+
+    combined_embeddings = torch.cat([visual_soft_tokens, text_embeddings], dim=1)
+    combined_attention_mask = torch.cat(
+        [torch.ones(visual_soft_tokens.shape[:2], device=ctx.device), attention_mask], dim=1
     )
-    logger.info(f"Steps per epoch:       {len(train_loader) // accumulation_steps}")
-    logger.info(f"Total training steps:  {total_steps}")
-    logger.info(f"Learning rate:         {train_params['learning_rate']:.2e}")
-    logger.info(f"Weight decay:          {train_params['weight_decay']}")
-    logger.info(f"Label smoothing:       {label_smoothing}")
-    logger.info(f"Attention dropout:     {attention_dropout}")
-    logger.info(f"Expert dropout:        {expert_dropout}")
-    logger.info(f"Router dropout:        0.1 (pre-configured)")
-    logger.info(f"Optimizer:             AdamW (fused)")
-    logger.info(f"Scheduler:             CosineAnnealingLR")
-    logger.info(f"Mixed precision:       bfloat16")
-    logger.info(f"Gradient checkpointing: Disabled")
-    logger.info(f"FSDP robustness:       Dummy expert touching enabled")
-    logger.info("=" * 70 + "\n")
-    if resumed_from_checkpoint:
-        logger.info(f"🔄 Continuing from model checkpoint with FRESH optimizer state")
-        logger.info(f"   This allows dataset/LR changes without compatibility issues\n")
-    logger.info(f"🚀 Starting training...")
+    outputs = setup.llm(inputs_embeds=combined_embeddings, attention_mask=combined_attention_mask)
+    return outputs.logits, visual_soft_tokens.shape[1]
 
-start_time = time.time()
-for epoch in range(start_epoch, NUM_EPOCHS):
-    train_sampler.set_epoch(epoch)
 
-    # Note: Synchronize random seed across all ranks for deterministic Gumbel sampling
-    # The MoE layer uses Gumbel noise for routing, which must be identical across ranks
-    # to ensure FSDP execution order consistency
+def _sequence_loss(
+    setup: TrainingSetup,
+    logits: torch.Tensor,
+    num_visual_tokens: int,
+    input_ids: torch.Tensor,
+    labels: torch.Tensor | None,
+) -> torch.Tensor:
+    """Next-token cross-entropy over the text span only.
+
+    Visual tokens are dropped from the logits first. With LLaVA labels the
+    question tokens are already masked to -100, so only answer tokens
+    contribute; with COCO every text token does.
+    """
+    if labels is not None:
+        text_logits = logits[..., num_visual_tokens:, :].contiguous()
+        text_logits = text_logits[..., :-1, :].contiguous()
+        text_labels = labels.contiguous()[..., 1:].contiguous()
+    else:
+        text_logits = logits[..., num_visual_tokens:-1, :].contiguous()
+        text_labels = input_ids[..., 1:].contiguous()
+
+    return setup.loss_fn(text_logits.view(-1, setup.vocab_size), text_labels.view(-1))
+
+
+def train_one_epoch(setup: TrainingSetup, ctx: RunContext, epoch: int, num_epochs: int) -> float:
+    """Run one training epoch and return the mean loss per optimiser step."""
+    setup.train_sampler.set_epoch(epoch)
+
+    # Every rank must draw the same Gumbel noise for routing, or FSDP sees
+    # divergent execution order across ranks.
     torch.manual_seed(42 + epoch)
     torch.cuda.manual_seed_all(42 + epoch)
 
-    llm.train()
-    # Note: Keep vision_connector in eval mode since all its parameters are frozen
-    # Calling .train() on a frozen module is inconsistent and may cause issues with
-    # BatchNorm/Dropout layers if they exist
-    vision_connector.eval()
-    total_train_loss = 0
-    optimizer.zero_grad()
+    setup.llm.train()
+    # The connector is frozen, so it stays in eval mode.
+    setup.vision_connector.eval()
+
+    total_train_loss = 0.0
+    setup.optimizer.zero_grad()
     epoch_start_time = time.time()
 
-    if local_rank == 0:
-        logger.info(f"\n{'=' * 70}")
-        logger.info(f"📚 Starting Epoch {epoch + 1}/{NUM_EPOCHS}")
-        logger.info(f"{'=' * 70}")
+    if ctx.is_main:
+        logger.info("\n%s", "=" * 70)
+        logger.info("📚 Starting Epoch %d/%d", epoch + 1, num_epochs)
+        logger.info("%s", "=" * 70)
 
-    for i, batch in enumerate(train_loader):
-        # Unpack batch - LLaVA returns 4 items (images, input_ids, attention_mask, labels)
-        # COCO returns 3 items (images, input_ids, attention_mask) - labels = input_ids shifted
-        if len(batch) == 4:
-            # LLaVA dataset with proper loss masking
-            images, input_ids, attention_mask, labels = batch
-            images, input_ids, attention_mask, labels = (
-                images.to(DEVICE),
-                input_ids.to(DEVICE),
-                attention_mask.to(DEVICE),
-                labels.to(DEVICE),
-            )
-            use_llava_labels = True
+    steps_per_epoch = len(setup.train_loader) // setup.accumulation_steps
+
+    for i, batch in enumerate(setup.train_loader):
+        moved, has_labels = _move_batch(batch, ctx.device)
+        if has_labels:
+            images, input_ids, attention_mask, labels = moved
         else:
-            # COCO dataset (backward compatibility)
-            images, input_ids, attention_mask = batch
-            images, input_ids, attention_mask = (
-                images.to(DEVICE),
-                input_ids.to(DEVICE),
-                attention_mask.to(DEVICE),
-            )
-            use_llava_labels = False
+            images, input_ids, attention_mask = moved
+            labels = None
 
-        with autocast(device_type=AMP_DEVICE, dtype=torch.bfloat16, enabled=USE_FSDP):
-            with torch.no_grad():
-                patch_embeddings = vision_encoder(images).last_hidden_state
+        with autocast(device_type=ctx.amp_device, dtype=torch.bfloat16, enabled=ctx.use_fsdp):
+            logits, num_visual_tokens = _forward(setup, ctx, images, input_ids, attention_mask)
+            ce_loss = _sequence_loss(setup, logits, num_visual_tokens, input_ids, labels)
+            loss = ce_loss / setup.accumulation_steps
 
-            visual_soft_tokens = vision_connector(patch_embeddings)
-            # Use cached embedding layer to avoid unwrap_model(llm).* access
-            text_embeddings = embed_tokens_layer(input_ids)
-            combined_embeddings = torch.cat([visual_soft_tokens, text_embeddings], dim=1)
-            combined_attention_mask = torch.cat(
-                [torch.ones(visual_soft_tokens.shape[:2], device=DEVICE), attention_mask],
-                dim=1,
-            )
+        setup.scaler.scale(loss).backward()
 
-            outputs = llm(
-                inputs_embeds=combined_embeddings,
-                attention_mask=combined_attention_mask,
-            )
-            logits = outputs.logits
+        if (i + 1) % setup.accumulation_steps == 0 or (i + 1) == len(setup.train_loader):
+            # .item() forces a host sync, so it is only called here — once per
+            # optimiser step — rather than on every micro-batch, where it would
+            # skew timing between ranks.
+            total_train_loss += loss.item() * setup.accumulation_steps
 
-            num_visual_tokens = visual_soft_tokens.shape[1]
+            setup.scaler.unscale_(setup.optimizer)
+            torch.nn.utils.clip_grad_norm_(setup.trainable_params, max_norm=1.0)
+            setup.scaler.step(setup.optimizer)
+            setup.scaler.update()
+            setup.optimizer.zero_grad()
+            setup.scheduler.step()
 
-            if use_llava_labels:
-                # LLaVA: Use provided labels with masking
-                # Logits for text portion only (skip visual tokens)
-                text_logits = logits[..., num_visual_tokens:, :].contiguous()
-                # Labels already have question tokens masked with -100
-                text_labels = labels.contiguous()
-
-                # Shift for next-token prediction: logits[:-1] predicts labels[1:]
-                text_logits = text_logits[..., :-1, :].contiguous()
-                text_labels = text_labels[..., 1:].contiguous()
-            else:
-                # COCO: Original behavior (compute loss on all text)
-                text_logits = logits[..., num_visual_tokens:-1, :].contiguous()
-                text_labels = input_ids[..., 1:].contiguous()
-
-            ce_loss = loss_fn(text_logits.view(-1, VOCAB_SIZE), text_labels.view(-1))
-
-            loss = ce_loss / accumulation_steps
-
-        scaler.scale(loss).backward()
-
-        # Note: Accumulate loss tensor WITHOUT .item() to avoid CPU-GPU sync during accumulation
-        # Calling .item() on every iteration can cause timing skew between ranks (especially with 4+ GPUs)
-        # Instead, accumulate the tensor and only extract .item() after gradient update
-        if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):
-            # NOW it's safe to sync - we're already synchronizing for the optimizer step
-            total_train_loss += loss.item() * accumulation_steps
-
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
-
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-            scheduler.step()
-
-            # Progress logging every 50 steps (after gradient update)
-            if local_rank == 0:
-                total_steps = len(train_loader) // accumulation_steps
-                steps_done = (i + 1) // accumulation_steps
-
-                # Log every 50 steps OR on the first step OR on the last step
-                if steps_done % 50 == 0 or steps_done == 1 or steps_done == total_steps:
-                    current_lr = scheduler.get_last_lr()[0]
-                    avg_loss_so_far = total_train_loss / (i + 1) if (i + 1) > 0 else 0.0
+            if ctx.is_main:
+                steps_done = (i + 1) // setup.accumulation_steps
+                if steps_done % 50 == 0 or steps_done == 1 or steps_done == steps_per_epoch:
                     elapsed = time.time() - epoch_start_time
                     steps_per_sec = steps_done / elapsed if elapsed > 0 else 0.0
-                    eta_seconds = (
-                        (total_steps - steps_done) / steps_per_sec if steps_per_sec > 0 else 0
+                    eta_minutes = int(
+                        ((steps_per_epoch - steps_done) / steps_per_sec / 60)
+                        if steps_per_sec > 0
+                        else 0
                     )
-                    eta_minutes = int(eta_seconds / 60)
-
                     logger.info(
-                        f"  [Step {steps_done:4d}/{total_steps}] Loss: {avg_loss_so_far:.4f} | "
-                        f"LR: {current_lr:.2e} | Speed: {steps_per_sec:.2f} steps/s | ETA: {eta_minutes}min"
+                        "  [Step %4d/%d] Loss: %.4f | LR: %.2e | Speed: %.2f steps/s | ETA: %dmin",
+                        steps_done,
+                        steps_per_epoch,
+                        total_train_loss / (i + 1),
+                        setup.scheduler.get_last_lr()[0],
+                        steps_per_sec,
+                        eta_minutes,
                     )
 
-    # Note: Average training loss over number of optimizer steps, NOT total batches
-    num_optimizer_steps = len(train_loader) // accumulation_steps
-    avg_train_loss = total_train_loss / num_optimizer_steps
-    if local_rank == 0:
-        epoch_train_time = time.time() - epoch_start_time
+    # Averaged over optimiser steps, not micro-batches.
+    avg_train_loss = total_train_loss / steps_per_epoch
+    if ctx.is_main:
         logger.info(
-            f"\n✅ Training complete: Avg Loss = {avg_train_loss:.4f} | Time: {epoch_train_time / 60:.2f} min"
+            "\n✅ Training complete: Avg Loss = %.4f | Time: %.2f min",
+            avg_train_loss,
+            (time.time() - epoch_start_time) / 60,
         )
+    return avg_train_loss
 
-    # --- Validation Phase (All Ranks, Limited Batches) ---
-    # SOLUTION: Use Stage 2.5's validation pattern:
-    # - All ranks participate (FSDP collectives work correctly)
-    # - Limit to MAX_VAL_BATCHES (keeps validation fast, ~5-10 minutes)
-    # - Each rank computes its own average (no distributed aggregation)
-    # - Only rank 0's validation loss is used for model selection
-    llm.eval()
-    vision_connector.eval()
-    total_val_loss = 0
+
+def run_validation(setup: TrainingSetup, ctx: RunContext) -> tuple[float, dict | None, int]:
+    """Validate and, on rank 0, collect the routing metrics.
+
+    Every rank runs the loop so FSDP collectives stay matched, but each computes
+    its own average and only rank 0's is used for model selection.
+    """
+    setup.llm.eval()
+    setup.vision_connector.eval()
+    total_val_loss = 0.0
     val_steps = 0
-    MAX_VAL_BATCHES = 300  # Limited to keep validation fast (~5-10 minutes)
 
-    # Initialize expert usage tracker (rank 0 only for efficiency)
     expert_tracker = None
-    if local_rank == 0:
-        # Sized from the loaded backbones rather than the 7B/ViT-L constants
-        # (32 layers, 257 visual tokens), so the tracker is also correct for the
-        # tiny models used by the CPU demo.
+    if ctx.is_main:
+        # Sized from the loaded model rather than the 7B/ViT-L constants, so the
+        # tracker is also correct for the tiny models used by the CPU demo.
         expert_tracker = ExpertUsageTracker(
-            num_layers=llm.config.num_hidden_layers,
-            num_experts=2,
-            visual_token_end=NUM_VISUAL_TOKENS - 1,
+            num_layers=setup.llm.config.num_hidden_layers,
+            num_experts=NUM_EXPERTS,
+            visual_token_end=setup.num_visual_tokens - 1,
         )
-        logger.debug(
-            f"\n📊 Running validation (all ranks, max {MAX_VAL_BATCHES} batches per GPU)..."
-        )
-        logger.info(f"   📈 Collecting expert utilization metrics for research analysis...")
-        val_start_time = time.time()
+        logger.debug("\n📊 Running validation (all ranks, max %d batches)...", MAX_VAL_BATCHES)
 
     with torch.no_grad():
-        for i, batch in enumerate(val_loader):
-            # Early stop after MAX_VAL_BATCHES to keep validation fast
+        for i, batch in enumerate(setup.val_loader):
             if i >= MAX_VAL_BATCHES:
                 break
 
-            # Unpack batch (handle both LLaVA and COCO formats)
-            if len(batch) == 4:
-                images, input_ids, attention_mask, labels = batch
-                images, input_ids, attention_mask, labels = (
-                    images.to(DEVICE),
-                    input_ids.to(DEVICE),
-                    attention_mask.to(DEVICE),
-                    labels.to(DEVICE),
-                )
-                use_llava_labels = True
+            moved, has_labels = _move_batch(batch, ctx.device)
+            if has_labels:
+                images, input_ids, attention_mask, labels = moved
             else:
-                images, input_ids, attention_mask = batch
-                images, input_ids, attention_mask = (
-                    images.to(DEVICE),
-                    input_ids.to(DEVICE),
-                    attention_mask.to(DEVICE),
-                )
-                use_llava_labels = False
+                images, input_ids, attention_mask = moved
+                labels = None
 
-            # Note: Don't use try-except with break - it can cause ranks to diverge
-            # Instead, just skip failed batches but continue the loop
-            with autocast(device_type=AMP_DEVICE, dtype=torch.bfloat16, enabled=USE_FSDP):
-                patch_embeddings = vision_encoder(images).last_hidden_state
-                visual_soft_tokens = vision_connector(patch_embeddings)
-                # Use cached embedding layer to avoid unwrap_model(llm).* access
-                text_embeddings = embed_tokens_layer(input_ids)
-                combined_embeddings = torch.cat([visual_soft_tokens, text_embeddings], dim=1)
-                combined_attention_mask = torch.cat(
-                    [torch.ones(visual_soft_tokens.shape[:2], device=DEVICE), attention_mask],
-                    dim=1,
-                )
+            with autocast(device_type=ctx.amp_device, dtype=torch.bfloat16, enabled=ctx.use_fsdp):
+                logits, num_visual_tokens = _forward(setup, ctx, images, input_ids, attention_mask)
 
-                # Forward pass (router logits are stored in each MoE layer's _last_router_logits)
-                outputs = llm(
-                    inputs_embeds=combined_embeddings,
-                    attention_mask=combined_attention_mask,
-                )
-                logits = outputs.logits
-                num_visual_tokens = visual_soft_tokens.shape[1]
+                if expert_tracker is not None:
+                    _collect_routing_metrics(setup, ctx, expert_tracker, logits)
 
-                # Collect expert routing metrics (rank 0 only, memory efficient)
-                # Access router logits from MoE layers after forward pass
-                if local_rank == 0 and expert_tracker is not None:
-                    batch_size, seq_len = combined_embeddings.shape[:2]
-                    # Create position indices: [batch_size, seq_len] with values 0 to seq_len-1
-                    positions = (
-                        torch.arange(seq_len, device=DEVICE).unsqueeze(0).expand(batch_size, -1)
-                    )
-
-                    # Access the unwrapped model to get MoE layers
-                    # For FSDP, the actual model is in unwrap_model(llm) if wrapped, else llm directly
-                    model_to_inspect = unwrap_model(llm) if hasattr(llm, "module") else llm
-
-                    # Iterate through layers and collect router logits
-                    for layer_idx, layer in enumerate(model_to_inspect.model.layers):
-                        if hasattr(layer.mlp, "_last_router_logits"):
-                            router_logits = layer.mlp._last_router_logits
-                            # Convert logits to probabilities
-                            router_probs = torch.softmax(router_logits, dim=-1)
-                            # Update tracker
-                            expert_tracker.update(layer_idx, router_probs, positions)
-
-                if use_llava_labels:
-                    # LLaVA: Use provided labels with masking
-                    text_logits = logits[..., num_visual_tokens:, :].contiguous()
-                    text_labels = labels.contiguous()
-                    # Shift for next-token prediction
-                    text_logits = text_logits[..., :-1, :].contiguous()
-                    text_labels = text_labels[..., 1:].contiguous()
-                else:
-                    # COCO: Original behavior
-                    text_logits = logits[..., num_visual_tokens:-1, :].contiguous()
-                    text_labels = input_ids[..., 1:].contiguous()
-
-                loss = loss_fn(text_logits.view(-1, VOCAB_SIZE), text_labels.view(-1))
+                loss = _sequence_loss(setup, logits, num_visual_tokens, input_ids, labels)
 
             total_val_loss += loss.item()
             val_steps += 1
 
-            # Progress logging every 25 batches
-            if local_rank == 0 and (i + 1) % 25 == 0:
-                avg_val_loss_so_far = total_val_loss / val_steps if val_steps > 0 else 0.0
+            if ctx.is_main and (i + 1) % 25 == 0:
                 logger.info(
-                    f"  Validation progress: {i + 1}/{MAX_VAL_BATCHES} batches | Avg Loss: {avg_val_loss_so_far:.4f}"
+                    "  Validation progress: %d/%d batches | Avg Loss: %.4f",
+                    i + 1,
+                    MAX_VAL_BATCHES,
+                    total_val_loss / val_steps,
                 )
 
-    # Each rank computes its own average - no distributed aggregation needed
     avg_val_loss = total_val_loss / val_steps if val_steps > 0 else float("inf")
+    expert_metrics = expert_tracker.compute_metrics() if expert_tracker is not None else None
+    return avg_val_loss, expert_metrics, val_steps
 
-    # Compute and save expert metrics (rank 0 only)
-    if local_rank == 0 and expert_tracker is not None:
-        logger.debug(f"\n📊 Computing expert utilization metrics...")
-        expert_metrics = expert_tracker.compute_metrics()
 
-        # Save to JSON file
-        expert_metrics_dir = os.path.join(OUTPUT_DIR, "expert_metrics")
-        os.makedirs(expert_metrics_dir, exist_ok=True)
-        metrics_filename = f"expert_metrics_epoch_{epoch + 1}.json"
-        metrics_filepath = os.path.join(expert_metrics_dir, metrics_filename)
+def _collect_routing_metrics(
+    setup: TrainingSetup, ctx: RunContext, tracker: ExpertUsageTracker, logits: torch.Tensor
+) -> None:
+    """Read each MoE layer's stored router logits into the tracker.
 
-        with open(metrics_filepath, "w") as f:
-            json.dump(expert_metrics, f, indent=2)
+    MoELayer caches ``_last_router_logits`` on every forward, so the routing
+    distribution can be recovered without a second pass.
+    """
+    model = unwrap_model(setup.llm)
+    # Shape from the batch in hand — the final batch of an epoch may be short.
+    batch_size, seq_len = logits.shape[:2]
+    positions = torch.arange(seq_len, device=ctx.device).unsqueeze(0).expand(batch_size, -1)
 
-        logger.info(f"✅ Expert metrics saved to {metrics_filepath}")
+    for layer_idx, layer in enumerate(model.model.layers):
+        if hasattr(layer.mlp, "_last_router_logits"):
+            router_probs = torch.softmax(layer.mlp._last_router_logits, dim=-1)
+            tracker.update(layer_idx, router_probs, positions)
 
-        # Print summary table
-        logger.info(f"\n{'=' * 70}")
-        logger.info(f"📈 EXPERT UTILIZATION METRICS - Epoch {epoch + 1}")
-        logger.info(f"{'=' * 70}")
 
-        agg = expert_metrics["aggregate"]
+def save_checkpoints(
+    setup: TrainingSetup,
+    ctx: RunContext,
+    checkpoint_dir: str,
+    epoch: int,
+    avg_val_loss: float,
+    best_val_loss: float,
+) -> float:
+    """Save the latest (and, if improved, best) checkpoint. Returns the new best.
 
-        # 1. Expert Load Distribution (Aggregate)
-        logger.info(f"\n1️⃣  Expert Load Distribution (Aggregate across all layers):")
-        if "expert_load_distribution" in agg:
-            for expert, pct in agg["expert_load_distribution"].items():
-                logger.info(f"   {expert}: {pct}%")
-
-        # 2. Routing Entropy (Aggregate)
-        logger.info(f"\n2️⃣  Average Routing Entropy (Aggregate):")
-        if "avg_routing_entropy" in agg:
-            logger.info(f"   {agg['avg_routing_entropy']:.4f} (lower = more decisive routing)")
-
-        # 3. Routing Confidence (Aggregate)
-        logger.info(f"\n3️⃣  High Confidence Routing Fraction (Aggregate):")
-        if "high_confidence_fraction" in agg:
-            logger.info(
-                f"   {agg['high_confidence_fraction']:.2%} of tokens routed with >70% confidence"
-            )
-
-        # 4. Visual vs Text Routing (Aggregate)
-        logger.info(f"\n4️⃣  Visual vs Text Token Routing (Aggregate):")
-        if "visual_routing" in agg:
-            logger.info(f"   Visual Tokens (positions 0-256):")
-            for expert, pct in agg["visual_routing"].items():
-                logger.info(f"      {expert}: {pct}%")
-        if "text_routing" in agg:
-            logger.info(f"   Text Tokens (positions {NUM_VISUAL_TOKENS}+):")
-            for expert, pct in agg["text_routing"].items():
-                logger.info(f"      {expert}: {pct}%")
-
-        # Sample per-layer metrics: first, middle and last layer of whatever
-        # depth the loaded model actually has.
-        num_reported_layers = len(expert_metrics["per_layer"])
-        sample_layers = sorted({0, num_reported_layers // 2, num_reported_layers - 1})
-        logger.debug(f"\n📋 Sample Per-Layer Metrics (Layers {sample_layers}):")
-        for layer_idx in sample_layers:
-            layer_metrics = expert_metrics["per_layer"][layer_idx]
-            logger.info(f"\n   Layer {layer_idx}:")
-            logger.info(f"      Expert Load: {layer_metrics['expert_load_distribution']}")
-            logger.info(f"      Entropy: {layer_metrics['avg_routing_entropy']:.4f}")
-            logger.info(f"      High Conf: {layer_metrics['high_confidence_fraction']:.2%}")
-            if "visual" in layer_metrics["visual_vs_text_routing"]:
-                logger.info(f"      Visual: {layer_metrics['visual_vs_text_routing']['visual']}")
-            if "text" in layer_metrics["visual_vs_text_routing"]:
-                logger.info(f"      Text: {layer_metrics['visual_vs_text_routing']['text']}")
-
-        logger.info(f"\n💡 Full per-layer metrics available in {metrics_filepath}")
-        logger.info(f"{'=' * 70}\n")
-
-    if local_rank == 0:
-        val_time = time.time() - val_start_time
-        epoch_time = time.time() - epoch_start_time
-        logger.info(f"\n{'=' * 70}")
-        logger.info(f"Epoch [{epoch + 1}/{NUM_EPOCHS}] Complete")
-        logger.info(f"  Training Loss:   {avg_train_loss:.4f}")
-        logger.info(f"  Validation Loss: {avg_val_loss:.4f} (rank 0, {val_steps} batches)")
-        logger.info(
-            f"  Epoch Time:      {epoch_time / 60:.2f} minutes (Train: {(epoch_time - val_time) / 60:.2f}m, Val: {val_time / 60:.2f}m)"
-        )
-        logger.info(f"  Learning Rate:   {scheduler.get_last_lr()[0]:.2e}")
-        logger.info(f"{'=' * 70}\n")  # --- Metrics and Checkpoint Saving ---
-    if local_rank == 0:
-        metrics_history["epoch"].append(epoch + 1)
-        metrics_history["train_loss"].append(avg_train_loss)
-        metrics_history["val_loss"].append(avg_val_loss)
-        metrics_history["learning_rate"].append(optimizer.param_groups[0]["lr"])
-        with open(metrics_path, "w") as f:
-            json.dump(metrics_history, f, indent=4)
-        logger.info(f"✅ Metrics saved to {metrics_path}")
-
-    # Note: Barrier before checkpoint extraction to ensure all ranks are ready
-    # FSDP state_dict extraction requires coordination between ranks
+    Two variants are written: a full checkpoint carrying optimiser and scheduler
+    state, which is tied to the GPU count, and a portable one holding only model
+    weights, which is what resumption uses.
+    """
     dist.barrier()
-
-    if local_rank == 0:
-        logger.debug(f"\n💾 Saving checkpoints...")
-        checkpoint_start_time = time.time()
-
-    # Force garbage collection and clear cache before checkpoint saving
     gc.collect()
-    if USE_FSDP:
+    if ctx.use_fsdp:
         torch.cuda.empty_cache()
 
-    with full_state_dict_context(llm, rank0_only=True):
-        llm_state_dict = llm.state_dict()
+    # Gathering the sharded parameters is collective — every rank must enter.
+    with full_state_dict_context(setup.llm, rank0_only=True):
+        llm_state_dict = setup.llm.state_dict()
+    connector_state_dict = setup.vision_connector.state_dict()
 
-    connector_state_dict = vision_connector.state_dict()
+    if ctx.is_main:
+        checkpoint_start = time.time()
+        os.makedirs(checkpoint_dir, exist_ok=True)
 
-    if local_rank == 0:
-        # Save full checkpoint (includes optimizer/scheduler - tied to GPU count)
         full_checkpoint = {
             "model_state_dict": llm_state_dict,
             "connector_state_dict": connector_state_dict,
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
+            "optimizer_state_dict": setup.optimizer.state_dict(),
+            "scheduler_state_dict": setup.scheduler.state_dict(),
             "epoch": epoch,
             "best_val_loss": best_val_loss,
             "current_val_loss": avg_val_loss,
-            "world_size": dist.get_world_size(),  # Track GPU count
+            "world_size": dist.get_world_size(),
         }
-
-        # Save portable checkpoint (model weights only - GPU count agnostic)
         portable_checkpoint = {
             "model_state_dict": llm_state_dict,
             "connector_state_dict": connector_state_dict,
@@ -1149,56 +705,255 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             "val_loss": avg_val_loss,
         }
 
-        os.makedirs(STAGE3_CHECKPOINT_DIR, exist_ok=True)
-
-        # Save both full and portable versions
-        latest_checkpoint_path = os.path.join(STAGE3_CHECKPOINT_DIR, "llm_stage3_latest.pth")
-        portable_checkpoint_path = os.path.join(
-            STAGE3_CHECKPOINT_DIR, "llm_stage3_latest_portable.pth"
+        torch.save(full_checkpoint, os.path.join(checkpoint_dir, "llm_stage3_latest.pth"))
+        torch.save(
+            portable_checkpoint,
+            os.path.join(checkpoint_dir, "llm_stage3_latest_portable.pth"),
         )
-
-        torch.save(full_checkpoint, latest_checkpoint_path)
-        torch.save(portable_checkpoint, portable_checkpoint_path)
-
-        checkpoint_time = time.time() - checkpoint_start_time
-        logger.info(f"  ✅ Saved latest checkpoint ({checkpoint_time:.1f}s)")
-        logger.info(f"     Full: {latest_checkpoint_path}")
-        logger.info(f"     Portable: {portable_checkpoint_path}")
+        logger.info("  ✅ Saved latest checkpoint (%.1fs)", time.time() - checkpoint_start)
 
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             full_checkpoint["best_val_loss"] = best_val_loss
-
-            best_checkpoint_path = os.path.join(STAGE3_CHECKPOINT_DIR, "llm_stage3_best.pth")
-            best_portable_path = os.path.join(STAGE3_CHECKPOINT_DIR, "llm_stage3_best_portable.pth")
-
-            torch.save(full_checkpoint, best_checkpoint_path)
-            torch.save(portable_checkpoint, best_portable_path)
-            logger.info(f"\n  🏆 NEW BEST MODEL! Val loss improved: {avg_val_loss:.4f}")
-            logger.info(f"     Best: {best_checkpoint_path}")
-            logger.info(f"     Best Portable: {best_portable_path}")
-        else:
-            logger.debug(
-                f"  ℹ️  Best val loss remains: {best_val_loss:.4f} (current: {avg_val_loss:.4f})"
+            torch.save(full_checkpoint, os.path.join(checkpoint_dir, "llm_stage3_best.pth"))
+            torch.save(
+                portable_checkpoint,
+                os.path.join(checkpoint_dir, "llm_stage3_best_portable.pth"),
             )
+            logger.info("\n  🏆 NEW BEST MODEL! Val loss improved: %.4f", avg_val_loss)
+        else:
+            logger.debug("  ℹ️  Best val loss remains: %.4f", best_val_loss)
 
-        # Clean up checkpoint dicts to free memory
         del llm_state_dict, connector_state_dict, full_checkpoint, portable_checkpoint
 
-    # Force memory cleanup after checkpoint operations
     gc.collect()
-    if USE_FSDP:
+    if ctx.use_fsdp:
         torch.cuda.empty_cache()
+    dist.barrier()
+    return best_val_loss
 
+
+def log_configuration(
+    setup: TrainingSetup,
+    ctx: RunContext,
+    train_params: dict[str, Any],
+    num_epochs: int,
+    start_epoch: int,
+) -> None:
+    """Print the run's configuration once, from rank 0."""
+    if not ctx.is_main:
+        return
+
+    world_size = dist.get_world_size()
+    steps_per_epoch = len(setup.train_loader) // setup.accumulation_steps
+    batch_size = train_params["batch_size"]
+
+    logger.info("\n%s", "=" * 70)
+    logger.info("🚀 STAGE 3 TRAINING CONFIGURATION")
+    logger.info("%s", "=" * 70)
+    logger.info("Dataset:               %s", train_params.get("dataset", "coco").upper())
+    logger.info("Epochs:                %d (starting from epoch %d)", num_epochs, start_epoch)
+    logger.info("Training batches:      %d", len(setup.train_loader))
+    logger.info("Validation batches:    %d", len(setup.val_loader))
+    logger.info("Batch size per GPU:    %d", batch_size)
+    logger.info("Gradient accumulation: %d", setup.accumulation_steps)
+    logger.info(
+        "Effective batch size:  %d (batch_size × %d ranks × accum_steps)",
+        batch_size * world_size * setup.accumulation_steps,
+        world_size,
+    )
+    logger.info("Steps per epoch:       %d", steps_per_epoch)
+    logger.info("Learning rate:         %.2e", train_params["learning_rate"])
+    logger.info("Weight decay:          %s", train_params["weight_decay"])
+    logger.info("Label smoothing:       %s", train_params.get("label_smoothing", 0.0))
+    logger.info("Attention dropout:     %s", train_params.get("attention_dropout", 0.0))
+    logger.info("Expert dropout:        %s", train_params.get("expert_dropout", 0.0))
+    logger.info("Mixed precision:       %s", "bfloat16" if ctx.use_fsdp else "disabled (CPU)")
+    logger.info("Sharding:              %s", "FSDP" if ctx.use_fsdp else "none (single process)")
+    logger.info("%s\n", "=" * 70)
+
+
+def build_setup(
+    paths: dict[str, Any],
+    train_params: dict[str, Any],
+    loader_params: dict[str, Any],
+    num_epochs: int,
+    ctx: RunContext,
+) -> TrainingSetup:
+    """Assemble every component the epoch loop needs, in dependency order.
+
+    Order matters: the connector's dimensions come from the loaded backbones,
+    the vocab size and embedding layer must be cached before FSDP wrapping, and
+    the Stage 2 experts must be loaded after wrapping so the state dict is
+    gathered through FSDP rather than applied to an unsharded model.
+    """
+    output_dir = paths["output_dir"]
+    stage2_checkpoint_dir = os.path.join(output_dir, "stage2_checkpoints")
+
+    vision_encoder, clip_processor, tokenizer, num_visual_tokens = build_backbones(paths, ctx)
+    llm = build_llm(paths, train_params, ctx)
+    configure_trainable_parameters(llm, vision_encoder, ctx)
+
+    vision_connector = VisionLanguageConnector(
+        clip_hidden_size=vision_encoder.config.hidden_size,
+        llm_hidden_size=llm.config.hidden_size,
+    ).to(ctx.device)
+    for param in vision_connector.parameters():
+        param.requires_grad = False
+
+    # Cache both before wrapping: reading llm.config or the embedding layer
+    # through FSDP can trigger collectives on a single rank.
+    vocab_size = llm.config.vocab_size
+    embed_tokens_layer = llm.model.embed_tokens
+
+    llm = wrap_with_fsdp(llm, ctx)
+    load_stage2_experts(llm, stage2_checkpoint_dir, ctx)
+    load_stage1_connector(vision_connector, output_dir, ctx)
     dist.barrier()
 
-if local_rank == 0:
-    end_time = time.time()
-    duration_seconds = end_time - start_time
-    hours = int(duration_seconds // 3600)
-    minutes = int((duration_seconds % 3600) // 60)
-    seconds = int(duration_seconds % 60)
-    logger.info(f"--- Total Training Time: {hours}h {minutes}m {seconds}s ---")
+    if ctx.is_main:
+        logger.info("Creating datasets and dataloaders...")
+    train_dataset, val_dataset = build_datasets(
+        paths, train_params, loader_params, clip_processor, tokenizer, ctx
+    )
+    train_loader, val_loader, train_sampler = build_dataloaders(
+        train_dataset, val_dataset, train_params, loader_params, ctx
+    )
 
-dist.destroy_process_group()
-logger.info("Job finished.")
+    accumulation_steps = train_params.get("gradient_accumulation_steps", 1)
+    trainable_params = [p for p in llm.parameters() if p.requires_grad]
+    optimizer = optim.AdamW(
+        trainable_params,
+        lr=train_params["learning_rate"],
+        weight_decay=train_params["weight_decay"],
+        fused=False,
+    )
+    # GradScaler applies to float16 only; this stage trains in bfloat16, which
+    # does not need loss scaling.
+    scaler = GradScaler(ctx.amp_device, enabled=False)
+    scheduler = CosineAnnealingLR(
+        optimizer, T_max=(len(train_loader) // accumulation_steps) * num_epochs
+    )
+    label_smoothing = train_params.get("label_smoothing", 0.0)
+    loss_fn = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=label_smoothing)
+    if ctx.is_main and label_smoothing > 0:
+        logger.info("  ✅ Label smoothing: %s", label_smoothing)
+
+    return TrainingSetup(
+        llm=llm,
+        vision_encoder=vision_encoder,
+        vision_connector=vision_connector,
+        embed_tokens_layer=embed_tokens_layer,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        train_sampler=train_sampler,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        loss_fn=loss_fn,
+        trainable_params=trainable_params,
+        vocab_size=vocab_size,
+        num_visual_tokens=num_visual_tokens,
+        accumulation_steps=accumulation_steps,
+    )
+
+
+def main() -> None:
+    """Assemble the Stage 3 run and drive the epoch loop."""
+    register_moe_model()
+
+    config = load_config()
+    paths = config["paths"]
+    train_params = config["training_stage3"]
+    loader_params = config["dataloader"]
+    num_epochs = train_params["num_epochs"]
+    output_dir = paths["output_dir"]
+    stage2_checkpoint_dir = os.path.join(output_dir, "stage2_checkpoints")
+    stage3_checkpoint_dir = os.path.join(output_dir, "stage3_checkpoints")
+
+    use_fsdp = supports_fsdp()
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    init_distributed(local_rank, timeout=DIST_TIMEOUT)
+    setup_logging(local_rank)
+    ctx = RunContext(
+        device=local_rank if use_fsdp else "cpu",
+        amp_device="cuda" if use_fsdp else "cpu",
+        use_fsdp=use_fsdp,
+        local_rank=local_rank,
+    )
+    if use_fsdp:
+        torch.cuda.set_device(local_rank)
+
+    # Seed every RNG, as Stage 1 does. Without this, dropout, the Gumbel noise
+    # in soft routing and the shuffled sampler all draw from an unseeded stream.
+    set_seed(loader_params.get("data_seed", 42))
+
+    if ctx.is_main:
+        logger.info("--- Initializing Stage 3 Training (End-to-End) ---")
+
+    setup = build_setup(paths, train_params, loader_params, num_epochs, ctx)
+
+    start_epoch = maybe_resume(setup.llm, setup.vision_connector, stage3_checkpoint_dir, ctx)
+    best_val_loss = float("inf")
+
+    metrics_path = os.path.join(output_dir, "training_metrics_stage3.json")
+    metrics_history: dict[str, list] = {
+        "epoch": [],
+        "train_loss": [],
+        "val_loss": [],
+        "learning_rate": [],
+    }
+    if ctx.is_main and start_epoch > 0 and os.path.exists(metrics_path):
+        with open(metrics_path) as f:
+            metrics_history = json.load(f)
+
+    if ctx.is_main:
+        logger.info(
+            "Optimizing %d trainable parameters.",
+            sum(p.numel() for p in setup.trainable_params),
+        )
+    log_configuration(setup, ctx, train_params, num_epochs, start_epoch)
+
+    start_time = time.time()
+    for epoch in range(start_epoch, num_epochs):
+        avg_train_loss = train_one_epoch(setup, ctx, epoch, num_epochs)
+        avg_val_loss, expert_metrics, val_steps = run_validation(setup, ctx)
+
+        if ctx.is_main:
+            if expert_metrics is not None:
+                save_expert_metrics(expert_metrics, output_dir, epoch, setup.num_visual_tokens)
+
+            logger.info("\n%s", "=" * 70)
+            logger.info("Epoch [%d/%d] Complete", epoch + 1, num_epochs)
+            logger.info("  Training Loss:   %.4f", avg_train_loss)
+            logger.info("  Validation Loss: %.4f (rank 0, %d batches)", avg_val_loss, val_steps)
+            logger.info("  Learning Rate:   %.2e", setup.scheduler.get_last_lr()[0])
+            logger.info("%s\n", "=" * 70)
+
+            metrics_history["epoch"].append(epoch + 1)
+            metrics_history["train_loss"].append(avg_train_loss)
+            metrics_history["val_loss"].append(avg_val_loss)
+            metrics_history["learning_rate"].append(setup.optimizer.param_groups[0]["lr"])
+            with open(metrics_path, "w") as f:
+                json.dump(metrics_history, f, indent=4)
+            logger.info("✅ Metrics saved to %s", metrics_path)
+
+        best_val_loss = save_checkpoints(
+            setup, ctx, stage3_checkpoint_dir, epoch, avg_val_loss, best_val_loss
+        )
+
+    if ctx.is_main:
+        duration = int(time.time() - start_time)
+        logger.info(
+            "--- Total Training Time: %dh %dm %ds ---",
+            duration // 3600,
+            (duration % 3600) // 60,
+            duration % 60,
+        )
+
+    dist.destroy_process_group()
+    logger.info("Job finished.")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,5 +1,6 @@
 import gc
 import json
+import logging
 import os
 import time
 from functools import partial
@@ -29,7 +30,6 @@ from transformers.models.mistral.modeling_mistral import MistralMLP
 
 from data import COCO_Loader
 from models import VisionLanguageConnector
-import logging
 from models.utils.common import (
     full_state_dict_context,
     get_attn_implementation,
