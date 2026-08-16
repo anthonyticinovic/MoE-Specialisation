@@ -1,696 +1,676 @@
+"""Stage 2.5: train the router, and nothing else.
+
+The bridging stage. Stage 2 specialises the experts under a fixed,
+position-derived mask — there is no learned router. Stage 3 needs one. Going
+straight from a hard mask to end-to-end soft routing collapses routing onto a
+single expert, so this stage trains only the gate, with the experts frozen,
+until soft routing is stable.
+
+Three things shape the objective: Gumbel-Softmax temperature annealed from 2.0
+towards 1.0, a load-balancing term, and an entropy bonus that decays over
+epochs — early exploration first, specialisation later.
+
+Run from the repo root::
+
+    torchrun --nproc_per_node=4 training_scripts/train_stage_2.5.py
+
+A single-process CPU run works too. Paths come from
+``configs/training_config.yaml`` unless ``MOE_CONFIG`` points elsewhere.
+"""
+
+from __future__ import annotations
+
 import gc
 import json
 import logging
 import os
-from functools import partial
+from dataclasses import dataclass
+from typing import Any
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
 from torch.amp import GradScaler, autocast
-from torch.distributed.fsdp import (
-    CPUOffload,
-)
-from torch.distributed.fsdp import (
-    FullyShardedDataParallel as FSDP,
-)
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from transformers import (
-    AutoModelForCausalLM,
-    AutoProcessor,
-    AutoTokenizer,
-    CLIPVisionModel,
-)
-from transformers.models.mistral.modeling_mistral import MistralMLP
+from transformers import AutoModelForCausalLM
 
 from data import COCO_Loader
-from models import VisionLanguageConnector
 from models.utils.common import (
     full_state_dict_context,
     get_attn_implementation,
     get_model_dtype,
-    init_distributed,
     load_config,
     register_moe_model,
-    set_seed,
-    setup_logging,
-    supports_fsdp,
     unwrap_model,
+)
+from training_scripts._lib import (
+    RunContext,
+    broadcast_flag,
+    build_backbones,
+    build_distributed_loaders,
+    build_run_context,
+    build_vision_connector,
+    combine_sequence,
+    shifted_caption_loss,
+    teardown,
+    wrap_with_fsdp,
 )
 
 logger = logging.getLogger(__name__)
 
-register_moe_model()
+# Validation is capped so an epoch stays a sensible length on the full dataset.
+MAX_VAL_BATCHES = 75
+# The router's gradients are clipped loosely: the gate is tiny and a tight bound
+# stalls it before it escapes the uniform-routing fixed point.
+ROUTER_GRAD_CLIP = 10.0
+ROUTER_MONITOR_EVERY = 500
 
-# ====================================================================================
-# 2. SETUP AND CONFIGURATION
-# ====================================================================================
-config = load_config()
 
-paths = config["paths"]
-train_params = config["training_stage2.5"]
-loader_params = config["dataloader"]
-NUM_EPOCHS = train_params["num_epochs"]
-OUTPUT_DIR = paths["output_dir"]
-STAGE2_CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "stage2_checkpoints")
-STAGE2_5_CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "stage2_5_checkpoints")
-LOAD_BALANCING_COEFF = train_params.get("load_balancing_coeff", 0.01)
+@dataclass
+class Stage25Setup:
+    """Everything the epoch loop needs, assembled once before training."""
 
-# --- Initialize the distributed environment ---
-USE_FSDP = supports_fsdp()
-local_rank = int(os.environ.get("LOCAL_RANK", 0))
-init_distributed(local_rank)
-setup_logging(local_rank)
-if USE_FSDP:
-    torch.cuda.set_device(local_rank)
-    DEVICE = f"cuda:{local_rank}"
-else:
-    DEVICE = "cpu"
-# autocast/GradScaler take a device *type* string; DEVICE may be an ordinal.
-AMP_DEVICE = "cuda" if USE_FSDP else "cpu"
+    llm: nn.Module
+    vision_encoder: nn.Module
+    vision_connector: nn.Module
+    train_loader: DataLoader
+    val_loader: DataLoader
+    train_sampler: DistributedSampler
+    optimizer: optim.Optimizer
+    scheduler: CosineAnnealingLR
+    scaler: GradScaler
+    loss_fn: nn.Module
+    accumulation_steps: int
+    vocab_size: int
+    hidden_size: int
+    num_moe_layers: int
+    load_balancing_coeff: float
 
-# Seed every RNG, as Stage 1 already does. Without this the run is not
-# reproducible: dropout, the shuffled sampler and (under soft routing) the
-# Gumbel noise all draw from an unseeded stream.
-set_seed(loader_params.get("data_seed", 42))
 
-if local_rank == 0:
-    logger.info("--- Initializing Stage 2.5 Training (Training the Router) ---")
-
-# ====================================================================================
-# 3. MODEL LOADING
-# ====================================================================================
-if local_rank == 0:
-    logger.info("Loading foundational models with low_cpu_mem_usage to prevent OOM...")
-vision_encoder = CLIPVisionModel.from_pretrained(paths["clip_local_path"]).to(DEVICE)
-clip_processor = AutoProcessor.from_pretrained(paths["clip_local_path"])
-tokenizer = AutoTokenizer.from_pretrained(paths["mistral_local_path"])
-tokenizer.pad_token = tokenizer.eos_token
-moe_model_path = paths["moe_model_path"]
-
-llm = AutoModelForCausalLM.from_pretrained(
-    moe_model_path,
-    trust_remote_code=True,
-    local_files_only=True,
-    torch_dtype=get_model_dtype(),
-    attn_implementation=get_attn_implementation(),
-    low_cpu_mem_usage=True,
-)
-
-# ====================================================================================
-# 4. TRAINING SETUP
-# ====================================================================================
-if local_rank == 0:
-    logger.info("Setting MoE layers to 'soft' routing mode for Stage 2.5.")
-for layer in llm.model.layers:
-    if hasattr(layer.mlp, "routing_mode"):
-        layer.mlp.routing_mode = "soft"
-
-if local_rank == 0:
-    logger.info("Preparing model for Stage 2.5: Freezing experts, unfreezing routers.")
-for name, param in llm.named_parameters():
-    if "mlp.gate" in name:
-        param.requires_grad = True
-    else:
-        param.requires_grad = False
-
-# ====================================================================================
-# 5. FSDP WRAPPING & CHECKPOINTING
-# ====================================================================================
-# Number of layers carrying a router gate — used to turn the layer-summed
-# entropy bonus into a reportable mean.
-num_moe_layers = sum(1 for layer in llm.model.layers if hasattr(layer.mlp, "gate"))
-
-my_auto_wrap_policy = partial(transformer_auto_wrap_policy, transformer_layer_cls={MistralMLP})
-ignored_modules = [llm.model.embed_tokens]
-
-if USE_FSDP:
-    llm = FSDP(
-        llm,
-        device_id=DEVICE,
-        auto_wrap_policy=my_auto_wrap_policy,
-        cpu_offload=CPUOffload(offload_params=None),
-        mixed_precision=torch.distributed.fsdp.MixedPrecision(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.bfloat16,
-            buffer_dtype=torch.bfloat16,
-        ),
-        use_orig_params=True,
-        ignored_modules=ignored_modules,
+def build_moe_llm(paths: dict[str, Any], ctx: RunContext) -> nn.Module:
+    """Load the MoE model, switch it to soft routing, and freeze all but the gate."""
+    llm = AutoModelForCausalLM.from_pretrained(
+        paths["moe_model_path"],
+        trust_remote_code=True,
+        local_files_only=True,
+        torch_dtype=get_model_dtype(),
+        attn_implementation=get_attn_implementation(),
+        low_cpu_mem_usage=True,
     )
-else:
-    # CPU demo: sharding is a no-op at one rank; the loop below is unchanged.
-    llm = llm.to(DEVICE)
 
-# --- 5.1. Load Stage 2 Checkpoint (Base weights for experts) ---
-# Define the path to the best checkpoint directly
-checkpoint_path = os.path.join(STAGE2_CHECKPOINT_DIR, "llm_stage2_best.pth")
+    if ctx.is_main:
+        logger.info("Setting MoE layers to 'soft' routing mode for Stage 2.5.")
+    for layer in llm.model.layers:
+        if hasattr(layer.mlp, "routing_mode"):
+            layer.mlp.routing_mode = "soft"
 
-# Have rank 0 check if the file exists
-file_exists = 1.0 if local_rank == 0 and os.path.exists(checkpoint_path) else 0.0
-file_exists_tensor = torch.tensor([file_exists], dtype=torch.float32).to(DEVICE)
+    if ctx.is_main:
+        logger.info("Freezing experts, unfreezing routers.")
+    for name, param in llm.named_parameters():
+        param.requires_grad = "mlp.gate" in name
 
-# Broadcast the existence status to all other ranks
-dist.broadcast(file_exists_tensor, src=0)
-should_load = file_exists_tensor.item() == 1.0
+    return llm
 
-# All ranks will attempt to load if the file was found on rank 0
-if should_load:
-    if local_rank == 0:
-        logger.debug(f"💾 Loading Stage 2 BEST expert weights from: {checkpoint_path}")
 
-    # Load the state dict. Your 'best' checkpoint saves the state_dict directly.
+def load_stage2_experts(llm: nn.Module, checkpoint_dir: str, ctx: RunContext) -> None:
+    """Load the specialised experts produced by Stage 2."""
+    checkpoint_path = os.path.join(checkpoint_dir, "llm_stage2_best.pth")
+    if not broadcast_flag(os.path.exists(checkpoint_path), ctx):
+        if ctx.is_main:
+            logger.warning(
+                "Stage 2 best checkpoint not found at %s. Starting from base weights.",
+                checkpoint_path,
+            )
+        return
+
+    if ctx.is_main:
+        logger.debug("💾 Loading Stage 2 expert weights from %s", checkpoint_path)
+
     state_dict = torch.load(checkpoint_path, map_location="cpu")
-
-    # Load the state dict into the FSDP model
     with full_state_dict_context(llm, rank0_only=False):
         llm.load_state_dict(state_dict, strict=False)
 
     del state_dict
     gc.collect()
-
-    # Barrier to ensure all processes have loaded before continuing
     dist.barrier()
 
-    if local_rank == 0:
+    if ctx.is_main:
         logger.info("✅ Stage 2 'best' state loaded successfully.")
-else:
-    if local_rank == 0:
-        logger.info(
-            f"🚨 WARNING: Stage 2 best checkpoint not found at '{checkpoint_path}'. Starting from base weights."
-        )
 
-# Re-initialise every router gate from scratch *after* loading the Stage 2
-# checkpoint. The Stage 2 checkpoint carries gate tensors that were never
-# trained (Stage 2 uses hard routing), so they must be discarded rather than
-# fine-tuned — keeping them collapses routing onto a single expert. This is a
-# deliberate design choice, not a workaround for a load bug.
-if local_rank == 0:
-    logger.info("--- Re-initialising router gates before soft routing ---")
 
-for layer in unwrap_model(llm).model.layers:
-    if hasattr(layer.mlp, "gate"):
-        new_gate = nn.Linear(layer.mlp.d_model, layer.mlp.num_experts, bias=False)
-        # std=0.1 (vs the 0.05 default in MoELayer): a slightly wider init gives
-        # each gate a stronger initial modality preference, which empirically
-        # helps the routers escape the uniform-routing fixed point early on.
-        nn.init.normal_(new_gate.weight, std=0.1)
-        new_gate = new_gate.to(DEVICE)
-        layer.mlp.gate = new_gate
-        layer.mlp.gate.weight.requires_grad = True
+def reinitialise_router_gates(llm: nn.Module, ctx: RunContext) -> None:
+    """Reset every gate from scratch after loading the Stage 2 checkpoint.
 
-# ====================================================================================
-# Verify the expert weights are frozen (only the gate trains in Stage 2.5)
-# ====================================================================================
-if local_rank == 0:
-    logger.info("\n=== Expert Weight Verification ===")
-    sample_layer = unwrap_model(llm).model.layers[0]
-    expert_0_requires_grad = any(p.requires_grad for p in sample_layer.mlp.experts[0].parameters())
-    expert_1_requires_grad = any(p.requires_grad for p in sample_layer.mlp.experts[1].parameters())
-    gate_requires_grad = sample_layer.mlp.gate.weight.requires_grad
+    That checkpoint carries gate tensors that were never trained — Stage 2 uses
+    hard routing — so they are discarded rather than fine-tuned; keeping them
+    collapses routing onto a single expert. This is a deliberate design choice,
+    not a workaround for a load bug.
 
-    logger.info(f"Expert 0 trainable: {expert_0_requires_grad} (should be False)")
-    logger.info(f"Expert 1 trainable: {expert_1_requires_grad} (should be False)")
-    logger.info(f"Gate trainable: {gate_requires_grad} (should be True)")
+    std=0.1 rather than the 0.05 default in MoELayer: a slightly wider init
+    gives each gate a stronger initial modality preference, which empirically
+    helps the routers escape the uniform-routing fixed point.
+    """
+    if ctx.is_main:
+        logger.info("--- Re-initialising router gates before soft routing ---")
 
-    if expert_0_requires_grad or expert_1_requires_grad:
-        raise RuntimeError("❌ Experts are not frozen! This will corrupt training.")
-    if not gate_requires_grad:
-        raise RuntimeError("❌ Router gate is frozen! Cannot train routers.")
+    for layer in unwrap_model(llm).model.layers:
+        if hasattr(layer.mlp, "gate"):
+            new_gate = nn.Linear(layer.mlp.d_model, layer.mlp.num_experts, bias=False)
+            nn.init.normal_(new_gate.weight, std=0.1)
+            layer.mlp.gate = new_gate.to(ctx.device)
+            layer.mlp.gate.weight.requires_grad = True
 
-    logger.info("✅ All weight freeze states correct")
-    logger.info("==================================\n")
 
-# ====================================================================================
-# 6. DATA & OPTIMIZER
-# ====================================================================================
-if local_rank == 0:
-    logger.info("Creating datasets and dataloaders...")
-train_dataset = COCO_Loader(
-    image_dir=paths["image_dir"],
-    annotations_file=paths["annotations_file"],
-    clip_processor=clip_processor,
-    tokenizer=tokenizer,
-    subset_fraction=train_params["subset_fraction"],
-    split="train",
-    seed=loader_params.get("data_seed", 42),  # Fixed seed for reproducibility
-)
-val_dataset = COCO_Loader(
-    image_dir=paths["image_dir"],
-    annotations_file=paths["annotations_file"],
-    clip_processor=clip_processor,
-    tokenizer=tokenizer,
-    subset_fraction=train_params["subset_fraction"],
-    split="val",
-    seed=loader_params.get("data_seed", 42),  # Same seed ensures consistent splits
-)
-train_sampler = DistributedSampler(train_dataset)
-val_sampler = DistributedSampler(val_dataset, shuffle=False)
-train_loader = DataLoader(
-    train_dataset,
-    batch_size=train_params["batch_size"],
-    sampler=train_sampler,
-    num_workers=loader_params["num_workers"],
-    pin_memory=USE_FSDP,
-)
-val_loader = DataLoader(
-    val_dataset,
-    batch_size=train_params["batch_size"],
-    sampler=val_sampler,
-    num_workers=loader_params["num_workers"],
-    pin_memory=USE_FSDP,
-)
+def router_temperature(epoch: int) -> float:
+    """Gumbel-Softmax temperature for this epoch.
 
-# Create optimizer AFTER gates are fixed
-if local_rank == 0:
-    logger.info("Creating optimizer and scheduler with refreshed trainable parameters...")
-accumulation_steps = train_params.get("gradient_accumulation_steps", 1)
-trainable_params = [p for p in llm.parameters() if p.requires_grad]
-optimizer = optim.AdamW(
-    trainable_params,
-    lr=train_params["learning_rate"],
-    weight_decay=train_params["weight_decay"],
-    fused=True,
-)
-scaler = GradScaler(AMP_DEVICE, enabled=USE_FSDP)
-total_steps = (len(train_loader) // accumulation_steps) * NUM_EPOCHS
-scheduler = CosineAnnealingLR(optimizer, T_max=total_steps)
-loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+    Starts at 2.0 and decays towards a floor of 1.0: high temperature softens
+    the routing distribution and encourages exploration early on.
+    """
+    return max(1.0, 2.0 * (0.9**epoch))
 
-# --- 5.2. Resume from Stage 2.5 Checkpoint ---
-start_epoch = 0
-best_val_loss = float("inf")
-latest_checkpoint_path = os.path.join(STAGE2_5_CHECKPOINT_DIR, "llm_stage2_5_latest.pth")
 
-# Have rank 0 check if the 'latest' checkpoint exists
-should_resume = 1.0 if local_rank == 0 and os.path.exists(latest_checkpoint_path) else 0.0
-resume_tensor = torch.tensor([should_resume], dtype=torch.float32).to(DEVICE)
-dist.broadcast(resume_tensor, src=0)
+def apply_router_temperature(llm: nn.Module, temperature: float) -> None:
+    """Push the temperature onto every soft-routing layer.
 
-if resume_tensor.item() == 1.0:
-    if local_rank == 0:
-        logger.debug(f"💾 Resuming training from latest checkpoint: {latest_checkpoint_path}")
-
-    # All ranks load the checkpoint
-    checkpoint = torch.load(latest_checkpoint_path, map_location="cpu")
-    model_state_dict = checkpoint["model_state_dict"]
-
-    with full_state_dict_context(llm, rank0_only=False):
-        llm.load_state_dict(model_state_dict, strict=False)
-
-    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-
-    # Update epoch and best_val_loss from the checkpoint to continue correctly
-    start_epoch = checkpoint["epoch"] + 1
-    best_val_loss = checkpoint.get("best_val_loss", float("inf"))
-
-    del checkpoint
-    del model_state_dict
-    gc.collect()
-
-    dist.barrier()
-    if local_rank == 0:
-        logger.info(f"✅ Resumed successfully. Starting from epoch {start_epoch}.")
-else:
-    if local_rank == 0:
-        logger.info("🏁 No 'latest' checkpoint found. Starting training from scratch.")
-
-# --- 5.3. Finalize Model Setup ---
-llm.model.embed_tokens.to(DEVICE)
-# Gradient checkpointing is intentionally left disabled: combined with FSDP and
-# the MoE layer's per-rank dummy expert pass it produced unstable activations.
-# Stage 2.5 only trains the small gate, so the memory saving is not needed.
-vision_connector = VisionLanguageConnector(
-    clip_hidden_size=vision_encoder.config.hidden_size,
-    llm_hidden_size=llm.config.hidden_size,
-).to(DEVICE)
-vision_connector.load_state_dict(
-    torch.load(
-        os.path.join(OUTPUT_DIR, "vision_connector_stage1_best.pth"),
-        map_location=DEVICE,
-    )
-)
-for param in vision_encoder.parameters():
-    param.requires_grad = False
-for param in vision_connector.parameters():
-    param.requires_grad = False
-
-if local_rank == 0:
-    logger.info(
-        f"Optimizing {sum(p.numel() for p in trainable_params)} trainable router parameters."
-    )
-
-metrics_history = {
-    "epoch": [],
-    "train_loss": [],
-    "train_ce_loss": [],
-    "train_lb_loss": [],
-    "val_loss": [],
-    "learning_rate": [],
-    "entropy": [],
-    "temperature": [],
-}
-metrics_path = os.path.join(OUTPUT_DIR, "training_metrics_stage2.5.json")
-if local_rank == 0 and start_epoch > 0 and os.path.exists(metrics_path):
-    with open(metrics_path, "r") as f:
-        metrics_history = json.load(f)
-
-# Optional: Verification block to confirm gate shapes are correct before training
-if local_rank == 0:
-    logger.info("--- Verifying Gate Parameter Shapes Before Training ---")
-    for i, layer in enumerate(unwrap_model(llm).model.layers):
-        if hasattr(layer.mlp, "gate") and hasattr(layer.mlp.gate, "weight"):
-            logger.info(f"  Layer {i} gate shape: {tuple(layer.mlp.gate.weight.shape)}")
-    logger.info("---------------------------------------------------------")
-
-# ====================================================================================
-# 8. TRAINING LOOP
-# ====================================================================================
-if local_rank == 0:
-    logger.info(f"🚀 Starting Stage 2.5 training from epoch {start_epoch}...")
-for epoch in range(start_epoch, NUM_EPOCHS):
-    train_sampler.set_epoch(epoch)
-    llm.train()
-
-    # Temperature annealing: Start high (exploration) -> decay to 1.0 (exploitation)
-    # High temperature = softer probabilities = more exploration
-    temperature = max(1.0, 2.0 * (0.9**epoch))  # Starts at 2.0, decays to 1.0
-
-    # Set temperature for all MoE layers
+    ``MoELayer.forward`` reads ``_forward_temperature``; ``temperature`` is set
+    too because the analysis scripts read that name.
+    """
     for layer in unwrap_model(llm).model.layers:
         if hasattr(layer.mlp, "temperature"):
             layer.mlp.temperature = temperature
+        if getattr(layer.mlp, "routing_mode", None) == "soft":
+            layer.mlp._forward_temperature = temperature
 
-    if local_rank == 0 and epoch == start_epoch:
-        logger.info(f"  Router temperature for epoch {epoch + 1}: {temperature:.3f}")
 
-    total_train_loss, total_ce_loss, total_lb_loss = 0, 0, 0
-    epoch_entropy_sum, epoch_entropy_batches = 0.0, 0
-    optimizer.zero_grad()
+def router_regularisers(
+    setup: Stage25Setup, combined_embeddings: torch.Tensor
+) -> tuple[torch.Tensor | int, torch.Tensor | int]:
+    """Sum the load-balancing loss and the entropy bonus across layers.
 
-    for i, (images, input_ids, attention_mask) in enumerate(train_loader):
-        images, input_ids, attention_mask = (
-            images.to(DEVICE),
-            input_ids.to(DEVICE),
-            attention_mask.to(DEVICE),
-        )
+    Both are summed, not averaged — that is what enters the objective. The
+    reported entropy divides by the layer count so it stays a per-layer mean
+    within [0, ln(num_experts)].
+    """
+    total_load_balancing_loss: torch.Tensor | int = 0
+    total_entropy_bonus: torch.Tensor | int = 0
 
-        with autocast(device_type=AMP_DEVICE, dtype=torch.bfloat16, enabled=USE_FSDP):
+    for layer in unwrap_model(setup.llm).model.layers:
+        if hasattr(layer.mlp, "load_balancing_loss"):
+            total_load_balancing_loss += layer.mlp.load_balancing_loss
+
+        if hasattr(layer.mlp, "gate"):
+            gate_logits = layer.mlp.gate(combined_embeddings.view(-1, setup.hidden_size))
+            gate_probs = torch.softmax(gate_logits, dim=-1)
+            entropy = -(gate_probs * torch.log(gate_probs + 1e-10)).sum(dim=-1).mean()
+            total_entropy_bonus += entropy
+
+    return total_load_balancing_loss, total_entropy_bonus
+
+
+def clip_router_gradients(llm: nn.Module) -> None:
+    """Clip the gate gradients, loosely."""
+    router_params = [
+        param
+        for name, param in llm.named_parameters()
+        if "mlp.gate" in name and param.requires_grad
+    ]
+    if router_params:
+        torch.nn.utils.clip_grad_norm_(router_params, max_norm=ROUTER_GRAD_CLIP)
+
+
+def log_router_analysis(
+    setup: Stage25Setup,
+    combined_embeddings: torch.Tensor,
+    input_ids: torch.Tensor,
+    num_visual: int,
+    epoch: int,
+    batch: int,
+) -> None:
+    """Compare how a sample visual and text token route, at a few layers.
+
+    The specialisation score is the gap between the two — near zero means the
+    router is ignoring modality, which is exactly the collapse this stage exists
+    to prevent.
+    """
+    layers = unwrap_model(setup.llm).model.layers
+    # First, middle and last layer of whatever depth the model actually has.
+    sample_layers = sorted({0, len(layers) // 2, len(layers) - 1})
+
+    with torch.no_grad():
+        visual_idx = num_visual // 2
+        visual_hidden = combined_embeddings[0:1, visual_idx : visual_idx + 1, :].float()
+        text_idx = num_visual + (input_ids.shape[1] // 2)
+        text_hidden = combined_embeddings[0:1, text_idx : text_idx + 1, :].float()
+
+        logger.info("\n%s", "=" * 60)
+        logger.info("Router Analysis - Batch %d | Epoch %d", batch, epoch + 1)
+        logger.info("%s", "=" * 60)
+
+        for layer_idx in sample_layers:
+            gate = getattr(layers[layer_idx].mlp, "gate", None)
+            if gate is None:
+                continue
+            visual_probs = torch.softmax(gate(visual_hidden.view(-1, setup.hidden_size)), dim=-1)
+            text_probs = torch.softmax(gate(text_hidden.view(-1, setup.hidden_size)), dim=-1)
+            specialisation = abs(visual_probs[0, 0] - text_probs[0, 0]).item()
+
+            logger.info("\nLayer %2d:", layer_idx)
+            logger.info(
+                "  Visual token -> E0: %.3f, E1: %.3f", visual_probs[0, 0], visual_probs[0, 1]
+            )
+            logger.info("  Text   token -> E0: %.3f, E1: %.3f", text_probs[0, 0], text_probs[0, 1])
+            logger.info(
+                "  Specialisation score: %.3f (%s)",
+                specialisation,
+                "GOOD" if specialisation > 0.3 else "WEAK",
+            )
+        logger.info("%s\n", "=" * 60)
+
+
+def train_one_epoch(
+    setup: Stage25Setup, ctx: RunContext, epoch: int, num_epochs: int
+) -> tuple[float, float, float, float, float]:
+    """Train the router for one epoch.
+
+    Returns the mean total, cross-entropy, load-balancing and entropy values,
+    plus the temperature used.
+    """
+    setup.train_sampler.set_epoch(epoch)
+    setup.llm.train()
+
+    temperature = router_temperature(epoch)
+    apply_router_temperature(setup.llm, temperature)
+    if ctx.is_main:
+        logger.info("  Router temperature for epoch %d: %.3f", epoch + 1, temperature)
+
+    total_train_loss = total_ce_loss = total_lb_loss = 0.0
+    entropy_sum, entropy_batches = 0.0, 0
+    setup.optimizer.zero_grad()
+
+    # Decays over epochs: explore first, allow specialisation later.
+    entropy_coeff = 0.001 * (0.95**epoch)
+
+    for i, (images, input_ids, attention_mask) in enumerate(setup.train_loader):
+        images = images.to(ctx.device)
+        input_ids = input_ids.to(ctx.device)
+        attention_mask = attention_mask.to(ctx.device)
+
+        with autocast(device_type=ctx.amp_device, dtype=torch.bfloat16, enabled=ctx.on_gpu):
+            # Everything upstream of the router is frozen in this stage.
             with torch.no_grad():
-                patch_embeddings = vision_encoder(images).last_hidden_state
-                visual_soft_tokens = vision_connector(patch_embeddings)
-                text_embeddings = llm.model.embed_tokens(input_ids)
+                patch_embeddings = setup.vision_encoder(images).last_hidden_state
+                visual_soft_tokens = setup.vision_connector(patch_embeddings)
+                text_embeddings = setup.llm.model.embed_tokens(input_ids)
 
-            combined_embeddings = torch.cat([visual_soft_tokens, text_embeddings], dim=1)
-            combined_attention_mask = torch.cat(
-                [
-                    torch.ones(visual_soft_tokens.shape[:2], device=DEVICE),
-                    attention_mask,
-                ],
-                dim=1,
+            combined_embeddings, combined_attention_mask = combine_sequence(
+                visual_soft_tokens, text_embeddings, attention_mask, ctx
             )
+            apply_router_temperature(setup.llm, temperature)
 
-            # Pass temperature to MoE layers through forward hooks
-            # Note: LLM doesn't directly accept temperature, so we set it as layer attribute
-            for layer in unwrap_model(llm).model.layers:
-                if hasattr(layer.mlp, "routing_mode") and layer.mlp.routing_mode == "soft":
-                    # Store temperature for this forward pass
-                    layer.mlp._forward_temperature = temperature
-
-            outputs = llm(
-                inputs_embeds=combined_embeddings,
-                attention_mask=combined_attention_mask,
+            outputs = setup.llm(
+                inputs_embeds=combined_embeddings, attention_mask=combined_attention_mask
             )
-            logits = outputs.logits
-
-            num_visual_tokens = visual_soft_tokens.shape[1]
-            text_logits = logits[..., num_visual_tokens:-1, :].contiguous()
-            text_labels = input_ids[..., 1:].contiguous()
-            ce_loss = loss_fn(text_logits.view(-1, llm.config.vocab_size), text_labels.view(-1))
-
-            total_load_balancing_loss = 0
-            total_entropy_bonus = 0
-            for layer in unwrap_model(llm).model.layers:
-                if hasattr(layer.mlp, "load_balancing_loss"):
-                    total_load_balancing_loss += layer.mlp.load_balancing_loss
-
-                # Add entropy bonus to encourage exploration
-                if hasattr(layer.mlp, "gate"):
-                    # Get routing logits for current batch
-                    gate_logits = layer.mlp.gate(
-                        combined_embeddings.view(-1, llm.config.hidden_size)
-                    )
-                    gate_probs = torch.softmax(gate_logits, dim=-1)
-                    # Entropy = -sum(p * log(p)). Higher entropy = more exploration
-                    entropy = -(gate_probs * torch.log(gate_probs + 1e-10)).sum(dim=-1).mean()
-                    total_entropy_bonus += entropy
-
-            # Entropy coefficient: negative because we want to MAXIMIZE entropy (minimize negative entropy)
-            # Start with small coefficient and decay over time to allow specialization later
-            entropy_coeff = 0.001 * (0.95**epoch)  # Decays from 0.001 to ~0.0003 over 20 epochs
+            ce_loss = shifted_caption_loss(
+                setup.loss_fn,
+                outputs.logits,
+                visual_soft_tokens.shape[1],
+                input_ids,
+                setup.vocab_size,
+                device=ctx.device,
+            )
+            load_balancing_loss, entropy_bonus = router_regularisers(setup, combined_embeddings)
 
             loss = (
                 ce_loss
-                + LOAD_BALANCING_COEFF * total_load_balancing_loss
-                - entropy_coeff * total_entropy_bonus  # Negative = maximize entropy
-            ) / accumulation_steps
+                + setup.load_balancing_coeff * load_balancing_loss
+                - entropy_coeff * entropy_bonus  # negative: the bonus is maximised
+            ) / setup.accumulation_steps
 
-        scaler.scale(loss).backward()
+        setup.scaler.scale(loss).backward()
 
-        if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):
-            # Step 1: Unscale gradients
-            scaler.unscale_(optimizer)
-
-            # Step 2: Collect all router parameters and compute their norm BEFORE clipping
-            router_params = []
-            for name, param in llm.named_parameters():
-                if "mlp.gate" in name and param.requires_grad:  # ← Remove grad check
-                    router_params.append(param)
-
-            if router_params:
-                # Compute the ACTUAL gradient norm before clipping
-                total_norm = 0.0
-                for p in router_params:
-                    if p.grad is not None:  # ← Add this check
-                        param_norm = p.grad.detach().data.norm(2)
-                        total_norm += param_norm.item() ** 2
-                total_norm = total_norm**0.5
-
-                # Now clip the gradients - use MUCH higher threshold
-                clipped_norm = torch.nn.utils.clip_grad_norm_(
-                    router_params,
-                    max_norm=10.0,  # Increased from 1.0 to 10.0
-                )
-
-            # Step 3: Update optimizer
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-            scheduler.step()
+        if (i + 1) % setup.accumulation_steps == 0 or (i + 1) == len(setup.train_loader):
+            setup.scaler.unscale_(setup.optimizer)
+            clip_router_gradients(setup.llm)
+            setup.scaler.step(setup.optimizer)
+            setup.scaler.update()
+            setup.optimizer.zero_grad()
+            setup.scheduler.step()
 
         if loss.item() > 0:
-            total_train_loss += loss.item() * accumulation_steps
+            total_train_loss += loss.item() * setup.accumulation_steps
             total_ce_loss += ce_loss.item()
-            if isinstance(total_load_balancing_loss, torch.Tensor):
-                total_lb_loss += total_load_balancing_loss.item()
-            if isinstance(total_entropy_bonus, torch.Tensor):
-                # total_entropy_bonus is summed over layers for the loss term;
-                # divide by the layer count so the *reported* value is a mean
-                # per-layer entropy and stays within [0, ln(num_experts)].
-                epoch_entropy_sum += total_entropy_bonus.item() / num_moe_layers
-                epoch_entropy_batches += 1
+            if isinstance(load_balancing_loss, torch.Tensor):
+                total_lb_loss += load_balancing_loss.item()
+            if isinstance(entropy_bonus, torch.Tensor):
+                # Summed over layers for the loss; divide so the reported value
+                # is a per-layer mean bounded by ln(num_experts).
+                entropy_sum += entropy_bonus.item() / setup.num_moe_layers
+                entropy_batches += 1
 
-        # ====================================================================================
-        # SOLUTION 3: ROUTER MONITORING (Enhanced with modality-specific routing)
-        # ====================================================================================
-        if local_rank == 0 and (i + 1) % 500 == 0:
-            # Monitor routing decisions for first layer
-            with torch.no_grad():
-                num_visual = visual_soft_tokens.shape[1]
+        if ctx.is_main and (i + 1) % ROUTER_MONITOR_EVERY == 0:
+            log_router_analysis(
+                setup,
+                combined_embeddings,
+                input_ids,
+                visual_soft_tokens.shape[1],
+                epoch,
+                i + 1,
+            )
+        if ctx.is_main and (i + 1) % 100 == 0:
+            logger.info("  Epoch %d, Batch [%d/%d]", epoch + 1, i + 1, len(setup.train_loader))
 
-                # Sample visual token (middle of visual sequence)
-                visual_idx = num_visual // 2
-                visual_hidden = combined_embeddings[0:1, visual_idx : visual_idx + 1, :]
-
-                # Sample text token (middle of text sequence)
-                text_idx = num_visual + (input_ids.shape[1] // 2)
-                text_hidden = combined_embeddings[0:1, text_idx : text_idx + 1, :]
-
-                logger.info(f"\n{'=' * 60}")
-                logger.info(f"Router Analysis - Batch {i + 1} | Epoch {epoch + 1}")
-                logger.info(f"{'=' * 60}")
-
-                for layer_idx in [0, 15, 31]:  # First, middle, last
-                    check_layer = unwrap_model(llm).model.layers[layer_idx]
-                    if hasattr(check_layer.mlp, "gate"):
-                        # Convert to float32 to match gate weights dtype
-                        visual_hidden_fp32 = visual_hidden.float()
-                        text_hidden_fp32 = text_hidden.float()
-
-                        # Visual token routing
-                        visual_logits = check_layer.mlp.gate(
-                            visual_hidden_fp32.view(-1, llm.config.hidden_size)
-                        )
-                        visual_probs = torch.softmax(visual_logits, dim=-1)
-
-                        # Text token routing
-                        text_logits = check_layer.mlp.gate(
-                            text_hidden_fp32.view(-1, llm.config.hidden_size)
-                        )
-                        text_probs = torch.softmax(text_logits, dim=-1)
-
-                        logger.info(f"\nLayer {layer_idx:2d}:")
-                        logger.info(
-                            f"  Visual Token -> E0: {visual_probs[0, 0]:.3f}, E1: {visual_probs[0, 1]:.3f} ({'✓E0' if visual_probs[0, 0] > 0.6 else '✓E1' if visual_probs[0, 1] > 0.6 else 'MIXED'})"
-                        )
-                        logger.info(
-                            f"  Text   Token -> E0: {text_probs[0, 0]:.3f}, E1: {text_probs[0, 1]:.3f} ({'✓E0' if text_probs[0, 0] > 0.6 else '✓E1' if text_probs[0, 1] > 0.6 else 'MIXED'})"
-                        )
-
-                        # Calculate specialization score (how different are the routings?)
-                        specialization = abs(visual_probs[0, 0] - text_probs[0, 0]).item()
-                        logger.info(
-                            f"  Specialization score: {specialization:.3f} ({'GOOD' if specialization > 0.3 else 'WEAK'})"
-                        )
-
-                logger.info(f"{'=' * 60}\n")
-
-        if local_rank == 0 and (i + 1) % 100 == 0:
-            logger.info(f"  Epoch {epoch + 1}, Batch [{i + 1}/{len(train_loader)}]")
-
-    avg_train_loss = total_train_loss / len(train_loader)
-    avg_ce_loss = total_ce_loss / len(train_loader)
-    avg_lb_loss = total_lb_loss / len(train_loader)
-
-    # Mean per-layer routing entropy over the epoch, bounded by ln(num_experts).
-    avg_entropy = epoch_entropy_sum / epoch_entropy_batches if epoch_entropy_batches else 0
-
-    if local_rank == 0:
+    batches = len(setup.train_loader)
+    avg_entropy = entropy_sum / entropy_batches if entropy_batches else 0.0
+    if ctx.is_main:
         logger.info(
-            f"Epoch [{epoch + 1}/{NUM_EPOCHS}] - Training Loss: {avg_train_loss:.4f} | CE Loss: {avg_ce_loss:.4f} | "
-            f"LB Loss: {avg_lb_loss:.4f} | Entropy: {avg_entropy:.4f} | Temp: {temperature:.3f}"
+            "Epoch [%d/%d] - Training Loss: %.4f | CE Loss: %.4f | LB Loss: %.4f | "
+            "Entropy: %.4f | Temp: %.3f",
+            epoch + 1,
+            num_epochs,
+            total_train_loss / batches,
+            total_ce_loss / batches,
+            total_lb_loss / batches,
+            avg_entropy,
+            temperature,
         )
+    return (
+        total_train_loss / batches,
+        total_ce_loss / batches,
+        total_lb_loss / batches,
+        avg_entropy,
+        temperature,
+    )
 
-    # --- Validation Phase ---
-    llm.eval()
-    total_val_loss = 0
+
+def run_validation(setup: Stage25Setup, ctx: RunContext, epoch: int, num_epochs: int) -> float:
+    """Validate on a capped number of batches; each rank keeps its own average."""
+    setup.llm.eval()
+    total_val_loss = 0.0
     val_steps = 0
-    MAX_VAL_BATCHES = 75  # DRASTICALLY reduced to prevent timeout
 
-    if local_rank == 0:
-        logger.info(f"  Starting validation (max {MAX_VAL_BATCHES} batches per GPU)...")
+    if ctx.is_main:
+        logger.info("  Starting validation (max %d batches per GPU)...", MAX_VAL_BATCHES)
 
     with torch.no_grad():
-        for i, (images, input_ids, attention_mask) in enumerate(val_loader):
-            # Early stop after MAX_VAL_BATCHES
+        for i, (images, input_ids, attention_mask) in enumerate(setup.val_loader):
             if i >= MAX_VAL_BATCHES:
                 break
 
-            images, input_ids, attention_mask = (
-                images.to(DEVICE),
-                input_ids.to(DEVICE),
-                attention_mask.to(DEVICE),
-            )
+            images = images.to(ctx.device)
+            input_ids = input_ids.to(ctx.device)
+            attention_mask = attention_mask.to(ctx.device)
 
             try:
-                with autocast(device_type=AMP_DEVICE, dtype=torch.bfloat16, enabled=USE_FSDP):
-                    patch_embeddings = vision_encoder(images).last_hidden_state
-                    visual_soft_tokens = vision_connector(patch_embeddings)
-                    text_embeddings = llm.model.embed_tokens(input_ids)
-                    combined_embeddings = torch.cat([visual_soft_tokens, text_embeddings], dim=1)
-                    combined_attention_mask = torch.cat(
-                        [
-                            torch.ones(visual_soft_tokens.shape[:2], device=DEVICE),
-                            attention_mask,
-                        ],
-                        dim=1,
+                with autocast(device_type=ctx.amp_device, dtype=torch.bfloat16, enabled=ctx.on_gpu):
+                    patch_embeddings = setup.vision_encoder(images).last_hidden_state
+                    visual_soft_tokens = setup.vision_connector(patch_embeddings)
+                    text_embeddings = setup.llm.model.embed_tokens(input_ids)
+                    combined_embeddings, combined_attention_mask = combine_sequence(
+                        visual_soft_tokens, text_embeddings, attention_mask, ctx
                     )
-                    outputs = llm(
+                    outputs = setup.llm(
                         inputs_embeds=combined_embeddings,
                         attention_mask=combined_attention_mask,
                     )
-                    logits = outputs.logits
-                    num_visual_tokens = visual_soft_tokens.shape[1]
-                    text_logits = logits[..., num_visual_tokens:-1, :].contiguous()
-                    text_labels = input_ids[..., 1:].contiguous()
-                    loss = loss_fn(
-                        text_logits.view(-1, llm.config.vocab_size), text_labels.view(-1)
+                    loss = shifted_caption_loss(
+                        setup.loss_fn,
+                        outputs.logits,
+                        visual_soft_tokens.shape[1],
+                        input_ids,
+                        setup.vocab_size,
+                        device=ctx.device,
                     )
                 total_val_loss += loss.item()
                 val_steps += 1
-            except Exception as e:
-                if local_rank == 0:
-                    logger.debug(f"⚠️  Validation batch {i} failed: {e}")
+            except Exception as exc:  # noqa: BLE001 - a bad batch must not kill the run
+                if ctx.is_main:
+                    logger.debug("⚠️  Validation batch %d failed: %s", i, exc)
                 break
 
-    # Each rank computed its own average - just use local average (no distributed aggregation)
     avg_val_loss = total_val_loss / val_steps if val_steps > 0 else float("inf")
-
-    if local_rank == 0:
+    if ctx.is_main:
         logger.info(
-            f"Epoch [{epoch + 1}/{NUM_EPOCHS}] - Validation Loss: {avg_val_loss:.4f} (rank 0, {val_steps} batches)"
+            "Epoch [%d/%d] - Validation Loss: %.4f (rank 0, %d batches)",
+            epoch + 1,
+            num_epochs,
+            avg_val_loss,
+            val_steps,
         )
+    return avg_val_loss
 
-    # --- Metrics and Checkpoint Saving ---
-    if local_rank == 0:
-        metrics_history["epoch"].append(epoch + 1)
-        metrics_history["train_loss"].append(avg_train_loss)
-        metrics_history["train_ce_loss"].append(avg_ce_loss)
-        metrics_history["train_lb_loss"].append(avg_lb_loss)
-        metrics_history["val_loss"].append(avg_val_loss)
-        metrics_history["learning_rate"].append(optimizer.param_groups[0]["lr"])
-        metrics_history["entropy"].append(avg_entropy)
-        metrics_history["temperature"].append(temperature)
-        with open(metrics_path, "w") as f:
-            json.dump(metrics_history, f, indent=4)
-        logger.info(f"✅ Metrics saved to {metrics_path}")
 
-    with full_state_dict_context(llm, rank0_only=True):
-        full_state_dict = llm.state_dict()
+def save_checkpoints(
+    setup: Stage25Setup,
+    ctx: RunContext,
+    checkpoint_dir: str,
+    epoch: int,
+    avg_val_loss: float,
+    best_val_loss: float,
+) -> float:
+    """Save the trained router weights. Returns the best validation loss.
 
-    if local_rank == 0:
-        # Get only the trainable router weights for the checkpoint
-        router_weights = {}
-        for name, weight in full_state_dict.items():
-            param = llm.get_parameter(name)
-            if param.requires_grad:
-                router_weights[name] = weight
+    Only the trainable parameters are stored: the experts are unchanged from
+    Stage 2, so repeating them would triple the checkpoint for nothing.
+    """
+    # Gathering sharded parameters is collective — every rank must enter.
+    with full_state_dict_context(setup.llm, rank0_only=True):
+        full_state_dict = setup.llm.state_dict()
 
-        # Create a single consolidated checkpoint for this epoch
-        consolidated_checkpoint = {
+    if ctx.is_main:
+        router_weights = {
+            name: weight
+            for name, weight in full_state_dict.items()
+            if setup.llm.get_parameter(name).requires_grad
+        }
+        checkpoint = {
             "model_state_dict": router_weights,
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
+            "optimizer_state_dict": setup.optimizer.state_dict(),
+            "scheduler_state_dict": setup.scheduler.state_dict(),
             "epoch": epoch,
             "best_val_loss": best_val_loss,
             "current_val_loss": avg_val_loss,
         }
 
-        os.makedirs(STAGE2_5_CHECKPOINT_DIR, exist_ok=True)
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        torch.save(checkpoint, os.path.join(checkpoint_dir, "llm_stage2_5_latest.pth"))
 
-        # 1. Save this as the 'latest' checkpoint, overwriting the previous one
-        latest_checkpoint_path = os.path.join(STAGE2_5_CHECKPOINT_DIR, "llm_stage2_5_latest.pth")
-        torch.save(consolidated_checkpoint, latest_checkpoint_path)
-        logger.debug(f"💾 Saved latest checkpoint to {latest_checkpoint_path}")
-
-        # 2. Check if this is the 'best' model and save it if so
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            # Update the best_val_loss in the checkpoint before saving as 'best'
-            consolidated_checkpoint["best_val_loss"] = best_val_loss
+            checkpoint["best_val_loss"] = best_val_loss
+            best_path = os.path.join(checkpoint_dir, "llm_stage2_5_best.pth")
+            torch.save(checkpoint, best_path)
+            logger.info("🏆 New best model! Val loss: %.4f. Saved to %s", avg_val_loss, best_path)
+    return best_val_loss
 
-            best_checkpoint_path = os.path.join(STAGE2_5_CHECKPOINT_DIR, "llm_stage2_5_best.pth")
-            torch.save(consolidated_checkpoint, best_checkpoint_path)
-            logger.info(
-                f"🏆 New best model! Val loss: {avg_val_loss:.4f}. Saved to {best_checkpoint_path}"
-            )
 
-    # Removed barrier - not needed since only rank 0 saves checkpoints
+def resume_from_checkpoint(
+    setup: Stage25Setup, checkpoint_dir: str, ctx: RunContext
+) -> tuple[int, float]:
+    """Restore router, optimiser and scheduler state if a checkpoint exists."""
+    latest_path = os.path.join(checkpoint_dir, "llm_stage2_5_latest.pth")
+    if not broadcast_flag(os.path.exists(latest_path), ctx):
+        if ctx.is_main:
+            logger.info("🏁 No 'latest' checkpoint found. Starting training from scratch.")
+        return 0, float("inf")
 
-dist.destroy_process_group()
-logger.info("Job finished.")
+    if ctx.is_main:
+        logger.debug("💾 Resuming training from %s", latest_path)
+
+    checkpoint = torch.load(latest_path, map_location="cpu")
+    with full_state_dict_context(setup.llm, rank0_only=False):
+        setup.llm.load_state_dict(checkpoint["model_state_dict"], strict=False)
+    setup.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    setup.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+
+    start_epoch = checkpoint["epoch"] + 1
+    best_val_loss = checkpoint.get("best_val_loss", float("inf"))
+
+    del checkpoint
+    gc.collect()
+    dist.barrier()
+
+    if ctx.is_main:
+        logger.info("✅ Resumed successfully. Starting from epoch %d.", start_epoch)
+    return start_epoch, best_val_loss
+
+
+def build_setup(
+    paths: dict[str, Any],
+    train_params: dict[str, Any],
+    loader_params: dict[str, Any],
+    num_epochs: int,
+    ctx: RunContext,
+) -> Stage25Setup:
+    """Assemble every component the epoch loop needs, in dependency order."""
+    output_dir = paths["output_dir"]
+    stage2_checkpoint_dir = os.path.join(output_dir, "stage2_checkpoints")
+
+    vision_encoder, clip_processor, tokenizer, _ = build_backbones(paths, ctx)
+    llm = build_moe_llm(paths, ctx)
+
+    vocab_size = llm.config.vocab_size
+    hidden_size = llm.config.hidden_size
+    num_moe_layers = sum(1 for layer in llm.model.layers if hasattr(layer.mlp, "gate"))
+
+    # Stage 2.5 shards without parameter offloading.
+    llm = wrap_with_fsdp(llm, ctx, offload_params=None)
+    load_stage2_experts(llm, stage2_checkpoint_dir, ctx)
+    reinitialise_router_gates(llm, ctx)
+
+    # Gradient checkpointing is intentionally left disabled: combined with FSDP
+    # and the MoE layer's per-rank dummy expert pass it produced unstable
+    # activations, and only the small gate trains here anyway.
+    vision_connector = build_vision_connector(vision_encoder, llm, ctx, trainable=False)
+    stage1_path = os.path.join(output_dir, "vision_connector_stage1_best.pth")
+    vision_connector.load_state_dict(torch.load(stage1_path, map_location=ctx.device))
+
+    if ctx.is_main:
+        logger.info("Creating datasets and dataloaders...")
+    common = {
+        "image_dir": paths["image_dir"],
+        "annotations_file": paths["annotations_file"],
+        "clip_processor": clip_processor,
+        "tokenizer": tokenizer,
+        "subset_fraction": train_params["subset_fraction"],
+        "seed": loader_params.get("data_seed", 42),
+    }
+    train_loader, val_loader, train_sampler = build_distributed_loaders(
+        COCO_Loader(split="train", **common),
+        COCO_Loader(split="val", **common),
+        train_params,
+        loader_params,
+        ctx,
+    )
+
+    accumulation_steps = train_params.get("gradient_accumulation_steps", 1)
+    trainable_params = [p for p in llm.parameters() if p.requires_grad]
+    optimizer = optim.AdamW(
+        trainable_params,
+        lr=train_params["learning_rate"],
+        weight_decay=train_params["weight_decay"],
+    )
+    scaler = GradScaler(ctx.amp_device, enabled=ctx.on_gpu)
+    scheduler = CosineAnnealingLR(
+        optimizer, T_max=(len(train_loader) // accumulation_steps) * num_epochs
+    )
+    loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+
+    if ctx.is_main:
+        logger.info(
+            "Optimizing %d trainable router parameters.",
+            sum(p.numel() for p in trainable_params),
+        )
+
+    return Stage25Setup(
+        llm=llm,
+        vision_encoder=vision_encoder,
+        vision_connector=vision_connector,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        train_sampler=train_sampler,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        loss_fn=loss_fn,
+        accumulation_steps=accumulation_steps,
+        vocab_size=vocab_size,
+        hidden_size=hidden_size,
+        num_moe_layers=num_moe_layers,
+        load_balancing_coeff=train_params.get("load_balancing_coeff", 0.01),
+    )
+
+
+def main() -> None:
+    """Assemble the Stage 2.5 run and drive the epoch loop."""
+    register_moe_model()
+
+    config = load_config()
+    paths = config["paths"]
+    train_params = config["training_stage2.5"]
+    loader_params = config["dataloader"]
+    num_epochs = train_params["num_epochs"]
+    output_dir = paths["output_dir"]
+    checkpoint_dir = os.path.join(output_dir, "stage2_5_checkpoints")
+
+    ctx = build_run_context(
+        distributed=True,
+        seed=loader_params.get("data_seed", 42),
+        stage_name="Stage 2.5",
+    )
+    if ctx.is_main:
+        logger.info("--- Initializing Stage 2.5 Training (Training the Router) ---")
+
+    setup = build_setup(paths, train_params, loader_params, num_epochs, ctx)
+    start_epoch, best_val_loss = resume_from_checkpoint(setup, checkpoint_dir, ctx)
+
+    metrics_path = os.path.join(output_dir, "training_metrics_stage2.5.json")
+    metrics_history: dict[str, list] = {
+        "epoch": [],
+        "train_loss": [],
+        "train_ce_loss": [],
+        "train_lb_loss": [],
+        "val_loss": [],
+        "learning_rate": [],
+        "entropy": [],
+        "temperature": [],
+    }
+    if ctx.is_main and start_epoch > 0 and os.path.exists(metrics_path):
+        with open(metrics_path) as f:
+            metrics_history = json.load(f)
+
+    if ctx.is_main:
+        logger.info("🚀 Starting Stage 2.5 training from epoch %d...", start_epoch)
+
+    for epoch in range(start_epoch, num_epochs):
+        train_loss, ce_loss, lb_loss, entropy, temperature = train_one_epoch(
+            setup, ctx, epoch, num_epochs
+        )
+        avg_val_loss = run_validation(setup, ctx, epoch, num_epochs)
+
+        if ctx.is_main:
+            metrics_history["epoch"].append(epoch + 1)
+            metrics_history["train_loss"].append(train_loss)
+            metrics_history["train_ce_loss"].append(ce_loss)
+            metrics_history["train_lb_loss"].append(lb_loss)
+            metrics_history["val_loss"].append(avg_val_loss)
+            metrics_history["learning_rate"].append(setup.optimizer.param_groups[0]["lr"])
+            metrics_history["entropy"].append(entropy)
+            metrics_history["temperature"].append(temperature)
+            with open(metrics_path, "w") as f:
+                json.dump(metrics_history, f, indent=4)
+            logger.info("✅ Metrics saved to %s", metrics_path)
+
+        best_val_loss = save_checkpoints(
+            setup, ctx, checkpoint_dir, epoch, avg_val_loss, best_val_loss
+        )
+
+    teardown()
+    logger.info("Job finished.")
+
+
+if __name__ == "__main__":
+    main()

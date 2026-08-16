@@ -23,7 +23,6 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from functools import partial
 from typing import Any
 
 import torch
@@ -31,35 +30,35 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
 from torch.amp import GradScaler, autocast
-from torch.distributed.fsdp import CPUOffload
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from transformers import (
     AutoModelForCausalLM,
-    AutoProcessor,
-    AutoTokenizer,
-    CLIPVisionModel,
 )
-from transformers.models.mistral.modeling_mistral import MistralMLP
 
 from data import COCO_Loader, LLaVA_Loader
-from models import VisionLanguageConnector
 from models.utils.common import (
     full_state_dict_context,
     get_attn_implementation,
     get_model_dtype,
-    init_distributed,
     load_config,
     register_moe_model,
-    set_seed,
-    setup_logging,
-    supports_fsdp,
     unwrap_model,
 )
-from training_scripts._lib import ExpertUsageTracker, save_expert_metrics
+from training_scripts._lib import (
+    ExpertUsageTracker,
+    RunContext,
+    build_backbones,
+    build_distributed_loaders,
+    build_run_context,
+    build_vision_connector,
+    combine_sequence,
+    move_batch,
+    save_expert_metrics,
+    teardown,
+    wrap_with_fsdp,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -71,20 +70,6 @@ NUM_EXPERTS = 2
 
 
 # ====================================================================================
-@dataclass(frozen=True)
-class RunContext:
-    """Where this process runs and how it talks to its peers."""
-
-    device: str | int
-    amp_device: str
-    use_fsdp: bool
-    local_rank: int
-
-    @property
-    def is_main(self) -> bool:
-        return self.local_rank == 0
-
-
 @dataclass
 class TrainingSetup:
     """Everything the epoch loop needs, assembled once before training."""
@@ -104,30 +89,6 @@ class TrainingSetup:
     vocab_size: int
     num_visual_tokens: int
     accumulation_steps: int
-
-
-def build_backbones(paths: dict[str, Any], ctx: RunContext) -> tuple[Any, Any, Any, int]:
-    """Load the frozen CLIP tower, its processor and the tokenizer.
-
-    Returns the vision encoder, CLIP processor, tokenizer and the number of
-    visual tokens the tower emits (patch grid plus CLS — 257 for ViT-L/14 at
-    224px, fewer for the demo's tiny tower).
-    """
-    if ctx.is_main:
-        logger.info("Loading foundational models...")
-
-    vision_encoder = CLIPVisionModel.from_pretrained(paths["clip_local_path"]).to(ctx.device)
-    num_visual_tokens = (
-        vision_encoder.config.image_size // vision_encoder.config.patch_size
-    ) ** 2 + 1
-    # The encoder is frozen, so eval mode keeps its dropout deterministic.
-    vision_encoder.eval()
-
-    clip_processor = AutoProcessor.from_pretrained(paths["clip_local_path"])
-    tokenizer = AutoTokenizer.from_pretrained(paths["mistral_local_path"])
-    tokenizer.pad_token = tokenizer.eos_token
-
-    return vision_encoder, clip_processor, tokenizer, num_visual_tokens
 
 
 def build_llm(paths: dict[str, Any], train_params: dict[str, Any], ctx: RunContext) -> nn.Module:
@@ -210,37 +171,6 @@ def configure_trainable_parameters(
             f"{total:,}",
             100 * trainable / total,
         )
-
-
-def wrap_with_fsdp(llm: nn.Module, ctx: RunContext) -> nn.Module:
-    """Shard the model across ranks, or return it unchanged on CPU.
-
-    The embedding layer is excluded from sharding because the training loop
-    calls it directly; it must already be on the target device before wrapping,
-    or FSDP reports it as a newly-added parameter.
-    """
-    llm.model.embed_tokens.to(ctx.device)
-
-    if not ctx.use_fsdp:
-        # CPU demo: sharding is a no-op at one rank; the loop below is unchanged.
-        return llm.to(ctx.device)
-
-    auto_wrap_policy = partial(transformer_auto_wrap_policy, transformer_layer_cls={MistralMLP})
-    # Mirrors Stage 2.5 exactly, on purpose: device_id must be the local rank as
-    # an int, and cpu_offload must be CPUOffload(offload_params=None), not False.
-    return FSDP(
-        llm,
-        device_id=ctx.device,
-        auto_wrap_policy=auto_wrap_policy,
-        cpu_offload=CPUOffload(offload_params=None),
-        mixed_precision=torch.distributed.fsdp.MixedPrecision(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.bfloat16,
-            buffer_dtype=torch.bfloat16,
-        ),
-        use_orig_params=True,
-        ignored_modules=[llm.model.embed_tokens],
-    )
 
 
 def load_stage2_experts(llm: nn.Module, checkpoint_dir: str, ctx: RunContext) -> None:
@@ -364,33 +294,6 @@ def build_datasets(
     return train_dataset, val_dataset
 
 
-def build_dataloaders(
-    train_dataset: Any,
-    val_dataset: Any,
-    train_params: dict[str, Any],
-    loader_params: dict[str, Any],
-    ctx: RunContext,
-) -> tuple[DataLoader, DataLoader, DistributedSampler]:
-    """Wrap the datasets in distributed samplers and loaders.
-
-    drop_last=True on training keeps the batch count identical on every rank;
-    a padded final batch produces rank-specific execution paths that FSDP flags
-    as execution-order divergence. Validation does not update FSDP state, so it
-    can keep its remainder.
-    """
-    train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=True)
-    val_sampler = DistributedSampler(val_dataset, shuffle=False, drop_last=False)
-
-    loader_kwargs = dict(
-        batch_size=train_params["batch_size"],
-        num_workers=loader_params["num_workers"],
-        pin_memory=ctx.use_fsdp,
-    )
-    train_loader = DataLoader(train_dataset, sampler=train_sampler, **loader_kwargs)
-    val_loader = DataLoader(val_dataset, sampler=val_sampler, **loader_kwargs)
-    return train_loader, val_loader, train_sampler
-
-
 def maybe_resume(
     llm: nn.Module,
     vision_connector: nn.Module,
@@ -439,16 +342,6 @@ def maybe_resume(
     return start_epoch
 
 
-def _move_batch(batch: tuple, device: str | int) -> tuple[tuple, bool]:
-    """Move a batch to the device and report whether it carries LLaVA labels.
-
-    LLaVA yields four tensors (the labels have question tokens masked to -100);
-    COCO yields three and the loss is computed over all text.
-    """
-    moved = tuple(tensor.to(device) for tensor in batch)
-    return moved, len(batch) == 4
-
-
 def _forward(
     setup: TrainingSetup,
     ctx: RunContext,
@@ -468,9 +361,8 @@ def _forward(
     # The cached embedding layer avoids touching FSDP internals in the loop.
     text_embeddings = setup.embed_tokens_layer(input_ids)
 
-    combined_embeddings = torch.cat([visual_soft_tokens, text_embeddings], dim=1)
-    combined_attention_mask = torch.cat(
-        [torch.ones(visual_soft_tokens.shape[:2], device=ctx.device), attention_mask], dim=1
+    combined_embeddings, combined_attention_mask = combine_sequence(
+        visual_soft_tokens, text_embeddings, attention_mask, ctx
     )
     outputs = setup.llm(inputs_embeds=combined_embeddings, attention_mask=combined_attention_mask)
     return outputs.logits, visual_soft_tokens.shape[1]
@@ -525,14 +417,14 @@ def train_one_epoch(setup: TrainingSetup, ctx: RunContext, epoch: int, num_epoch
     steps_per_epoch = len(setup.train_loader) // setup.accumulation_steps
 
     for i, batch in enumerate(setup.train_loader):
-        moved, has_labels = _move_batch(batch, ctx.device)
+        moved, has_labels = move_batch(batch, ctx.device)
         if has_labels:
             images, input_ids, attention_mask, labels = moved
         else:
             images, input_ids, attention_mask = moved
             labels = None
 
-        with autocast(device_type=ctx.amp_device, dtype=torch.bfloat16, enabled=ctx.use_fsdp):
+        with autocast(device_type=ctx.amp_device, dtype=torch.bfloat16, enabled=ctx.on_gpu):
             logits, num_visual_tokens = _forward(setup, ctx, images, input_ids, attention_mask)
             ce_loss = _sequence_loss(setup, logits, num_visual_tokens, input_ids, labels)
             loss = ce_loss / setup.accumulation_steps
@@ -610,14 +502,14 @@ def run_validation(setup: TrainingSetup, ctx: RunContext) -> tuple[float, dict |
             if i >= MAX_VAL_BATCHES:
                 break
 
-            moved, has_labels = _move_batch(batch, ctx.device)
+            moved, has_labels = move_batch(batch, ctx.device)
             if has_labels:
                 images, input_ids, attention_mask, labels = moved
             else:
                 images, input_ids, attention_mask = moved
                 labels = None
 
-            with autocast(device_type=ctx.amp_device, dtype=torch.bfloat16, enabled=ctx.use_fsdp):
+            with autocast(device_type=ctx.amp_device, dtype=torch.bfloat16, enabled=ctx.on_gpu):
                 logits, num_visual_tokens = _forward(setup, ctx, images, input_ids, attention_mask)
 
                 if expert_tracker is not None:
@@ -676,7 +568,7 @@ def save_checkpoints(
     """
     dist.barrier()
     gc.collect()
-    if ctx.use_fsdp:
+    if ctx.on_gpu:
         torch.cuda.empty_cache()
 
     # Gathering the sharded parameters is collective — every rank must enter.
@@ -727,7 +619,7 @@ def save_checkpoints(
         del llm_state_dict, connector_state_dict, full_checkpoint, portable_checkpoint
 
     gc.collect()
-    if ctx.use_fsdp:
+    if ctx.on_gpu:
         torch.cuda.empty_cache()
     dist.barrier()
     return best_val_loss
@@ -768,8 +660,8 @@ def log_configuration(
     logger.info("Label smoothing:       %s", train_params.get("label_smoothing", 0.0))
     logger.info("Attention dropout:     %s", train_params.get("attention_dropout", 0.0))
     logger.info("Expert dropout:        %s", train_params.get("expert_dropout", 0.0))
-    logger.info("Mixed precision:       %s", "bfloat16" if ctx.use_fsdp else "disabled (CPU)")
-    logger.info("Sharding:              %s", "FSDP" if ctx.use_fsdp else "none (single process)")
+    logger.info("Mixed precision:       %s", "bfloat16" if ctx.on_gpu else "disabled (CPU)")
+    logger.info("Sharding:              %s", "FSDP" if ctx.on_gpu else "none (single process)")
     logger.info("%s\n", "=" * 70)
 
 
@@ -794,19 +686,15 @@ def build_setup(
     llm = build_llm(paths, train_params, ctx)
     configure_trainable_parameters(llm, vision_encoder, ctx)
 
-    vision_connector = VisionLanguageConnector(
-        clip_hidden_size=vision_encoder.config.hidden_size,
-        llm_hidden_size=llm.config.hidden_size,
-    ).to(ctx.device)
-    for param in vision_connector.parameters():
-        param.requires_grad = False
+    vision_connector = build_vision_connector(vision_encoder, llm, ctx, trainable=False)
 
     # Cache both before wrapping: reading llm.config or the embedding layer
     # through FSDP can trigger collectives on a single rank.
     vocab_size = llm.config.vocab_size
     embed_tokens_layer = llm.model.embed_tokens
 
-    llm = wrap_with_fsdp(llm, ctx)
+    # Stage 3 shards without parameter offloading.
+    llm = wrap_with_fsdp(llm, ctx, offload_params=None)
     load_stage2_experts(llm, stage2_checkpoint_dir, ctx)
     load_stage1_connector(vision_connector, output_dir, ctx)
     dist.barrier()
@@ -816,8 +704,8 @@ def build_setup(
     train_dataset, val_dataset = build_datasets(
         paths, train_params, loader_params, clip_processor, tokenizer, ctx
     )
-    train_loader, val_loader, train_sampler = build_dataloaders(
-        train_dataset, val_dataset, train_params, loader_params, ctx
+    train_loader, val_loader, train_sampler = build_distributed_loaders(
+        train_dataset, val_dataset, train_params, loader_params, ctx, drop_last_train=True
     )
 
     accumulation_steps = train_params.get("gradient_accumulation_steps", 1)
@@ -871,22 +759,12 @@ def main() -> None:
     stage2_checkpoint_dir = os.path.join(output_dir, "stage2_checkpoints")
     stage3_checkpoint_dir = os.path.join(output_dir, "stage3_checkpoints")
 
-    use_fsdp = supports_fsdp()
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    init_distributed(local_rank, timeout=DIST_TIMEOUT)
-    setup_logging(local_rank)
-    ctx = RunContext(
-        device=local_rank if use_fsdp else "cpu",
-        amp_device="cuda" if use_fsdp else "cpu",
-        use_fsdp=use_fsdp,
-        local_rank=local_rank,
+    ctx = build_run_context(
+        distributed=True,
+        seed=loader_params.get("data_seed", 42),
+        timeout=DIST_TIMEOUT,
+        stage_name="Stage 3",
     )
-    if use_fsdp:
-        torch.cuda.set_device(local_rank)
-
-    # Seed every RNG, as Stage 1 does. Without this, dropout, the Gumbel noise
-    # in soft routing and the shuffled sampler all draw from an unseeded stream.
-    set_seed(loader_params.get("data_seed", 42))
 
     if ctx.is_main:
         logger.info("--- Initializing Stage 3 Training (End-to-End) ---")
@@ -951,7 +829,7 @@ def main() -> None:
             duration % 60,
         )
 
-    dist.destroy_process_group()
+    teardown()
     logger.info("Job finished.")
 
 

@@ -28,6 +28,7 @@ STAGE_METRIC_FILES = {
     "Stage 2": "training_metrics_stage2.json",
     "Stage 2.5": "training_metrics_stage2.5.json",
     "Stage 3": "training_metrics_stage3.json",
+    "Dense": "training_metrics_dense.json",
 }
 
 

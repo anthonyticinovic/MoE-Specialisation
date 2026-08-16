@@ -43,8 +43,12 @@ STAGES: dict[str, tuple[str, list[str]]] = {
         "Stage 3 — end-to-end, soft routing",
         [sys.executable, "training_scripts/train_stage_3.py"],
     ),
+    "dense": (
+        "Dense — control baseline",
+        [sys.executable, "training_scripts/train_dense.py"],
+    ),
 }
-DEFAULT_STAGES = ["0", "1", "2", "2.5", "3"]
+DEFAULT_STAGES = ["0", "1", "2", "2.5", "3", "dense"]
 
 
 def _reset_run_artifacts(output_root: Path) -> None:

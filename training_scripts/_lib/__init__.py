@@ -5,5 +5,34 @@ enough to crowd a stage script, lives here rather than being copy-pasted.
 """
 
 from training_scripts._lib.expert_metrics import ExpertUsageTracker, save_expert_metrics
+from training_scripts._lib.pipeline import (
+    build_backbones,
+    build_distributed_loaders,
+    build_vision_connector,
+    combine_sequence,
+    move_batch,
+    shifted_caption_loss,
+)
+from training_scripts._lib.runtime import (
+    RunContext,
+    broadcast_flag,
+    build_run_context,
+    teardown,
+    wrap_with_fsdp,
+)
 
-__all__ = ["ExpertUsageTracker", "save_expert_metrics"]
+__all__ = [
+    "ExpertUsageTracker",
+    "RunContext",
+    "broadcast_flag",
+    "build_backbones",
+    "build_distributed_loaders",
+    "build_run_context",
+    "build_vision_connector",
+    "combine_sequence",
+    "move_batch",
+    "save_expert_metrics",
+    "shifted_caption_loss",
+    "teardown",
+    "wrap_with_fsdp",
+]

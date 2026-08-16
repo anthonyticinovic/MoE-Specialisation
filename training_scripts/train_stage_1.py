@@ -1,7 +1,27 @@
+"""Stage 1: train the vision→language connector.
+
+The first training stage and the only single-GPU one. CLIP and the LLM are
+frozen; the sole trainable module is the ``VisionLanguageConnector`` that
+projects CLIP patch embeddings into the LLM's embedding space. Everything
+downstream loads the connector this stage produces.
+
+Run from the repo root::
+
+    python training_scripts/train_stage_1.py
+
+A CPU run works too — mixed precision, 8-bit loading and ``torch.compile`` are
+skipped when CUDA is unavailable. Paths come from
+``configs/training_config.yaml`` unless ``MOE_CONFIG`` points elsewhere.
+"""
+
+from __future__ import annotations
+
 import gc
 import json
 import logging
 import os
+from dataclasses import dataclass
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -9,267 +29,345 @@ import torch.optim as optim
 from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
-from transformers import (
-    AutoProcessor,
-    AutoTokenizer,
-    CLIPVisionModel,
-    MistralForCausalLM,
-)
+from transformers import MistralForCausalLM
 
 from data import COCO_Loader
-from models import VisionLanguageConnector
-from models.utils.common import get_device, load_config, set_seed, setup_logging
+from models.utils.common import get_model_dtype, load_config
+from training_scripts._lib import (
+    RunContext,
+    build_backbones,
+    build_run_context,
+    build_vision_connector,
+    combine_sequence,
+)
 
 logger = logging.getLogger(__name__)
 
-set_seed()
-setup_logging()
 
-# --- 1. Load Configuration ---
-logger.info("--- Initializing Stage 1: Vision Connector Training ---")
-config = load_config()
+@dataclass
+class Stage1Setup:
+    """Everything the epoch loop needs, assembled once before training."""
 
-paths = config["paths"]
-train_params = config["training_stage1"]
-loader_params = config["dataloader"]
-NUM_EPOCHS = train_params["num_epochs"]
-OUTPUT_DIR = paths["output_dir"]
-DEVICE = get_device()
-ON_GPU = DEVICE == "cuda"
+    llm: nn.Module
+    vision_encoder: nn.Module
+    vision_connector: nn.Module
+    train_loader: DataLoader
+    val_loader: DataLoader
+    optimizer: optim.Optimizer
+    scheduler: CosineAnnealingLR
+    scaler: GradScaler
+    loss_fn: nn.Module
+    accumulation_steps: int
+    vocab_size: int
 
-accumulation_steps = train_params.get("gradient_accumulation_steps", 1)
 
-logger.info(f"Using device: {DEVICE}")
-if not ON_GPU:
-    logger.warning(
-        "CUDA not available — running on CPU. Mixed precision, 8-bit loading and "
-        "torch.compile are disabled. This path exists for the CPU demo and local "
-        "smoke tests; real training requires a GPU."
+def build_frozen_llm(paths: dict[str, Any], ctx: RunContext) -> nn.Module:
+    """Load the base Mistral, frozen — only its embeddings and logits are used.
+
+    8-bit loading needs bitsandbytes and CUDA, so a CPU run falls back to
+    float32.
+    """
+    load_kwargs: dict[str, Any] = (
+        {"load_in_8bit": True, "torch_dtype": torch.bfloat16}
+        if ctx.on_gpu
+        else {"torch_dtype": get_model_dtype()}
+    )
+    llm = MistralForCausalLM.from_pretrained(paths["mistral_local_path"], **load_kwargs)
+    if not ctx.on_gpu:
+        # 8-bit loading places the model itself; the float32 path does not.
+        llm = llm.to(ctx.device)
+
+    for param in llm.parameters():
+        param.requires_grad = False
+    logger.info("✅ Models loaded and frozen.")
+    return llm
+
+
+def build_datasets(
+    paths: dict[str, Any],
+    train_params: dict[str, Any],
+    loader_params: dict[str, Any],
+    clip_processor: Any,
+    tokenizer: Any,
+) -> tuple[Any, Any]:
+    """Build the COCO caption datasets. The same seed keeps the split stable."""
+    common = {
+        "image_dir": paths["image_dir"],
+        "annotations_file": paths["annotations_file"],
+        "clip_processor": clip_processor,
+        "tokenizer": tokenizer,
+        "subset_fraction": train_params["subset_fraction"],
+        "seed": loader_params.get("data_seed", 42),
+    }
+    return COCO_Loader(split="train", **common), COCO_Loader(split="val", **common)
+
+
+def build_loaders(
+    train_dataset: Any,
+    val_dataset: Any,
+    train_params: dict[str, Any],
+    loader_params: dict[str, Any],
+    ctx: RunContext,
+) -> tuple[DataLoader, DataLoader]:
+    """Plain (non-distributed) loaders — Stage 1 is single-process.
+
+    persistent_workers requires num_workers > 0, and pinned memory only helps
+    host→GPU copies.
+    """
+    num_workers = loader_params["num_workers_s1"]
+    loader_kwargs = {
+        "batch_size": train_params["batch_size"],
+        "num_workers": num_workers,
+        "pin_memory": ctx.on_gpu,
+        "persistent_workers": num_workers > 0,
+    }
+    return (
+        DataLoader(train_dataset, shuffle=True, **loader_kwargs),
+        DataLoader(val_dataset, shuffle=False, **loader_kwargs),
     )
 
-# --- 2. Load Foundational Models ---
-logger.info("Loading foundational models...")
-vision_encoder = CLIPVisionModel.from_pretrained(paths["clip_local_path"]).to(DEVICE)
-clip_processor = AutoProcessor.from_pretrained(paths["clip_local_path"])
-# 8-bit loading needs bitsandbytes + CUDA; on CPU load the model in float32.
-llm_load_kwargs = (
-    {"load_in_8bit": True, "torch_dtype": torch.bfloat16}
-    if ON_GPU
-    else {"torch_dtype": torch.float32}
-)
-llm = MistralForCausalLM.from_pretrained(paths["mistral_local_path"], **llm_load_kwargs)
-if not ON_GPU:
-    llm = llm.to(DEVICE)
-tokenizer = AutoTokenizer.from_pretrained(paths["mistral_local_path"])
-tokenizer.pad_token = tokenizer.eos_token
 
-for param in vision_encoder.parameters():
-    param.requires_grad = False
-for param in llm.parameters():
-    param.requires_grad = False
-logger.info("✅ Models loaded and frozen.")
+def _connector_loss(
+    setup: Stage1Setup, logits: torch.Tensor, num_visual_tokens: int, input_ids: torch.Tensor
+) -> torch.Tensor:
+    """Next-token loss over the caption.
 
-# --- 3. Create Datasets and DataLoaders ---
-logger.info("Creating datasets and dataloaders...")
-train_dataset = COCO_Loader(
-    image_dir=paths["image_dir"],
-    annotations_file=paths["annotations_file"],
-    clip_processor=clip_processor,
-    tokenizer=tokenizer,
-    subset_fraction=train_params["subset_fraction"],
-    split="train",
-    seed=loader_params.get("data_seed", 42),  # Fixed seed for reproducibility
-)
-val_dataset = COCO_Loader(
-    image_dir=paths["image_dir"],
-    annotations_file=paths["annotations_file"],
-    clip_processor=clip_processor,
-    tokenizer=tokenizer,
-    subset_fraction=train_params["subset_fraction"],
-    split="val",
-    seed=loader_params.get("data_seed", 42),  # Same seed ensures consistent splits
-)
-# persistent_workers requires num_workers > 0; pin_memory only helps host→GPU copies.
-num_workers = loader_params["num_workers_s1"]
-loader_kwargs = {
-    "num_workers": num_workers,
-    "pin_memory": ON_GPU,
-    "persistent_workers": num_workers > 0,
-}
-train_loader = DataLoader(
-    train_dataset,
-    batch_size=train_params["batch_size"],
-    shuffle=True,
-    **loader_kwargs,
-)
-val_loader = DataLoader(
-    val_dataset,
-    batch_size=train_params["batch_size"],
-    shuffle=False,
-    **loader_kwargs,
-)
-
-# --- 4. Setup Model, Optimizer, and Checkpointing ---
-# Derive the projection dims from the loaded backbones rather than relying on
-# the CLIP ViT-L/14 (1024) → Mistral-7B (4096) defaults, so the script also runs
-# against the tiny models used by the CPU demo.
-vision_connector = VisionLanguageConnector(
-    clip_hidden_size=vision_encoder.config.hidden_size,
-    llm_hidden_size=llm.config.hidden_size,
-).to(DEVICE)
-
-optimizer = optim.AdamW(
-    vision_connector.parameters(),
-    lr=train_params["learning_rate"],
-    weight_decay=train_params.get("weight_decay", 0.01),
-)
-
-scheduler = CosineAnnealingLR(
-    optimizer, T_max=(len(train_loader) // accumulation_steps) * NUM_EPOCHS
-)
-loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
-# Loss scaling and autocast are GPU-only; on CPU the loop runs in plain float32.
-scaler = GradScaler(DEVICE, enabled=ON_GPU)
-metrics_history = {"epoch": [], "train_loss": [], "val_loss": [], "learning_rate": []}
-best_val_loss = float("inf")
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-best_model_path = os.path.join(OUTPUT_DIR, "vision_connector_stage1_best.pth")
-latest_model_path = os.path.join(OUTPUT_DIR, "vision_connector_stage1_latest.pth")
+    The slice starts one position earlier than in Stages 2/2.5/dense: the last
+    visual position predicts the first caption token, so every caption token is
+    scored rather than all but the first. Preserved as-is — it is the alignment
+    the published Stage 1 was trained with.
+    """
+    text_logits = logits[:, num_visual_tokens - 1 : -1, :].contiguous()
+    text_labels = input_ids.contiguous()
+    return setup.loss_fn(text_logits.view(-1, setup.vocab_size), text_labels.view(-1))
 
 
-if os.path.exists(latest_model_path):
-    logger.debug(f"💾 Loading saved weights from {latest_model_path}")
-    vision_connector.load_state_dict(torch.load(latest_model_path, map_location=DEVICE))
+def _forward_batch(
+    setup: Stage1Setup,
+    ctx: RunContext,
+    images: torch.Tensor,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> tuple[torch.Tensor, int]:
+    """Project the image, prepend it to the text and run the frozen LLM.
 
-# torch.compile wraps the module in an OptimizedModule whose state_dict is
-# prefixed; the checkpoint code below unwraps via ._orig_mod. Skipped on CPU,
-# where compilation costs more warm-up time than it saves.
-if ON_GPU:
-    vision_connector = torch.compile(vision_connector)
+    The connector is the only trainable module, so it stays outside ``no_grad``
+    while the encoder and the token embedding do not.
+    """
+    visual_soft_tokens = setup.vision_connector(patch_embeddings_of(setup, images))
+    text_embeddings = setup.llm.model.embed_tokens(input_ids)
+    combined_embeddings, combined_attention_mask = combine_sequence(
+        visual_soft_tokens, text_embeddings, attention_mask, ctx
+    )
+    outputs = setup.llm(inputs_embeds=combined_embeddings, attention_mask=combined_attention_mask)
+    return outputs.logits, visual_soft_tokens.shape[1]
 
-# --- 5. The Training and Validation Loop ---
-logger.info("🚀 Starting training...")
-for epoch in range(NUM_EPOCHS):
-    vision_connector.train()
-    total_train_loss = 0
 
-    # Reset gradients at the start of the epoch
-    optimizer.zero_grad()
+def patch_embeddings_of(setup: Stage1Setup, images: torch.Tensor) -> torch.Tensor:
+    """CLIP patch embeddings, always under no_grad — the tower is frozen."""
+    with torch.no_grad():
+        return setup.vision_encoder(images).last_hidden_state
 
-    for i, (images, input_ids, attention_mask) in enumerate(train_loader):
-        images, input_ids, attention_mask = (
-            images.to(DEVICE),
-            input_ids.to(DEVICE),
-            attention_mask.to(DEVICE),
-        )
 
+def train_one_epoch(setup: Stage1Setup, ctx: RunContext, epoch: int, num_epochs: int) -> float:
+    """Run one training epoch and return the mean loss per batch."""
+    setup.vision_connector.train()
+    total_train_loss = 0.0
+    setup.optimizer.zero_grad()
+
+    for i, (images, input_ids, attention_mask) in enumerate(setup.train_loader):
+        images = images.to(ctx.device)
+        input_ids = input_ids.to(ctx.device)
+        attention_mask = attention_mask.to(ctx.device)
+
+        # The frozen encoder and embedding run outside autocast, matching the
+        # published Stage 1: only the trainable connector and the LLM forward
+        # are done in reduced precision.
         with torch.no_grad():
-            patch_embeddings = vision_encoder(images).last_hidden_state
-            text_embeddings = llm.model.embed_tokens(input_ids)
+            patch_embeddings = setup.vision_encoder(images).last_hidden_state
+            text_embeddings = setup.llm.model.embed_tokens(input_ids)
 
-        with autocast(DEVICE, dtype=torch.bfloat16, enabled=ON_GPU):
-            visual_soft_tokens = vision_connector(patch_embeddings)
+        with autocast(ctx.amp_device, dtype=torch.bfloat16, enabled=ctx.on_gpu):
+            visual_soft_tokens = setup.vision_connector(patch_embeddings)
             num_visual_tokens = visual_soft_tokens.shape[1]
-
-            combined_embeddings = torch.cat([visual_soft_tokens, text_embeddings], dim=1)
-            combined_attention_mask = torch.cat(
-                [torch.ones(visual_soft_tokens.shape[:2], device=DEVICE), attention_mask], dim=1
+            combined_embeddings, combined_attention_mask = combine_sequence(
+                visual_soft_tokens, text_embeddings, attention_mask, ctx
             )
+            outputs = setup.llm(
+                inputs_embeds=combined_embeddings, attention_mask=combined_attention_mask
+            )
+            loss = _connector_loss(setup, outputs.logits, num_visual_tokens, input_ids)
+            loss = loss / setup.accumulation_steps
 
-            outputs = llm(inputs_embeds=combined_embeddings, attention_mask=combined_attention_mask)
-            logits = outputs.logits
+        setup.scaler.scale(loss).backward()
 
-            text_logits = logits[:, num_visual_tokens - 1 : -1, :].contiguous()
-            text_labels = input_ids.contiguous()
-            loss = loss_fn(text_logits.view(-1, llm.config.vocab_size), text_labels.view(-1))
+        if (i + 1) % setup.accumulation_steps == 0 or (i + 1) == len(setup.train_loader):
+            setup.scaler.unscale_(setup.optimizer)
+            torch.nn.utils.clip_grad_norm_(setup.vision_connector.parameters(), 1.0)
+            setup.scaler.step(setup.optimizer)
+            setup.scaler.update()
+            setup.scheduler.step()
+            setup.optimizer.zero_grad()
 
-            # --- CHANGE: Scale loss for gradient accumulation ---
-            loss = loss / accumulation_steps
-
-        scaler.scale(loss).backward()
-
-        # --- CHANGE: Optimizer step only after accumulating gradients ---
-        if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(vision_connector.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
-            optimizer.zero_grad()  # Zero gradients after optimizer step
-
-        total_train_loss += loss.item() * accumulation_steps  # Un-scale for logging
+        total_train_loss += loss.item() * setup.accumulation_steps
 
         if (i + 1) % 100 == 0:
-            logger.info(f"  Epoch {epoch + 1}, Batch [{i + 1}/{len(train_loader)}]")
+            logger.info("  Epoch %d, Batch [%d/%d]", epoch + 1, i + 1, len(setup.train_loader))
 
         del images, input_ids, attention_mask, patch_embeddings, text_embeddings
-        del visual_soft_tokens, combined_embeddings, outputs, logits, loss
+        del visual_soft_tokens, combined_embeddings, outputs, loss
         gc.collect()
-        if ON_GPU:
+        if ctx.on_gpu:
             torch.cuda.empty_cache()
 
-    avg_train_loss = total_train_loss / len(train_loader)
-    logger.info(f"Epoch [{epoch + 1}/{NUM_EPOCHS}] - Training Loss: {avg_train_loss:.4f}")
+    avg_train_loss = total_train_loss / len(setup.train_loader)
+    logger.info("Epoch [%d/%d] - Training Loss: %.4f", epoch + 1, num_epochs, avg_train_loss)
+    return avg_train_loss
 
-    # -- Validation Phase --
-    vision_connector.eval()
-    total_val_loss = 0
+
+def run_validation(setup: Stage1Setup, ctx: RunContext, epoch: int, num_epochs: int) -> float:
+    """Validate the connector and return the mean loss."""
+    setup.vision_connector.eval()
+    total_val_loss = 0.0
+
     with torch.no_grad():
-        for i, (images, input_ids, attention_mask) in enumerate(val_loader):
-            images, input_ids, attention_mask = (
-                images.to(DEVICE),
-                input_ids.to(DEVICE),
-                attention_mask.to(DEVICE),
-            )
-            with autocast(DEVICE, dtype=torch.bfloat16, enabled=ON_GPU):
-                patch_embeddings = vision_encoder(images).last_hidden_state
-                text_embeddings = llm.model.embed_tokens(input_ids)
-                visual_soft_tokens = vision_connector(patch_embeddings)
-                num_visual_tokens = visual_soft_tokens.shape[1]
+        for images, input_ids, attention_mask in setup.val_loader:
+            images = images.to(ctx.device)
+            input_ids = input_ids.to(ctx.device)
+            attention_mask = attention_mask.to(ctx.device)
 
-                combined_embeddings = torch.cat([visual_soft_tokens, text_embeddings], dim=1)
-                combined_attention_mask = torch.cat(
-                    [torch.ones(visual_soft_tokens.shape[:2], device=DEVICE), attention_mask], dim=1
+            with autocast(ctx.amp_device, dtype=torch.bfloat16, enabled=ctx.on_gpu):
+                logits, num_visual_tokens = _forward_batch(
+                    setup, ctx, images, input_ids, attention_mask
                 )
-
-                outputs = llm(
-                    inputs_embeds=combined_embeddings, attention_mask=combined_attention_mask
-                )
-                logits = outputs.logits
-                text_logits = logits[:, num_visual_tokens - 1 : -1, :].contiguous()
-                text_labels = input_ids.contiguous()
-                loss = loss_fn(text_logits.view(-1, llm.config.vocab_size), text_labels.view(-1))
+                loss = _connector_loss(setup, logits, num_visual_tokens, input_ids)
             total_val_loss += loss.item()
 
-    avg_val_loss = total_val_loss / len(val_loader)
-    logger.info(f"Epoch [{epoch + 1}/{NUM_EPOCHS}] - Validation Loss: {avg_val_loss:.4f}")
+    avg_val_loss = total_val_loss / len(setup.val_loader)
+    logger.info("Epoch [%d/%d] - Validation Loss: %.4f", epoch + 1, num_epochs, avg_val_loss)
+    return avg_val_loss
 
-    # --- Early Stopping and Checkpointing Logic ---
-    # Unwrap torch.compile's OptimizedModule so the saved state dict is loadable
-    # by an uncompiled VisionLanguageConnector.
-    state_to_save = getattr(vision_connector, "_orig_mod", vision_connector).state_dict()
 
-    # Save the clean state for the latest checkpoint
-    torch.save(state_to_save, latest_model_path)
-    logger.debug(f"💾 Latest model checkpoint saved to {latest_model_path}")
+def save_checkpoints(
+    setup: Stage1Setup, output_dir: str, avg_val_loss: float, best_val_loss: float
+) -> float:
+    """Save the latest connector and, if improved, the best. Returns the best."""
+    # Unwrap torch.compile's OptimizedModule so the saved state dict loads into
+    # a plain VisionLanguageConnector.
+    state = getattr(setup.vision_connector, "_orig_mod", setup.vision_connector).state_dict()
 
-    # If it's the best model, save the clean state for the best checkpoint too
+    torch.save(state, os.path.join(output_dir, "vision_connector_stage1_latest.pth"))
     if avg_val_loss < best_val_loss:
         best_val_loss = avg_val_loss
-        torch.save(state_to_save, best_model_path)
-        logger.info(f"🏆 New best validation loss! Model saved to {best_model_path}")
+        best_path = os.path.join(output_dir, "vision_connector_stage1_best.pth")
+        torch.save(state, best_path)
+        logger.info("🏆 New best validation loss! Model saved to %s", best_path)
+    return best_val_loss
 
-    # --- Metrics Logging ---
-    metrics_path = os.path.join(OUTPUT_DIR, "loss_history_stage1.json")
 
-    metrics_history["epoch"].append(epoch + 1)
-    metrics_history["train_loss"].append(avg_train_loss)
-    metrics_history["val_loss"].append(avg_val_loss)
-    metrics_history["learning_rate"].append(optimizer.param_groups[0]["lr"])
+def build_setup(
+    paths: dict[str, Any],
+    train_params: dict[str, Any],
+    loader_params: dict[str, Any],
+    num_epochs: int,
+    ctx: RunContext,
+) -> Stage1Setup:
+    """Assemble every component the epoch loop needs, in dependency order."""
+    vision_encoder, clip_processor, tokenizer, _ = build_backbones(paths, ctx)
+    llm = build_frozen_llm(paths, ctx)
 
-    with open(metrics_path, "w") as f:
-        json.dump(metrics_history, f, indent=4)
-    logger.info(f"✅ Metrics saved to {metrics_path}")
+    logger.info("Creating datasets and dataloaders...")
+    train_dataset, val_dataset = build_datasets(
+        paths, train_params, loader_params, clip_processor, tokenizer
+    )
+    train_loader, val_loader = build_loaders(
+        train_dataset, val_dataset, train_params, loader_params, ctx
+    )
 
-logger.info("✅ Training complete.")
+    vision_connector = build_vision_connector(vision_encoder, llm, ctx, trainable=True)
+
+    accumulation_steps = train_params.get("gradient_accumulation_steps", 1)
+    optimizer = optim.AdamW(
+        vision_connector.parameters(),
+        lr=train_params["learning_rate"],
+        weight_decay=train_params.get("weight_decay", 0.01),
+    )
+    scheduler = CosineAnnealingLR(
+        optimizer, T_max=(len(train_loader) // accumulation_steps) * num_epochs
+    )
+    loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+    # Loss scaling is GPU-only; on CPU the loop runs in plain float32.
+    scaler = GradScaler(ctx.amp_device, enabled=ctx.on_gpu)
+
+    return Stage1Setup(
+        llm=llm,
+        vision_encoder=vision_encoder,
+        vision_connector=vision_connector,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        loss_fn=loss_fn,
+        accumulation_steps=accumulation_steps,
+        vocab_size=llm.config.vocab_size,
+    )
+
+
+def main() -> None:
+    """Assemble the Stage 1 run and drive the epoch loop."""
+    config = load_config()
+    paths = config["paths"]
+    train_params = config["training_stage1"]
+    loader_params = config["dataloader"]
+    num_epochs = train_params["num_epochs"]
+    output_dir = paths["output_dir"]
+
+    ctx = build_run_context(
+        distributed=False,
+        seed=loader_params.get("data_seed", 42),
+        stage_name="Stage 1",
+    )
+    logger.info("--- Initializing Stage 1: Vision Connector Training ---")
+    logger.info("Using device: %s", ctx.device)
+
+    setup = build_setup(paths, train_params, loader_params, num_epochs, ctx)
+
+    os.makedirs(output_dir, exist_ok=True)
+    latest_path = os.path.join(output_dir, "vision_connector_stage1_latest.pth")
+    if os.path.exists(latest_path):
+        logger.debug("💾 Loading saved weights from %s", latest_path)
+        setup.vision_connector.load_state_dict(torch.load(latest_path, map_location=ctx.device))
+
+    # torch.compile is skipped on CPU, where warm-up costs more than it saves.
+    if ctx.on_gpu:
+        setup.vision_connector = torch.compile(setup.vision_connector)
+
+    metrics_path = os.path.join(output_dir, "loss_history_stage1.json")
+    metrics_history: dict[str, list] = {
+        "epoch": [],
+        "train_loss": [],
+        "val_loss": [],
+        "learning_rate": [],
+    }
+    best_val_loss = float("inf")
+
+    logger.info("🚀 Starting training...")
+    for epoch in range(num_epochs):
+        avg_train_loss = train_one_epoch(setup, ctx, epoch, num_epochs)
+        avg_val_loss = run_validation(setup, ctx, epoch, num_epochs)
+        best_val_loss = save_checkpoints(setup, output_dir, avg_val_loss, best_val_loss)
+
+        metrics_history["epoch"].append(epoch + 1)
+        metrics_history["train_loss"].append(avg_train_loss)
+        metrics_history["val_loss"].append(avg_val_loss)
+        metrics_history["learning_rate"].append(setup.optimizer.param_groups[0]["lr"])
+        with open(metrics_path, "w") as f:
+            json.dump(metrics_history, f, indent=4)
+        logger.info("✅ Metrics saved to %s", metrics_path)
+
+    logger.info("✅ Training complete.")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,418 +1,410 @@
-import gc
+"""Dense control: the same pipeline with a standard FFN instead of experts.
+
+The baseline the MoE stages are compared against. Architecture and data match
+Stage 2 — same frozen CLIP tower, same Stage 1 connector, same COCO captions,
+same loss — but the language model is stock Mistral, so its dense FFN trains in
+place of two routed experts. Self-attention and the FFN are unfrozen; the
+connector and the vision tower are not.
+
+Run from the repo root::
+
+    torchrun --nproc_per_node=4 training_scripts/train_dense.py
+
+A single-process CPU run works too: FSDP, mixed precision and FlashAttention are
+skipped when CUDA is unavailable. Paths come from
+``configs/training_config.yaml`` unless ``MOE_CONFIG`` points elsewhere.
+"""
+
+from __future__ import annotations
+
 import json
 import logging
 import os
 import time
-from functools import partial
+from dataclasses import dataclass
+from typing import Any
 
 import torch
-
-# Para GPU imports
 import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
 from torch.amp import GradScaler, autocast
-from torch.distributed.fsdp import (
-    CPUOffload,
-)
-from torch.distributed.fsdp import (
-    FullyShardedDataParallel as FSDP,
-)
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from transformers import (
-    AutoModelForCausalLM,
-    AutoProcessor,
-    AutoTokenizer,
-    CLIPVisionModel,
-)
-from transformers.models.mistral.modeling_mistral import MistralMLP
+from transformers import AutoModelForCausalLM
 
 from data import COCO_Loader
-from models import VisionLanguageConnector
 from models.utils.common import (
     full_state_dict_context,
     get_attn_implementation,
     get_model_dtype,
-    init_distributed,
     load_config,
-    set_seed,
-    setup_logging,
-    supports_fsdp,
+)
+from training_scripts._lib import (
+    RunContext,
+    broadcast_flag,
+    build_backbones,
+    build_distributed_loaders,
+    build_run_context,
+    build_vision_connector,
+    combine_sequence,
+    shifted_caption_loss,
+    teardown,
+    wrap_with_fsdp,
 )
 
 logger = logging.getLogger(__name__)
 
-# ====================================================================================
-# 2. SETUP AND CONFIGURATION
-# ====================================================================================
-config = load_config()
 
-paths = config["paths"]
-# CHANGED: Use dense_control parameters from config
-train_params = config["dense_control"]
-loader_params = config["dataloader"]
-NUM_EPOCHS = train_params["num_epochs"]
-OUTPUT_DIR = paths["output_dir"]
-# CHANGED: New checkpoint directory for the dense model
-DENSE_CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "dense_checkpoints")
+@dataclass
+class DenseSetup:
+    """Everything the epoch loop needs, assembled once before training."""
 
-# --- Initialize the distributed environment ---
-USE_FSDP = supports_fsdp()
-local_rank = int(os.environ.get("LOCAL_RANK", 0))
-init_distributed(local_rank)
-setup_logging(local_rank)
-if USE_FSDP:
-    torch.cuda.set_device(local_rank)
-    DEVICE = local_rank
-else:
-    DEVICE = "cpu"
-# autocast/GradScaler take a device *type* string; DEVICE may be an ordinal.
-AMP_DEVICE = "cuda" if USE_FSDP else "cpu"
+    llm: nn.Module
+    vision_encoder: nn.Module
+    vision_connector: nn.Module
+    train_loader: DataLoader
+    val_loader: DataLoader
+    train_sampler: DistributedSampler
+    optimizer: optim.Optimizer
+    scheduler: CosineAnnealingLR
+    scaler: GradScaler
+    loss_fn: nn.Module
+    trainable_params: list[torch.Tensor]
+    accumulation_steps: int
+    vocab_size: int
 
-# Seed every RNG, as Stage 1 already does. Without this the run is not
-# reproducible: dropout, the shuffled sampler and (under soft routing) the
-# Gumbel noise all draw from an unseeded stream.
-set_seed(loader_params.get("data_seed", 42))
 
-if local_rank == 0:
-    # CHANGED: Print statement for Dense Control model
-    logger.info("--- Initializing Dense Control Model Training ---")
+def build_dense_llm(paths: dict[str, Any], ctx: RunContext) -> nn.Module:
+    """Load stock Mistral and unfreeze self-attention plus the dense FFN.
 
-# ====================================================================================
-# 3. MODEL LOADING
-# ====================================================================================
-if local_rank == 0:
-    logger.info("Loading foundational models...")
-vision_encoder = CLIPVisionModel.from_pretrained(paths["clip_local_path"]).to(DEVICE)
-clip_processor = AutoProcessor.from_pretrained(paths["clip_local_path"])
-tokenizer = AutoTokenizer.from_pretrained(paths["mistral_local_path"])
-tokenizer.pad_token = tokenizer.eos_token
+    This is the control: the same trainable surface as Stage 3 minus the router,
+    so any difference in the results is attributable to the MoE layer rather
+    than to what was left trainable.
+    """
+    if ctx.is_main:
+        logger.info("Loading dense Mistral from %s...", paths["mistral_local_path"])
 
-# CHANGED: Load the standard dense Mistral-7B model
-dense_model_path = paths["mistral_local_path"]
-llm = AutoModelForCausalLM.from_pretrained(
-    dense_model_path,
-    torch_dtype=get_model_dtype(),
-    attn_implementation=get_attn_implementation(),
-    low_cpu_mem_usage=True,
-)
-
-# ====================================================================================
-# 4. TRAINING SETUP (PART 1 - Parameter Freezing)
-# ====================================================================================
-if local_rank == 0:
-    logger.info("Preparing dense model: Freezing vision, VLC, and embeddings.")
-
-# Freeze all parameters by default
-for param in llm.parameters():
-    param.requires_grad = False
-
-# NEW: Unfreeze only the attention and MLP layers
-for layer in llm.model.layers:
-    layer.self_attn.requires_grad_(True)
-    layer.mlp.requires_grad_(True)
-
-vision_connector = VisionLanguageConnector(
-    clip_hidden_size=vision_encoder.config.hidden_size,
-    llm_hidden_size=llm.config.hidden_size,
-).to(DEVICE)
-# NEW: Freeze the vision connector
-for param in vision_connector.parameters():
-    param.requires_grad = False
-
-# Ensure the vision encoder remains frozen
-for param in vision_encoder.parameters():
-    param.requires_grad = False
-
-# ====================================================================================
-# 5. FSDP WRAPPING & CHECKPOINTING
-# ====================================================================================
-my_auto_wrap_policy = partial(
-    transformer_auto_wrap_policy,
-    transformer_layer_cls={
-        MistralMLP,
-    },
-)
-
-if USE_FSDP:
-    llm = FSDP(
-        llm,
-        device_id=torch.cuda.current_device(),
-        auto_wrap_policy=my_auto_wrap_policy,
-        cpu_offload=CPUOffload(offload_params=True),
-        mixed_precision=torch.distributed.fsdp.MixedPrecision(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.bfloat16,
-            buffer_dtype=torch.bfloat16,
-        ),
-        use_orig_params=True,
+    llm = AutoModelForCausalLM.from_pretrained(
+        paths["mistral_local_path"],
+        torch_dtype=get_model_dtype(),
+        attn_implementation=get_attn_implementation(),
+        low_cpu_mem_usage=True,
     )
-else:
-    # CPU demo: sharding is a no-op at one rank; the loop below is unchanged.
-    llm = llm.to(DEVICE)
 
-# --- Load Stage 1 Vision Connector weights ---
-stage1_weights_path = os.path.join(OUTPUT_DIR, "vision_connector_stage1_best.pth")
-if os.path.exists(stage1_weights_path):
-    if local_rank == 0:
-        logger.debug(f"💾 Loading Stage 1 Vision Connector weights from {stage1_weights_path}")
-    vision_connector.load_state_dict(torch.load(stage1_weights_path, map_location=DEVICE))
+    for param in llm.parameters():
+        param.requires_grad = False
+    for layer in llm.model.layers:
+        layer.self_attn.requires_grad_(True)
+        layer.mlp.requires_grad_(True)
 
-dist.barrier()
+    if ctx.is_main:
+        logger.info("Dense model prepared: self-attention and FFN unfrozen.")
+    return llm
 
-# ====================================================================================
-# 6. DATA & OPTIMIZER
-# ====================================================================================
-if local_rank == 0:
-    logger.info("Creating datasets and dataloaders...")
-train_dataset = COCO_Loader(
-    image_dir=paths["image_dir"],
-    annotations_file=paths["annotations_file"],
-    clip_processor=clip_processor,
-    tokenizer=tokenizer,
-    subset_fraction=train_params["subset_fraction"],
-    split="train",
-    seed=loader_params.get("data_seed", 42),  # Fixed seed for reproducibility
-)
-val_dataset = COCO_Loader(
-    image_dir=paths["image_dir"],
-    annotations_file=paths["annotations_file"],
-    clip_processor=clip_processor,
-    tokenizer=tokenizer,
-    subset_fraction=train_params["subset_fraction"],
-    split="val",
-    seed=loader_params.get("data_seed", 42),  # Same seed ensures consistent splits
-)
 
-train_sampler = DistributedSampler(train_dataset)
-val_sampler = DistributedSampler(val_dataset, shuffle=False)
+def resume_from_checkpoint(
+    setup: DenseSetup, checkpoint_dir: str, ctx: RunContext
+) -> tuple[int, float]:
+    """Restore model, optimiser and scheduler state if a checkpoint exists."""
+    latest_path = os.path.join(checkpoint_dir, "dense_latest.pth")
+    if not broadcast_flag(os.path.exists(latest_path), ctx):
+        if ctx.is_main:
+            logger.info("No checkpoint found. Starting dense training from scratch.")
+        return 0, float("inf")
 
-train_loader = DataLoader(
-    train_dataset,
-    batch_size=train_params["batch_size"],
-    sampler=train_sampler,
-    num_workers=loader_params["num_workers"],
-    pin_memory=USE_FSDP,
-)
-val_loader = DataLoader(
-    val_dataset,
-    batch_size=train_params["batch_size"],
-    sampler=val_sampler,
-    num_workers=loader_params["num_workers"],
-    pin_memory=USE_FSDP,
-)
+    if ctx.is_main:
+        logger.debug("💾 Resuming dense training from %s", latest_path)
 
-accumulation_steps = train_params.get("gradient_accumulation_steps", 1)
-
-# Get only the parameters that are unfrozen
-trainable_params = [p for p in llm.parameters() if p.requires_grad]
-optimizer = optim.AdamW(
-    trainable_params,
-    lr=train_params["learning_rate"],
-    weight_decay=train_params["weight_decay"],
-    fused=True,
-)
-scaler = GradScaler(AMP_DEVICE, enabled=USE_FSDP)
-total_steps = (len(train_loader) // accumulation_steps) * NUM_EPOCHS
-scheduler = CosineAnnealingLR(optimizer, T_max=total_steps)
-loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
-
-# --- Resumption logic for Dense Model ---
-start_epoch = 0
-best_val_loss = float("inf")
-latest_checkpoint_path = os.path.join(DENSE_CHECKPOINT_DIR, "dense_latest.pth")
-
-should_resume = 1.0 if local_rank == 0 and os.path.exists(latest_checkpoint_path) else 0.0
-resume_tensor = torch.tensor([should_resume], dtype=torch.float32).to(DEVICE)
-dist.broadcast(resume_tensor, src=0)
-
-if resume_tensor.item() == 1.0:
-    if local_rank == 0:
-        logger.debug(f"💾 Resuming dense training from latest checkpoint: {latest_checkpoint_path}")
-
-    checkpoint = torch.load(latest_checkpoint_path, map_location="cpu")
-
-    with full_state_dict_context(llm, rank0_only=False):
-        llm.load_state_dict(checkpoint["model_state_dict"])
-
-    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+    checkpoint = torch.load(latest_path, map_location="cpu")
+    with full_state_dict_context(setup.llm, rank0_only=False):
+        setup.llm.load_state_dict(checkpoint["model_state_dict"])
+    setup.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    setup.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
 
     start_epoch = checkpoint["epoch"] + 1
     best_val_loss = checkpoint.get("best_val_loss", float("inf"))
+    if ctx.is_main:
+        logger.info("✅ Resumed from epoch %d (best val loss %.4f).", start_epoch, best_val_loss)
+    return start_epoch, best_val_loss
 
-    del checkpoint
-    gc.collect()
 
-    dist.barrier()
-    if local_rank == 0:
-        logger.info(f"✅ Resumed successfully. Starting from epoch {start_epoch}.")
-else:
-    if local_rank == 0:
-        logger.info("🏁 No 'latest' checkpoint found. Starting training from scratch.")
+def _forward(
+    setup: DenseSetup,
+    ctx: RunContext,
+    images: torch.Tensor,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> tuple[torch.Tensor, int]:
+    """Run the frozen front end and the trainable LLM.
 
-if local_rank == 0:
-    logger.info(f"Optimizing {sum(p.numel() for p in trainable_params)} trainable parameters.")
-
-metrics_path = os.path.join(OUTPUT_DIR, "training_metrics_dense.json")
-metrics_history = {"epoch": [], "train_loss": [], "val_loss": [], "learning_rate": []}
-if local_rank == 0 and start_epoch > 0 and os.path.exists(metrics_path):
-    with open(metrics_path, "r") as f:
-        metrics_history = json.load(f)
-
-# ====================================================================================
-# 8. TRAINING LOOP
-# ====================================================================================
-if local_rank == 0:
-    logger.info(f"🚀 Starting dense model training from epoch {start_epoch}...")
-start_time = time.time()
-for epoch in range(start_epoch, NUM_EPOCHS):
-    train_sampler.set_epoch(epoch)
-    llm.train()
-    total_train_loss = 0
-    optimizer.zero_grad()
-    for i, (images, input_ids, attention_mask) in enumerate(train_loader):
-        images, input_ids, attention_mask = (
-            images.to(DEVICE),
-            input_ids.to(DEVICE),
-            attention_mask.to(DEVICE),
-        )
-
-        with autocast(device_type=AMP_DEVICE, dtype=torch.bfloat16, enabled=USE_FSDP):
-            # The VLC and embedding layers are frozen, so run them in no_grad
-            with torch.no_grad():
-                patch_embeddings = vision_encoder(images).last_hidden_state
-                visual_soft_tokens = vision_connector(patch_embeddings)
-                text_embeddings = llm.model.embed_tokens(input_ids)
-
-            combined_embeddings = torch.cat([visual_soft_tokens, text_embeddings], dim=1)
-            combined_attention_mask = torch.cat(
-                [torch.ones(visual_soft_tokens.shape[:2], device=DEVICE), attention_mask],
-                dim=1,
-            )
-
-            outputs = llm(
-                inputs_embeds=combined_embeddings,
-                attention_mask=combined_attention_mask,
-            )
-            logits = outputs.logits
-
-            num_visual_tokens = visual_soft_tokens.shape[1]
-            text_logits = logits[..., num_visual_tokens:-1, :].contiguous()
-            text_labels = input_ids[..., 1:].contiguous()
-
-            loss = loss_fn(text_logits.view(-1, llm.config.vocab_size), text_labels.view(-1))
-            loss = loss / accumulation_steps
-
-        scaler.scale(loss).backward()
-
-        if loss.item() > 0:
-            total_train_loss += loss.item() * accumulation_steps
-
-        if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
-
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-            scheduler.step()
-
-    avg_train_loss = total_train_loss / len(train_loader)
-    if local_rank == 0:
-        logger.info(f"Epoch [{epoch + 1}/{NUM_EPOCHS}] - Training Loss: {avg_train_loss:.4f}")
-
-    # --- Validation Phase ---
-    llm.eval()
-    total_val_loss = 0
+    The vision tower, the connector and the token embedding are all frozen here,
+    so the whole front end runs under ``no_grad``.
+    """
     with torch.no_grad():
-        for i, (images, input_ids, attention_mask) in enumerate(val_loader):
-            images, input_ids, attention_mask = (
-                images.to(DEVICE),
-                input_ids.to(DEVICE),
-                attention_mask.to(DEVICE),
+        patch_embeddings = setup.vision_encoder(images).last_hidden_state
+        visual_soft_tokens = setup.vision_connector(patch_embeddings)
+        text_embeddings = setup.llm.model.embed_tokens(input_ids)
+
+    combined_embeddings, combined_attention_mask = combine_sequence(
+        visual_soft_tokens, text_embeddings, attention_mask, ctx
+    )
+    outputs = setup.llm(inputs_embeds=combined_embeddings, attention_mask=combined_attention_mask)
+    return outputs.logits, visual_soft_tokens.shape[1]
+
+
+def train_one_epoch(setup: DenseSetup, ctx: RunContext, epoch: int, num_epochs: int) -> float:
+    """Run one training epoch and return the mean loss per batch."""
+    setup.train_sampler.set_epoch(epoch)
+    setup.llm.train()
+    total_train_loss = 0.0
+    setup.optimizer.zero_grad()
+
+    for i, (images, input_ids, attention_mask) in enumerate(setup.train_loader):
+        images = images.to(ctx.device)
+        input_ids = input_ids.to(ctx.device)
+        attention_mask = attention_mask.to(ctx.device)
+
+        with autocast(device_type=ctx.amp_device, dtype=torch.bfloat16, enabled=ctx.on_gpu):
+            logits, num_visual_tokens = _forward(setup, ctx, images, input_ids, attention_mask)
+            loss = shifted_caption_loss(
+                setup.loss_fn,
+                logits,
+                num_visual_tokens,
+                input_ids,
+                setup.vocab_size,
+                device=ctx.device,
             )
-            with autocast(device_type=AMP_DEVICE, dtype=torch.bfloat16, enabled=USE_FSDP):
-                patch_embeddings = vision_encoder(images).last_hidden_state
-                visual_soft_tokens = vision_connector(patch_embeddings)
-                text_embeddings = llm.model.embed_tokens(input_ids)
-                combined_embeddings = torch.cat([visual_soft_tokens, text_embeddings], dim=1)
-                combined_attention_mask = torch.cat(
-                    [torch.ones(visual_soft_tokens.shape[:2], device=DEVICE), attention_mask],
-                    dim=1,
+            loss = loss / setup.accumulation_steps
+
+        setup.scaler.scale(loss).backward()
+        if loss.item() > 0:
+            total_train_loss += loss.item() * setup.accumulation_steps
+
+        if (i + 1) % setup.accumulation_steps == 0 or (i + 1) == len(setup.train_loader):
+            setup.scaler.unscale_(setup.optimizer)
+            torch.nn.utils.clip_grad_norm_(setup.trainable_params, max_norm=1.0)
+            setup.scaler.step(setup.optimizer)
+            setup.scaler.update()
+            setup.optimizer.zero_grad()
+            setup.scheduler.step()
+
+    avg_train_loss = total_train_loss / len(setup.train_loader)
+    if ctx.is_main:
+        logger.info("Epoch [%d/%d] - Training Loss: %.4f", epoch + 1, num_epochs, avg_train_loss)
+    return avg_train_loss
+
+
+def run_validation(setup: DenseSetup, ctx: RunContext, epoch: int, num_epochs: int) -> float:
+    """Validate and average the loss across ranks."""
+    setup.llm.eval()
+    total_val_loss = 0.0
+
+    with torch.no_grad():
+        for images, input_ids, attention_mask in setup.val_loader:
+            images = images.to(ctx.device)
+            input_ids = input_ids.to(ctx.device)
+            attention_mask = attention_mask.to(ctx.device)
+
+            with autocast(device_type=ctx.amp_device, dtype=torch.bfloat16, enabled=ctx.on_gpu):
+                logits, num_visual_tokens = _forward(setup, ctx, images, input_ids, attention_mask)
+                loss = shifted_caption_loss(
+                    setup.loss_fn,
+                    logits,
+                    num_visual_tokens,
+                    input_ids,
+                    setup.vocab_size,
+                    device=ctx.device,
                 )
-                outputs = llm(
-                    inputs_embeds=combined_embeddings,
-                    attention_mask=combined_attention_mask,
-                )
-                logits = outputs.logits
-                num_visual_tokens = visual_soft_tokens.shape[1]
-                text_logits = logits[..., num_visual_tokens:-1, :].contiguous()
-                text_labels = input_ids[..., 1:].contiguous()
+            total_val_loss += loss.item()
 
-                loss = loss_fn(text_logits.view(-1, llm.config.vocab_size), text_labels.view(-1))
-                total_val_loss += loss.item()
-
-    avg_val_loss = total_val_loss / len(val_loader)
-
-    val_loss_tensor = torch.tensor(avg_val_loss).to(DEVICE)
+    avg_val_loss = total_val_loss / len(setup.val_loader)
+    val_loss_tensor = torch.tensor(avg_val_loss).to(ctx.device)
     dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
     avg_val_loss = val_loss_tensor.item()
 
-    if local_rank == 0:
-        logger.info(f"Epoch [{epoch + 1}/{NUM_EPOCHS}] - Validation Loss: {avg_val_loss:.4f}")
+    if ctx.is_main:
+        logger.info("Epoch [%d/%d] - Validation Loss: %.4f", epoch + 1, num_epochs, avg_val_loss)
+    return avg_val_loss
 
-    # --- Metrics and Checkpoint Saving ---
-    if local_rank == 0:
-        metrics_history["epoch"].append(epoch + 1)
-        metrics_history["train_loss"].append(avg_train_loss)
-        metrics_history["val_loss"].append(avg_val_loss)
-        metrics_history["learning_rate"].append(optimizer.param_groups[0]["lr"])
-        with open(metrics_path, "w") as f:
-            json.dump(metrics_history, f, indent=4)
-        logger.info(f"✅ Metrics saved to {metrics_path}")
 
-    with full_state_dict_context(llm, rank0_only=True):
-        llm_state_dict = llm.state_dict()
+def save_checkpoints(
+    setup: DenseSetup,
+    ctx: RunContext,
+    checkpoint_dir: str,
+    epoch: int,
+    avg_val_loss: float,
+    best_val_loss: float,
+) -> float:
+    """Save the latest and, if improved, the best checkpoint. Returns the best."""
+    # Gathering sharded parameters is collective — every rank must enter.
+    with full_state_dict_context(setup.llm, rank0_only=True):
+        llm_state_dict = setup.llm.state_dict()
 
-    if local_rank == 0:
-        consolidated_checkpoint = {
+    if ctx.is_main:
+        checkpoint = {
             "model_state_dict": llm_state_dict,
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
+            "optimizer_state_dict": setup.optimizer.state_dict(),
+            "scheduler_state_dict": setup.scheduler.state_dict(),
             "epoch": epoch,
             "best_val_loss": best_val_loss,
             "current_val_loss": avg_val_loss,
         }
-
-        os.makedirs(DENSE_CHECKPOINT_DIR, exist_ok=True)
-
-        latest_checkpoint_path = os.path.join(DENSE_CHECKPOINT_DIR, "dense_latest.pth")
-        torch.save(consolidated_checkpoint, latest_checkpoint_path)
-        logger.debug(f"💾 Saved latest checkpoint to {latest_checkpoint_path}")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        torch.save(checkpoint, os.path.join(checkpoint_dir, "dense_latest.pth"))
 
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            consolidated_checkpoint["best_val_loss"] = best_val_loss
-
-            best_checkpoint_path = os.path.join(DENSE_CHECKPOINT_DIR, "dense_best.pth")
-            torch.save(consolidated_checkpoint, best_checkpoint_path)
-            logger.info(
-                f"🏆 New best model! Val loss: {avg_val_loss:.4f}. Saved to {best_checkpoint_path}"
-            )
+            checkpoint["best_val_loss"] = best_val_loss
+            best_path = os.path.join(checkpoint_dir, "dense_best.pth")
+            torch.save(checkpoint, best_path)
+            logger.info("🏆 New best model! Val loss: %.4f. Saved to %s", avg_val_loss, best_path)
 
     dist.barrier()
+    return best_val_loss
 
-if local_rank == 0:
-    end_time = time.time()
-    duration_seconds = end_time - start_time
-    hours = int(duration_seconds // 3600)
-    minutes = int((duration_seconds % 3600) // 60)
-    seconds = int(duration_seconds % 60)
-    logger.info(f"--- Total Training Time: {hours}h {minutes}m {seconds}s ---")
 
-dist.destroy_process_group()
-logger.info("Job finished.")
+def build_setup(
+    paths: dict[str, Any],
+    train_params: dict[str, Any],
+    loader_params: dict[str, Any],
+    num_epochs: int,
+    ctx: RunContext,
+) -> DenseSetup:
+    """Assemble every component the epoch loop needs, in dependency order."""
+    output_dir = paths["output_dir"]
+
+    vision_encoder, clip_processor, tokenizer, _ = build_backbones(paths, ctx)
+    llm = build_dense_llm(paths, ctx)
+    vocab_size = llm.config.vocab_size
+
+    vision_connector = build_vision_connector(vision_encoder, llm, ctx, trainable=False)
+
+    # The dense baseline shards the embedding along with everything else — it
+    # does not pass ignored_modules, unlike the MoE stages.
+    llm = wrap_with_fsdp(llm, ctx, offload_params=True, ignore_embeddings=False)
+
+    stage1_path = os.path.join(output_dir, "vision_connector_stage1_best.pth")
+    if os.path.exists(stage1_path):
+        logger.debug("💾 Loading Stage 1 connector weights from %s", stage1_path)
+        vision_connector.load_state_dict(torch.load(stage1_path, map_location=ctx.device))
+    dist.barrier()
+
+    if ctx.is_main:
+        logger.info("Creating datasets and dataloaders...")
+    common = {
+        "image_dir": paths["image_dir"],
+        "annotations_file": paths["annotations_file"],
+        "clip_processor": clip_processor,
+        "tokenizer": tokenizer,
+        "subset_fraction": train_params["subset_fraction"],
+        "seed": loader_params.get("data_seed", 42),
+    }
+    train_loader, val_loader, train_sampler = build_distributed_loaders(
+        COCO_Loader(split="train", **common),
+        COCO_Loader(split="val", **common),
+        train_params,
+        loader_params,
+        ctx,
+    )
+
+    accumulation_steps = train_params.get("gradient_accumulation_steps", 1)
+    trainable_params = [p for p in llm.parameters() if p.requires_grad]
+    optimizer = optim.AdamW(
+        trainable_params,
+        lr=train_params["learning_rate"],
+        weight_decay=train_params["weight_decay"],
+        fused=True,
+    )
+    scaler = GradScaler(ctx.amp_device, enabled=ctx.on_gpu)
+    scheduler = CosineAnnealingLR(
+        optimizer, T_max=(len(train_loader) // accumulation_steps) * num_epochs
+    )
+    loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+
+    return DenseSetup(
+        llm=llm,
+        vision_encoder=vision_encoder,
+        vision_connector=vision_connector,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        train_sampler=train_sampler,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        loss_fn=loss_fn,
+        trainable_params=trainable_params,
+        accumulation_steps=accumulation_steps,
+        vocab_size=vocab_size,
+    )
+
+
+def main() -> None:
+    """Assemble the dense control run and drive the epoch loop."""
+    config = load_config()
+    paths = config["paths"]
+    train_params = config["dense_control"]
+    loader_params = config["dataloader"]
+    num_epochs = train_params["num_epochs"]
+    output_dir = paths["output_dir"]
+    checkpoint_dir = os.path.join(output_dir, "dense_checkpoints")
+
+    ctx = build_run_context(
+        distributed=True,
+        seed=loader_params.get("data_seed", 42),
+        stage_name="the dense control",
+    )
+    if ctx.is_main:
+        logger.info("--- Initializing Dense Control Model Training ---")
+
+    setup = build_setup(paths, train_params, loader_params, num_epochs, ctx)
+    start_epoch, best_val_loss = resume_from_checkpoint(setup, checkpoint_dir, ctx)
+
+    metrics_path = os.path.join(output_dir, "training_metrics_dense.json")
+    metrics_history: dict[str, list] = {
+        "epoch": [],
+        "train_loss": [],
+        "val_loss": [],
+        "learning_rate": [],
+    }
+    if ctx.is_main and start_epoch > 0 and os.path.exists(metrics_path):
+        with open(metrics_path) as f:
+            metrics_history = json.load(f)
+
+    if ctx.is_main:
+        logger.info("🚀 Starting dense control training...")
+
+    start_time = time.time()
+    for epoch in range(start_epoch, num_epochs):
+        avg_train_loss = train_one_epoch(setup, ctx, epoch, num_epochs)
+        avg_val_loss = run_validation(setup, ctx, epoch, num_epochs)
+
+        if ctx.is_main:
+            metrics_history["epoch"].append(epoch + 1)
+            metrics_history["train_loss"].append(avg_train_loss)
+            metrics_history["val_loss"].append(avg_val_loss)
+            metrics_history["learning_rate"].append(setup.optimizer.param_groups[0]["lr"])
+            with open(metrics_path, "w") as f:
+                json.dump(metrics_history, f, indent=4)
+            logger.info("✅ Metrics saved to %s", metrics_path)
+
+        best_val_loss = save_checkpoints(
+            setup, ctx, checkpoint_dir, epoch, avg_val_loss, best_val_loss
+        )
+
+    if ctx.is_main:
+        duration = int(time.time() - start_time)
+        logger.info(
+            "--- Total Training Time: %dh %dm %ds ---",
+            duration // 3600,
+            (duration % 3600) // 60,
+            duration % 60,
+        )
+
+    teardown()
+    logger.info("Job finished.")
+
+
+if __name__ == "__main__":
+    main()
