@@ -51,6 +51,7 @@ from training_scripts._lib import (
     build_run_context,
     build_vision_connector,
     combine_sequence,
+    load_matching_weights,
     shifted_caption_loss,
     teardown,
     wrap_with_fsdp,
@@ -154,8 +155,9 @@ def resume_from_checkpoint(
                 gc.collect()
             else:
                 state_dict_to_load = {}
-            # strict=False because rank0_only loading gives other ranks nothing.
-            llm.load_state_dict(state_dict_to_load, strict=False)
+            # A partial load is expected here: rank0_only gives the other ranks
+            # an empty dict on purpose. An empty *overlap* on rank 0 is not.
+            load_matching_weights(llm, state_dict_to_load, source=latest_path)
 
     state_data = [latest_epoch, best_val_loss]
     dist.broadcast_object_list(state_data, src=0)
@@ -308,6 +310,12 @@ def save_checkpoints(
 
     if ctx.is_main:
         os.makedirs(checkpoint_dir, exist_ok=True)
+        # Update the best *before* writing either file: the latest checkpoint is
+        # what resumption reads, so recording a stale best there would let the
+        # next epoch overwrite a better model.
+        improved = avg_val_loss < best_val_loss
+        if improved:
+            best_val_loss = avg_val_loss
         checkpoint = {
             "epoch": epoch + 1,
             "model_state_dict": cpu_state_dict,
@@ -318,9 +326,7 @@ def save_checkpoints(
         }
         torch.save(checkpoint, os.path.join(checkpoint_dir, "llm_stage2_latest.pth"))
 
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            checkpoint["best_val_loss"] = best_val_loss
+        if improved:
             best_path = os.path.join(checkpoint_dir, "llm_stage2_best.pth")
             torch.save(checkpoint, best_path)
             logger.info(

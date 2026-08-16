@@ -121,6 +121,20 @@ class TestSharedLibrary:
         assert "FSDP(" not in source, f"{name} constructs FSDP directly instead of using _lib"
         assert "wrap_with_fsdp" in source
 
+    @pytest.mark.parametrize("name", list(SCRIPTS))
+    def test_no_script_loads_weights_without_the_guard(self, name):
+        """``strict=False`` must go through ``load_matching_weights``.
+
+        A bare ``load_state_dict(..., strict=False)`` accepts a state dict that
+        matches the model in no key at all: it loads nothing and returns
+        normally. That is how Stages 2.5 and 3 spent months starting from their
+        Stage 0 experts while logging that the Stage 2 checkpoint had loaded.
+        """
+        source = (SCRIPT_DIR / f"{FILENAMES[name]}.py").read_text()
+        assert "strict=False" not in source, (
+            f"{name}: use _lib.load_matching_weights instead of a bare strict=False load"
+        )
+
     def test_run_context_reports_main_rank(self):
         from training_scripts._lib import RunContext
 

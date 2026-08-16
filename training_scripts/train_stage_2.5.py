@@ -54,7 +54,9 @@ from training_scripts._lib import (
     build_run_context,
     build_vision_connector,
     combine_sequence,
+    load_matching_weights,
     shifted_caption_loss,
+    state_dict_from,
     teardown,
     wrap_with_fsdp,
 )
@@ -129,9 +131,11 @@ def load_stage2_experts(llm: nn.Module, checkpoint_dir: str, ctx: RunContext) ->
     if ctx.is_main:
         logger.debug("💾 Loading Stage 2 expert weights from %s", checkpoint_path)
 
-    state_dict = torch.load(checkpoint_path, map_location="cpu")
+    # state_dict_from accepts both checkpoint shapes; load_matching_weights
+    # raises rather than leaving the model on its Stage 0 weights.
+    state_dict = state_dict_from(checkpoint_path)
     with full_state_dict_context(llm, rank0_only=False):
-        llm.load_state_dict(state_dict, strict=False)
+        load_matching_weights(llm, state_dict, source=checkpoint_path)
 
     del state_dict
     gc.collect()
@@ -466,6 +470,10 @@ def save_checkpoints(
             for name, weight in full_state_dict.items()
             if setup.llm.get_parameter(name).requires_grad
         }
+        # Update the best before writing either file — see train_stage_2.py.
+        improved = avg_val_loss < best_val_loss
+        if improved:
+            best_val_loss = avg_val_loss
         checkpoint = {
             "model_state_dict": router_weights,
             "optimizer_state_dict": setup.optimizer.state_dict(),
@@ -478,9 +486,7 @@ def save_checkpoints(
         os.makedirs(checkpoint_dir, exist_ok=True)
         torch.save(checkpoint, os.path.join(checkpoint_dir, "llm_stage2_5_latest.pth"))
 
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            checkpoint["best_val_loss"] = best_val_loss
+        if improved:
             best_path = os.path.join(checkpoint_dir, "llm_stage2_5_best.pth")
             torch.save(checkpoint, best_path)
             logger.info("🏆 New best model! Val loss: %.4f. Saved to %s", avg_val_loss, best_path)
@@ -502,7 +508,9 @@ def resume_from_checkpoint(
 
     checkpoint = torch.load(latest_path, map_location="cpu")
     with full_state_dict_context(setup.llm, rank0_only=False):
-        setup.llm.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        # Only the router weights are stored, so most keys are legitimately
+        # missing — but not all of them.
+        load_matching_weights(setup.llm, checkpoint["model_state_dict"], source=latest_path)
     setup.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     setup.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
 

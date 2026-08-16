@@ -243,6 +243,10 @@ def save_checkpoints(
         llm_state_dict = setup.llm.state_dict()
 
     if ctx.is_main:
+        # Update the best before writing either file — see train_stage_2.py.
+        improved = avg_val_loss < best_val_loss
+        if improved:
+            best_val_loss = avg_val_loss
         checkpoint = {
             "model_state_dict": llm_state_dict,
             "optimizer_state_dict": setup.optimizer.state_dict(),
@@ -254,9 +258,7 @@ def save_checkpoints(
         os.makedirs(checkpoint_dir, exist_ok=True)
         torch.save(checkpoint, os.path.join(checkpoint_dir, "dense_latest.pth"))
 
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            checkpoint["best_val_loss"] = best_val_loss
+        if improved:
             best_path = os.path.join(checkpoint_dir, "dense_best.pth")
             torch.save(checkpoint, best_path)
             logger.info("🏆 New best model! Val loss: %.4f. Saved to %s", avg_val_loss, best_path)

@@ -54,8 +54,10 @@ from training_scripts._lib import (
     build_run_context,
     build_vision_connector,
     combine_sequence,
+    load_matching_weights,
     move_batch,
     save_expert_metrics,
+    state_dict_from,
     teardown,
     wrap_with_fsdp,
 )
@@ -195,18 +197,16 @@ def load_stage2_experts(llm: nn.Module, checkpoint_dir: str, ctx: RunContext) ->
     if ctx.is_main:
         logger.debug("💾 Loading Stage 2 (expert) checkpoint: %s", checkpoint_path)
 
-    state_dict = torch.load(checkpoint_path, map_location="cpu")
+    # state_dict_from accepts both checkpoint shapes; load_matching_weights
+    # raises rather than leaving the model on its Stage 0 weights.
+    state_dict = state_dict_from(checkpoint_path)
     # rank0_only keeps loading agnostic to the number of GPUs.
     with full_state_dict_context(llm, rank0_only=True):
-        missing_keys, unexpected_keys = llm.load_state_dict(state_dict, strict=False)
+        missing_keys, _ = load_matching_weights(llm, state_dict, source=checkpoint_path)
         if ctx.is_main:
             if missing_keys:
                 logger.debug("  ⚠️  Missing keys (%d): %s...", len(missing_keys), missing_keys[:5])
-            if unexpected_keys:
-                logger.debug(
-                    "  ⚠️  Unexpected keys (%d): %s...", len(unexpected_keys), unexpected_keys[:5]
-                )
-            if not missing_keys and not unexpected_keys:
+            else:
                 logger.info("  ✅ All keys matched perfectly!")
 
     del state_dict
@@ -321,7 +321,7 @@ def maybe_resume(
 
     checkpoint = torch.load(portable_path, map_location="cpu")
     with full_state_dict_context(llm, rank0_only=True):
-        llm.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        load_matching_weights(llm, checkpoint["model_state_dict"], source=portable_path)
     vision_connector.load_state_dict(checkpoint["connector_state_dict"])
 
     start_epoch = checkpoint["epoch"] + 1
@@ -580,6 +580,10 @@ def save_checkpoints(
         checkpoint_start = time.time()
         os.makedirs(checkpoint_dir, exist_ok=True)
 
+        # Update the best before writing either file — see train_stage_2.py.
+        improved = avg_val_loss < best_val_loss
+        if improved:
+            best_val_loss = avg_val_loss
         full_checkpoint = {
             "model_state_dict": llm_state_dict,
             "connector_state_dict": connector_state_dict,
@@ -604,9 +608,7 @@ def save_checkpoints(
         )
         logger.info("  ✅ Saved latest checkpoint (%.1fs)", time.time() - checkpoint_start)
 
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            full_checkpoint["best_val_loss"] = best_val_loss
+        if improved:
             torch.save(full_checkpoint, os.path.join(checkpoint_dir, "llm_stage3_best.pth"))
             torch.save(
                 portable_checkpoint,
