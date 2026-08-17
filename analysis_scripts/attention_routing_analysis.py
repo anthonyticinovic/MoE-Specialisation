@@ -37,7 +37,7 @@ class AttentionRoutingAnalyzer(CrossModalityPurityAnalyzer):
     expert routing decisions.
     """
 
-    def __init__(self, config_path: str = "configs/training_config.yaml", device: str = "cuda"):
+    def __init__(self, config_path: str | None = None, device: str | None = None):
         super().__init__(config_path, device)
 
     def extract_random_samples(
@@ -492,7 +492,7 @@ def main():
     parser.add_argument(
         "--device",
         type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
+        default=None,
         help="Device to run on (cuda or cpu)",
     )
 

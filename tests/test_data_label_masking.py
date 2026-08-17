@@ -11,6 +11,7 @@ from unittest.mock import patch
 import pytest
 import torch
 from PIL import Image
+from torch.utils.data import DataLoader
 
 # ---------------------------------------------------------------------------
 # Shared fakes
@@ -267,3 +268,119 @@ class TestCOCOLoader:
         ds1 = self._make_loader(tmp_path, seed=42)
         ds2 = self._make_loader(tmp_path, seed=42)
         assert [a["id"] for a in ds1.annotations] == [a["id"] for a in ds2.annotations]
+
+
+# ---------------------------------------------------------------------------
+# The dataset contract: every index yields a full, stackable sample
+# ---------------------------------------------------------------------------
+
+
+class TestDatasetContract:
+    """Both loaders once returned degenerate values for a ``collate_fn`` that
+    was never written — ``None`` from COCO, length-1 tensors from LLaVA. The
+    training scripts use the default collate, so those paths logged a warning
+    and then died several lines later inside ``default_collate`` with an
+    unrelated-looking error. The contract is now: an unusable sample never
+    enters the dataset, and anything that goes wrong afterwards raises.
+    """
+
+    def _coco(self, tmp_path, present, **kwargs):
+        from data.COCO_loader import COCO_Loader
+
+        for i in present:
+            Image.new("RGB", (4, 4)).save(tmp_path / f"{i:012d}.jpg")
+        with patch("data.COCO_loader.COCO", return_value=FakeCOCO(10)):
+            return COCO_Loader(
+                image_dir=str(tmp_path),
+                annotations_file="fake_annotations.json",
+                clip_processor=FakeProcessor(),
+                tokenizer=FakeTokenizer(),
+                split=kwargs.pop("split", "train"),
+                val_split_fraction=kwargs.pop("val_split_fraction", 0.0),
+                **kwargs,
+            )
+
+    def _llava(self, tmp_path, present, **kwargs):
+        from data.LLaVA_loader import LLaVA_Loader
+
+        img_dir = tmp_path / "images"
+        img_dir.mkdir(exist_ok=True)
+        for i in present:
+            Image.new("RGB", (4, 4)).save(img_dir / f"image_{i:06d}.jpg")
+        json_path = tmp_path / "llava.json"
+        json_path.write_text(json.dumps(_make_llava_json(10)))
+        return LLaVA_Loader(
+            annotations_file=str(json_path),
+            image_dir=str(img_dir),
+            clip_processor=FakeProcessor(),
+            tokenizer=FakeTokenizer(),
+            split=kwargs.pop("split", "train"),
+            val_fraction=kwargs.pop("val_fraction", 0.0),
+            **kwargs,
+        )
+
+    # -- COCO ---------------------------------------------------------------
+
+    def test_coco_drops_samples_with_no_image_file(self, tmp_path):
+        ds = self._coco(tmp_path, present=range(7))
+        assert len(ds) == 7
+        assert all(a["image_id"] < 7 for a in ds.annotations)
+
+    def test_coco_batches_when_images_are_missing(self, tmp_path):
+        """The regression: `default_collate` raised `TypeError` on the `None`."""
+        ds = self._coco(tmp_path, present=range(7))
+        loader = DataLoader(ds, batch_size=4)
+        batches = list(loader)
+        assert sum(b[0].shape[0] for b in batches) == 7
+
+    def test_coco_raises_if_an_image_disappears_mid_run(self, tmp_path):
+        ds = self._coco(tmp_path, present=range(10))
+        (tmp_path / f"{ds.annotations[0]['image_id']:012d}.jpg").unlink()
+        with pytest.raises(FileNotFoundError, match="disappeared"):
+            ds[0]
+
+    def test_coco_rejects_an_unknown_split(self, tmp_path):
+        with pytest.raises(ValueError, match="split must be"):
+            self._coco(tmp_path, present=range(10), split="test")
+
+    def test_coco_max_length_is_configurable(self, tmp_path):
+        ds = self._coco(tmp_path, present=range(10), max_length=64)
+        _, input_ids, attention_mask = ds[0]
+        assert input_ids.shape[0] == 64
+        assert attention_mask.shape[0] == 64
+
+    # -- LLaVA --------------------------------------------------------------
+
+    def test_llava_drops_samples_with_no_image_file(self, tmp_path):
+        ds = self._llava(tmp_path, present=range(6))
+        assert len(ds) == 6
+
+    def test_llava_batches_when_images_are_missing(self, tmp_path):
+        """The regression: the blank-image fallback trained on black pixels."""
+        ds = self._llava(tmp_path, present=range(6))
+        loader = DataLoader(ds, batch_size=3)
+        batches = list(loader)
+        assert sum(b[0].shape[0] for b in batches) == 6
+
+    def test_llava_raises_if_an_image_disappears_mid_run(self, tmp_path):
+        ds = self._llava(tmp_path, present=range(10))
+        (tmp_path / "images" / ds.data[0]["image"]).unlink()
+        with pytest.raises(OSError, match="existed when the dataset was built"):
+            ds[0]
+
+    def test_llava_rejects_an_unknown_split(self, tmp_path):
+        with pytest.raises(ValueError, match="split must be"):
+            self._llava(tmp_path, present=range(10), split="test")
+
+    def test_llava_max_length_is_configurable(self, tmp_path):
+        ds = self._llava(tmp_path, present=range(10), max_length=64)
+        _, input_ids, attention_mask, labels = ds[0]
+        assert input_ids.shape[0] == 64
+        assert attention_mask.shape[0] == 64
+        assert labels.shape[0] == 64
+
+    def test_llava_every_sample_is_the_same_length(self, tmp_path):
+        """Length-1 fallbacks made `default_collate` raise on a mixed batch."""
+        ds = self._llava(tmp_path, present=range(10))
+        lengths = {ds[i][1].shape[0] for i in range(len(ds))}
+        assert lengths == {ds.max_length}

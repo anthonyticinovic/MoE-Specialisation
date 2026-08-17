@@ -180,3 +180,48 @@ class TestSkipBehaviour:
         result = checks.check_experts_diverged(tmp_path, tmp_path / "absent.pth")
         assert result.skipped
         assert result.passed
+
+
+class TestAnalysisChecks:
+    """The two invariants covering the analysis half of the repo."""
+
+    def _results(self, tmp_path, normal, flipped):
+        payload = {
+            "num_samples": len(normal),
+            "normal_routing": {"losses": normal},
+            "flipped_routing": {"losses": flipped},
+            "delta": {"percent": 1.0},
+        }
+        path = tmp_path / "routing_ablation_results.json"
+        path.write_text(json.dumps(payload))
+        return path
+
+    def test_missing_results_file_fails(self, tmp_path):
+        """The analysis stage running is itself the check: a silent skip here
+        would restore the state N2 fixed, where the demo covered no analysis
+        code at all."""
+        result = checks.check_routing_ablation_ran(tmp_path / "absent.json")
+        assert not result.passed
+
+    def test_non_finite_loss_is_caught(self, tmp_path):
+        path = self._results(tmp_path, [1.0, float("nan")], [1.1, 1.2])
+        assert not checks.check_routing_ablation_ran(path).passed
+
+    def test_mismatched_series_lengths_are_caught(self, tmp_path):
+        path = self._results(tmp_path, [1.0, 1.1], [1.2])
+        assert not checks.check_routing_ablation_ran(path).passed
+
+    def test_specialised_experts_pass(self, tmp_path):
+        path = self._results(tmp_path, [1.0, 1.1], [1.2, 1.3])
+        assert checks.check_flipped_routing_is_worse(path).passed
+
+    def test_a_single_sample_that_prefers_the_flip_fails(self, tmp_path):
+        path = self._results(tmp_path, [1.0, 1.1], [1.2, 0.9])
+        result = checks.check_flipped_routing_is_worse(path)
+        assert not result.passed
+        assert "did not specialise" in result.detail
+
+    def test_identical_losses_fail(self, tmp_path):
+        """Equal losses mean routing made no difference — the experts are copies."""
+        path = self._results(tmp_path, [1.0, 1.1], [1.0, 1.1])
+        assert not checks.check_flipped_routing_is_worse(path).passed

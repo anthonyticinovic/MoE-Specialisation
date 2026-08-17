@@ -42,3 +42,18 @@ jobs:
         run: uv run mypy
       - name: Pytest
         run: uv run pytest -q
+      # The demo is the repo's headline artefact and the only check that runs
+      # the real training scripts end to end. The unit suite can stay green
+      # while the pipeline itself is broken — that is exactly the regression
+      # this step exists to catch. ~20s, CPU-only, no network (HF_HUB_OFFLINE).
+      - name: Demo pipeline (CPU, end to end)
+        run: uv run python demo/run_demo.py
+      - name: Upload demo report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-output
+          path: |
+            demo_output/demo_report.md
+            demo_output/logs/
+          if-no-files-found: ignore

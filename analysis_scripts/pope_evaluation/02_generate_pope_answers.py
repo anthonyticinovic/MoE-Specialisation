@@ -27,7 +27,7 @@ from karpathy_utils import (
     save_json,
 )
 from pope_utils import extract_yes_no_answer, extract_yes_no_answer_primed
-from models.utils.common import setup_logging
+from models.utils.common import get_device, setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +41,7 @@ def generate_pope_answers(
     max_new_tokens: int = 10,
     temperature: float = 0.0,  # Greedy decoding for yes/no
     batch_size: int = 1,  # Process one at a time for yes/no questions
-    device: str = "cuda",
+    device: str | None = None,
     stage_name: str = "stage2",
 ) -> list[dict]:
     """
@@ -62,6 +62,7 @@ def generate_pope_answers(
     Returns:
         results: List of questions with 'predicted_answer' added
     """
+    device = device or get_device()
     model.eval()
     model.to(device)
 
@@ -283,7 +284,7 @@ def generate_answers_primed(
     image_dir,
     processor,
     tokenizer,
-    device="cuda",
+    device=None,
     max_new_tokens=10,
     temperature=0.0,
     stage_name="stage3",
@@ -312,6 +313,7 @@ def generate_answers_primed(
     Returns:
         results: List of questions with 'predicted_answer' added
     """
+    device = device or get_device()
     model.eval()
     model.to(device)
 
@@ -530,7 +532,9 @@ def main():
     parser.add_argument(
         "--temperature", type=float, default=0.0, help="Sampling temperature (0.0 for greedy)"
     )
-    parser.add_argument("--device", type=str, default="cuda", help="Device (cuda or cpu)")
+    parser.add_argument(
+        "--device", type=str, default=get_device(), help="Device (default: cuda if available)"
+    )
     parser.add_argument(
         "--use-priming",
         action="store_true",

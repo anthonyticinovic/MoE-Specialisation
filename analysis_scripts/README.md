@@ -16,6 +16,15 @@ Fill in every `YOUR_PATH_HERE` placeholder in `configs/training_config.yaml`
 first — all scripts read model/data paths from there via the shared loader,
 which fails fast with a clear message if a placeholder is left unfilled.
 
+To run against a different config, set `MOE_CONFIG` rather than editing
+anything; the resolution order is the explicit `--training-config` argument,
+then `$MOE_CONFIG`, then the repo default. This is the same mechanism the CPU
+demo uses to drive the training scripts, and the reason
+`routing_ablation_experiment.py` is now the demo's final step. Device follows
+the same pattern: leave `--device` unset and `get_device()` picks CUDA when it
+is available and CPU otherwise, and the model dtype follows the device
+(bfloat16 on GPU, float32 on CPU).
+
 MoE model registration with HuggingFace `AutoModel` is handled automatically by
 the shared model loader (`_lib.model_loading`) — you no longer need to register
 it per script.

@@ -383,6 +383,66 @@ def check_losses_finite(runs_dir: Path, metric_files: dict[str, str]) -> CheckRe
 
 
 # ----------------------------------------------------------------------------
+# Analysis — the routing claim, run rather than plotted
+# ----------------------------------------------------------------------------
+
+
+def check_routing_ablation_ran(results_path: Path) -> CheckResult:
+    """The analysis script must produce a complete, finite result file.
+
+    This is the only invariant that covers the analysis half of the repo. It
+    fails if the config seam breaks again — pointing an analysis script at a
+    non-default config used to raise on the ``YOUR_PATH_HERE`` placeholder,
+    because the loader took an explicit default path and never consulted
+    ``MOE_CONFIG``.
+    """
+    name = "analysis: routing ablation produced results"
+    if not results_path.exists():
+        return _fail(name, f"{results_path} was not written")
+
+    results = json.loads(results_path.read_text())
+    normal = results["normal_routing"]["losses"]
+    flipped = results["flipped_routing"]["losses"]
+
+    if not normal or len(normal) != len(flipped):
+        return _fail(name, f"{len(normal)} normal vs {len(flipped)} flipped losses")
+    if not all(math.isfinite(value) for value in normal + flipped):
+        return _fail(name, "the ablation produced a non-finite loss")
+    return _ok(name, f"{len(normal)} samples under both routings, all finite")
+
+
+def check_flipped_routing_is_worse(results_path: Path) -> CheckResult:
+    """Swapping the experts must hurt — on every sample, not just on average.
+
+    Stage 2 trains expert 0 on visual positions and expert 1 on text positions
+    and nothing else. If sending each modality to the other expert costs
+    nothing, the experts did not specialise and the premise of the study is
+    gone. Asserting it per sample rather than on the mean makes the check
+    independent of how many fixtures the demo happens to build.
+    """
+    name = "analysis: flipped routing is worse on every sample"
+    if not results_path.exists():
+        return _skip(name, "No ablation results")
+
+    results = json.loads(results_path.read_text())
+    pairs = list(
+        zip(results["normal_routing"]["losses"], results["flipped_routing"]["losses"], strict=True)
+    )
+    if not pairs:
+        return _skip(name, "No ablation results")
+
+    better_flipped = [i for i, (normal, flipped) in enumerate(pairs) if flipped <= normal]
+    if better_flipped:
+        return _fail(
+            name,
+            f"{len(better_flipped)}/{len(pairs)} samples were no worse under flipped "
+            f"routing (indices {better_flipped[:5]}) — the experts did not specialise",
+        )
+    delta = results["delta"]["percent"]
+    return _ok(name, f"{len(pairs)}/{len(pairs)} samples worse when flipped (+{delta:.1f}% mean)")
+
+
+# ----------------------------------------------------------------------------
 # Driver
 # ----------------------------------------------------------------------------
 
@@ -394,6 +454,7 @@ def run_all(output_root: Path, metric_files: dict[str, str]) -> list[CheckResult
     moe_dir = fixtures / "moe_model"
     stage2_ckpt = runs / "stage2_checkpoints" / "llm_stage2_best.pth"
     stage2_5_ckpt = runs / "stage2_5_checkpoints" / "llm_stage2_5_best.pth"
+    ablation = output_root / "analysis" / "routing_ablation" / "routing_ablation_results.json"
 
     metrics_files = sorted((runs / "expert_metrics").glob("expert_metrics_epoch_*.json"))
     metrics = json.loads(metrics_files[-1].read_text()) if metrics_files else None
@@ -416,4 +477,6 @@ def run_all(output_root: Path, metric_files: dict[str, str]) -> list[CheckResult
         check_all_layers_reported(metrics, expected_layers),
         check_checkpoints_finite(runs),
         check_losses_finite(runs, metric_files),
+        check_routing_ablation_ran(ablation),
+        check_flipped_routing_is_worse(ablation),
     ]

@@ -47,8 +47,9 @@ STAGES: dict[str, tuple[str, list[str]]] = {
         "Dense — control baseline",
         [sys.executable, "training_scripts/train_dense.py"],
     ),
+    "analysis": ("Analysis — routing ablation", []),  # filled in at runtime (needs paths)
 }
-DEFAULT_STAGES = ["0", "1", "2", "2.5", "3", "dense"]
+DEFAULT_STAGES = ["0", "1", "2", "2.5", "3", "dense", "analysis"]
 
 
 def _reset_run_artifacts(output_root: Path) -> None:
@@ -58,7 +59,7 @@ def _reset_run_artifacts(output_root: Path) -> None:
     figures and logs are outputs and must not survive into a run against
     freshly-built fixtures.
     """
-    for name in ("runs", "figures", "logs"):
+    for name in ("runs", "figures", "logs", "analysis"):
         target = output_root / name
         if target.exists():
             shutil.rmtree(target)
@@ -128,6 +129,26 @@ def main() -> int:
             str(fixtures / "base_llm"),
             "--output",
             str(fixtures / "moe_model"),
+        ],
+    )
+
+    # The analysis half of the repo used to be unreachable from here: its
+    # config loader took an explicit default path, which bypassed MOE_CONFIG.
+    # Running one analysis script against the checkpoints the earlier stages
+    # just produced is what keeps that seam honest.
+    STAGES["analysis"] = (
+        "Analysis — routing ablation",
+        [
+            sys.executable,
+            "analysis_scripts/routing_ablation_experiment.py",
+            "--image-dir",
+            str(fixtures / "data" / "images"),
+            "--annotations",
+            str(fixtures / "data" / "coco_captions.json"),
+            "--num-samples",
+            str(args.num_images),
+            "--output-dir",
+            str(output_root / "analysis" / "routing_ablation"),
         ],
     )
 

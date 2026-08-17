@@ -13,31 +13,36 @@ See the paper for the full method and results.
 
 ## Run it in 30 seconds (no GPU, no data, no downloads)
 
-The full pipeline — Stage 0 → 1 → 2 → 2.5 → 3, plus the dense control — runs on
-a laptop CPU against generated fixtures:
+The full pipeline — Stage 0 → 1 → 2 → 2.5 → 3, the dense control, and one
+analysis script — runs on a laptop CPU against generated fixtures:
 
 ```bash
 uv sync --group dev
 make demo
 ```
 
-About 20 seconds. It writes 12 checkpoints, routing metrics, four figures and a
-one-page `demo_output/demo_report.md`.
+About 20 seconds. It writes 12 checkpoints, routing metrics, four figures, the
+routing-ablation results and a one-page `demo_output/demo_report.md`.
 
-The report leads with **12 executable invariants** — properties that must hold
+The report leads with **14 executable invariants** — properties that must hold
 for the pipeline to be correct, not just for it to exit zero. Among them: the
 two experts must start bit-identical (Stage 0 copies the base FFN into both) and
 must have diverged after Stage 2; hard routing must dispatch each token to
 exactly the masked expert; Stage 2 must leave every non-expert weight untouched;
 Stage 2.5 must move the gates and *only* the gates; routing entropy must stay
-within `[0, ln N]`. A failing invariant fails the run, so `make check` catches a
-refactor that runs cleanly but behaves wrongly.
+within `[0, ln N]`; and swapping the two experts at inference must raise the
+loss on **every** sample, which is the paper's specialisation claim reduced to
+something a machine can check. A failing invariant fails the run, so `make
+check` catches a refactor that runs cleanly but behaves wrongly.
 
 This runs the **real training scripts**, not a reimplementation: the same
 `train_stage_*.py` files used on the H100 cluster, pointed at a miniature config
 via `MOE_CONFIG`. What differs is only scale and device — a 2-layer/64-hidden
 Mistral, a 4-patch CLIP tower, 24 synthetic images, and CPU fallbacks for FSDP,
-8-bit loading and FlashAttention. Nothing is stubbed.
+8-bit loading and FlashAttention. Nothing is stubbed. The final step drives
+`analysis_scripts/routing_ablation_experiment.py` against the Stage 2
+checkpoint the run just produced, so the analysis code is covered by the same
+mechanism.
 
 It is a smoke test, not a result: a randomly-initialised 2-layer model cannot
 caption anything, and the routing metrics sit near an even split. The point is
@@ -45,7 +50,8 @@ that the pipeline, the checkpoint formats and the routing instrumentation are
 verifiably intact — and that a reader can confirm that themselves without a
 cluster.
 
-`make check` runs the lint, the tests and the demo together.
+`make check` runs the lint, the tests and the demo together; so does CI, on
+every push.
 
 ## Overview
 
@@ -318,7 +324,8 @@ MoE-Specialisation/
 │   ├── vl_connector.py       # VisionLanguageConnector (CLIP→LLM projection)
 │   └── utils/
 │       ├── create_moe_model.py   # Build MoE model from Mistral-7B
-│       └── common.py             # Shared helpers (config, seed, logging, registration)
+│       ├── checkpoints.py        # Cross-stage checkpoint reading, guarded
+│       └── common.py             # Shared helpers (config, device, seed, logging)
 ├── data/
 │   ├── COCO_loader.py        # COCO captions dataset
 │   └── LLaVA_loader.py       # LLaVA-Instruct-150K dataset
@@ -373,6 +380,10 @@ make demo     # the whole pipeline on CPU against synthetic fixtures
 make check    # lint + test + demo
 ```
 
+CI runs exactly this list on every push: the lint, the type check, the test
+suite, and the demo. The demo is included deliberately — the unit suite can stay
+green while the pipeline itself is broken.
+
 ruff and mypy are strict on the maintained core (`models/`, `data/`, `tests/`);
 the research scripts (`training_scripts/`, `analysis_scripts/`) are held to
 formatting plus the correctness rules (`F821`/`F811`/`F822`) that catch
@@ -385,8 +396,8 @@ The suite covers four levels, deliberately:
 |---|---|---|
 | Numerics | `tests/test_training_dry_run.py` | A tiny synthetic model must produce bit-identical loss and grad-norm against a recorded baseline. If those move, a refactor changed training numerics. |
 | Behaviour | `tests/test_training_steps.py` | Each stage runs a real epoch and must change **exactly** the parameters it claims to train, with gradients reaching all of them, and must resume from its own checkpoint. |
-| Structure | `tests/test_training_scripts_structure.py` | Every script stays inert on import, reuses `_lib` rather than re-implementing FSDP, and never loads weights with a bare `strict=False`. Also checks the SLURM scripts point at files that exist. |
-| End-to-end | `make demo` | 12 executable invariants over a full CPU pipeline run. |
+| Structure | `tests/test_training_scripts_structure.py`, `tests/test_analysis_lib.py` | Every script stays inert on import, reuses `_lib` rather than re-implementing FSDP, and never loads weights with a bare `strict=False`. No analysis script may hardcode the config path or default to CUDA — both would put it back out of the demo's reach. Also checks the SLURM scripts point at files that exist. |
+| End-to-end | `make demo` | 14 executable invariants over a full CPU pipeline run, including the routing ablation. |
 
 ## Citation
 

@@ -4,7 +4,10 @@ Mirrors ``analysis_scripts/_lib``: code used by more than one stage, or large
 enough to crowd a stage script, lives here rather than being copy-pasted.
 """
 
-from training_scripts._lib.checkpoints import load_matching_weights, state_dict_from
+# Re-exported from the core so the training scripts keep a single import
+# surface. It lives in models/utils because the analysis scripts load the same
+# checkpoints and need the same guard.
+from models.utils.checkpoints import load_matching_weights, state_dict_from
 from training_scripts._lib.expert_metrics import ExpertUsageTracker, save_expert_metrics
 from training_scripts._lib.pipeline import (
     build_backbones,

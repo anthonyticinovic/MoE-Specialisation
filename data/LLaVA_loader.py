@@ -31,6 +31,8 @@ class LLaVA_Loader(Dataset):
         val_fraction: float = 0.2,
         seed: int = 42,
         debug: bool = False,
+        max_length: int = 512,
+        verify_images: bool = True,
     ):
         """
         Args:
@@ -43,7 +45,12 @@ class LLaVA_Loader(Dataset):
             val_fraction: Fraction of data reserved for validation (0.0 to 1.0)
             seed: Random seed for reproducibility
             debug: If True, print first 3 samples with decoded tokens and labels
+            max_length: Sequence length every sample is truncated or padded to
+            verify_images: Drop samples whose image file is missing (one stat each)
         """
+        if split not in ("train", "val"):
+            raise ValueError(f"split must be 'train' or 'val', got {split!r}")
+
         self.annotations_file = annotations_file
         self.image_dir = image_dir
         self.clip_processor = clip_processor
@@ -53,6 +60,8 @@ class LLaVA_Loader(Dataset):
         self.val_fraction = val_fraction
         self.seed = seed
         self.debug = debug
+        self.max_length = max_length
+        self.verify_images = verify_images
         self.debug_counter = 0  # Track how many samples we've debugged
 
         # Load and process data
@@ -122,11 +131,32 @@ class LLaVA_Loader(Dataset):
         else:
             split_data = split_pool
 
-        # Filter out samples without conversations or images
+        # Filter out anything __getitem__ could not turn into a full sample.
+        # It has no way to skip an index — the default collate stacks whatever
+        # it returns — so every unusable sample must be dropped here. The two
+        # conditions are exactly the invariants __getitem__ relies on:
+        # at least one complete Q&A pair, and an image file that exists.
         valid_data = []
+        missing_images = 0
         for item in split_data:
-            if "conversations" in item and len(item["conversations"]) >= 2 and "image" in item:
-                valid_data.append(item)
+            if "conversations" not in item or "image" not in item:
+                continue
+            if len(item["conversations"]) < 2:
+                continue
+            if self.verify_images and not os.path.exists(
+                os.path.join(self.image_dir, item["image"])
+            ):
+                missing_images += 1
+                continue
+            valid_data.append(item)
+
+        if missing_images:
+            logger.warning(
+                "Dropped %d %s samples with no image file in %s.",
+                missing_images,
+                self.split,
+                self.image_dir,
+            )
 
         return valid_data
 
@@ -147,12 +177,16 @@ class LLaVA_Loader(Dataset):
         image_filename = sample["image"]
         image_path = os.path.join(self.image_dir, image_filename)
 
+        # Missing files are filtered out at construction. A blank-image
+        # fallback here would train the model on black pixels paired with a
+        # real caption and report nothing but a warning, so fail instead.
         try:
             image = Image.open(image_path).convert("RGB")
-        except Exception as e:
-            # Fallback: create a blank image if file not found
-            logger.warning("Could not load image %s: %s", image_path, e)
-            image = Image.new("RGB", (224, 224), color="black")
+        except OSError as err:
+            raise OSError(
+                f"Could not read {image_path}, which existed when the dataset "
+                "was built. Do not modify the image directory during a run."
+            ) from err
 
         # Process image with CLIP
         pixel_values = self.clip_processor(images=image, return_tensors="pt")[
@@ -167,16 +201,9 @@ class LLaVA_Loader(Dataset):
             # If odd, truncate to last complete Q&A pair
             conversations = conversations[: len(conversations) - 1]
 
-        # Skip samples with no valid Q&A pairs
-        if len(conversations) < 2:
-            # Fallback: return empty sequences (will be filtered in collate_fn if needed)
-            logger.warning("Sample %d has no valid Q&A pairs — skipping.", idx)
-            return (
-                pixel_values,
-                torch.tensor([self.tokenizer.eos_token_id], dtype=torch.long),
-                torch.tensor([1], dtype=torch.long),
-                torch.tensor([-100], dtype=torch.long),
-            )
+        # _load_data admits only samples with >= 2 turns, and dropping one odd
+        # turn from >= 2 still leaves >= 2, so this holds by construction.
+        assert len(conversations) >= 2, f"sample {idx} reached __getitem__ with no Q&A pair"
 
         # Build combined sequence with proper masking
         # Start with BOS token (included in first question tokenization)
@@ -236,7 +263,7 @@ class LLaVA_Loader(Dataset):
         label_mask = torch.tensor(label_mask, dtype=torch.bool)
 
         # CRITICAL: Handle truncation if sequence too long
-        max_length = 512
+        max_length = self.max_length
         if len(combined_ids) > max_length:
             # Truncate from the end
             combined_ids = combined_ids[:max_length]

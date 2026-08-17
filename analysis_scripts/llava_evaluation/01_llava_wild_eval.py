@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "karpathy_evaluation"))
 
 from karpathy_utils import load_and_preprocess_image, load_model_checkpoint, log_banner, save_json
-from models.utils.common import setup_logging
+from models.utils.common import get_device, setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +36,7 @@ def generate_conversational_response(
     question,
     max_new_tokens=100,
     temperature=0.7,
-    device="cuda",
+    device=None,
     is_stage3=False,
 ):
     """
@@ -44,6 +44,8 @@ def generate_conversational_response(
 
     Uses sampling (temperature > 0) for more natural, diverse responses.
     """
+    device = device or get_device()
+
     # Load and preprocess image
     pixel_values = load_and_preprocess_image(image_path, processor)
     pixel_values = pixel_values.unsqueeze(0).to(device)
@@ -276,7 +278,9 @@ def main():
     )
     parser.add_argument("--max_tokens", type=int, default=100, help="Max tokens to generate")
     parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature")
-    parser.add_argument("--device", type=str, default="cuda", help="Device")
+    parser.add_argument(
+        "--device", type=str, default=get_device(), help="Device (default: cuda if available)"
+    )
 
     args = parser.parse_args()
 

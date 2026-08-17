@@ -49,7 +49,7 @@ from analysis_scripts._lib import (
     load_stage3_models,
 )
 from analysis_scripts.cross_modality_purity import CrossModalityPurityAnalyzer
-from models.utils.common import setup_logging
+from models.utils.common import get_device, setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -68,8 +68,8 @@ class CrossConceptSimilarityAnalyzer:
 
     def __init__(
         self,
-        config_path: str = "configs/training_config.yaml",
-        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        config_path: str | None = None,
+        device: str | None = None,
         mode: str = "stage2",
         stage2_checkpoint: str | None = None,
         stage3_checkpoint: str | None = None,
@@ -91,7 +91,7 @@ class CrossConceptSimilarityAnalyzer:
         logger.info(f"   Device: {device}")
 
         self.mode = mode
-        self.device = device
+        self.device = device or get_device()
         self.temperature = temperature
         self.stage2_checkpoint = stage2_checkpoint
         self.stage3_checkpoint = stage3_checkpoint
@@ -981,13 +981,13 @@ def main():
     parser.add_argument(
         "--training-config",
         type=str,
-        default="configs/training_config.yaml",
-        help="Path to training config file for model paths",
+        default=None,
+        help="Path to training config (default: $MOE_CONFIG, else configs/training_config.yaml)",
     )
     parser.add_argument(
         "--device",
         type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
+        default=None,
         help="Device to run on (cuda/cpu)",
     )
 

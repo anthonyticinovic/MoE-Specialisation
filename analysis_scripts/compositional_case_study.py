@@ -49,7 +49,7 @@ from analysis_scripts._lib import compute_cosine_similarity_matrix, load_analysi
 
 # REUSE: Import existing analyzer class for model loading and representation extraction
 from analysis_scripts.cross_concept_similarity_matrix import CrossConceptSimilarityAnalyzer
-from models.utils.common import setup_logging
+from models.utils.common import get_device, setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -72,8 +72,8 @@ class CompositionalCaseStudyAnalyzer:
 
     def __init__(
         self,
-        config_path: str = "configs/training_config.yaml",
-        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        config_path: str | None = None,
+        device: str | None = None,
         temperature: float = 0.01,
     ):
         """
@@ -89,7 +89,7 @@ class CompositionalCaseStudyAnalyzer:
         logger.info(f"   Temperature: {temperature}")
 
         self.config_path = config_path
-        self.device = device
+        self.device = device or get_device()
         self.temperature = temperature
 
         # Will hold analyzers for each stage
@@ -653,13 +653,13 @@ def main():
     parser.add_argument(
         "--training-config",
         type=str,
-        default="configs/training_config.yaml",
-        help="Path to training config file for model paths",
+        default=None,
+        help="Path to training config (default: $MOE_CONFIG, else configs/training_config.yaml)",
     )
     parser.add_argument(
         "--device",
         type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
+        default=None,
         help="Device to run on (cuda/cpu)",
     )
 

@@ -19,12 +19,12 @@ import torch
 from tqdm import tqdm
 
 from analysis_scripts._lib import load_stage2_models, load_training_config
-from models.utils.common import setup_logging
+from models.utils.common import get_device, setup_logging
 
 logger = logging.getLogger(__name__)
 
 
-def load_stage2_model(checkpoint_path, config, device="cuda"):
+def load_stage2_model(checkpoint_path, config, device=None):
     """Load Stage 2 model with hard routing via the shared _lib loader."""
     logger.info("Loading Stage 2 model...")
     models = load_stage2_models(config, device, stage2_checkpoint=checkpoint_path)
@@ -38,7 +38,7 @@ def load_stage2_model(checkpoint_path, config, device="cuda"):
 
 
 def set_routing_mask(
-    llm, vision_expert_id, text_expert_id, num_visual_tokens, num_text_tokens, device="cuda"
+    llm, vision_expert_id, text_expert_id, num_visual_tokens, num_text_tokens, device=None
 ):
     """
     Set routing masks for all MoE layers.
@@ -74,7 +74,7 @@ def compute_loss_single_example(
     input_ids,
     vision_expert_id,
     text_expert_id,
-    device="cuda",
+    device=None,
 ):
     """
     Compute loss for a single example with specified routing.
@@ -97,10 +97,12 @@ def compute_loss_single_example(
             input_ids.unsqueeze(0).to(device) if input_ids.dim() == 1 else input_ids.to(device)
         )
 
-        # Get visual features
+        # Get visual features. The projection is cast to the LLM's own dtype
+        # (bfloat16 on GPU, float32 on CPU) rather than to a hardcoded
+        # bfloat16, which made the whole script GPU-only.
         visual_outputs = clip_model(pixel_values=pixel_values)
         visual_features = visual_outputs.last_hidden_state  # (1, 257, 1024)
-        visual_embeds = vision_connector(visual_features).to(torch.bfloat16)  # (1, 257, 4096)
+        visual_embeds = vision_connector(visual_features).to(llm.dtype)  # (1, 257, 4096)
 
         # Get text embeddings
         text_embeds = llm.get_input_embeddings()(input_ids)  # (1, seq_len, 4096)
@@ -137,7 +139,14 @@ def compute_loss_single_example(
 
 
 def run_routing_ablation(
-    checkpoint_path, data_path, num_samples=100, device="cuda", training_config=None
+    checkpoint_path,
+    data_path,
+    num_samples=100,
+    device=None,
+    training_config=None,
+    image_dir=None,
+    annotations_file=None,
+    output_dir=None,
 ):
     """
     Run routing ablation experiment.
@@ -146,9 +155,15 @@ def run_routing_ablation(
         checkpoint_path: Path to Stage 2 checkpoint (None → default from config)
         data_path: Path to COCO root directory (expects val2017/ and annotations/)
         num_samples: Number of examples to evaluate
-        training_config: Path to training_config.yaml (for model paths)
+        device: Compute device (None → CUDA when available, else CPU)
+        training_config: Path to training_config.yaml (None → MOE_CONFIG, then
+            the repo default)
+        image_dir: Image directory, overriding the COCO-root convention
+        annotations_file: COCO-format captions JSON, overriding the convention
+        output_dir: Where to write the JSON and the plot
     """
-    config = load_training_config(training_config or "configs/training_config.yaml")
+    config = load_training_config(training_config)
+    device = device or get_device()
 
     logger.info("=" * 80)
     logger.info("EXPERT ROUTING ABLATION STUDY - STAGE 2")
@@ -168,19 +183,23 @@ def run_routing_ablation(
     vision_connector.eval()
     llm.eval()
 
-    # Load data. data_path is the COCO root; default to the parent of the
-    # training image_dir so the script works out-of-the-box from config.
+    # Load data. By convention data_path is a COCO root holding val2017/ and
+    # annotations/, defaulting to the parent of the training image_dir.
+    # image_dir/annotations_file override that convention outright, which is
+    # what lets the demo point this at its own fixtures.
     if data_path is None:
         data_path = str(Path(config["paths"]["image_dir"]).parent)
     coco_root = Path(data_path)
-    logger.info(f"Loading data from {coco_root}...")
+    image_dir = image_dir or str(coco_root / "val2017")
+    annotations_file = annotations_file or str(coco_root / "annotations" / "captions_val2017.json")
+    logger.info(f"Loading data from {image_dir}...")
     from torch.utils.data import DataLoader
 
     from data.COCO_loader import COCO_Loader
 
     val_dataset = COCO_Loader(
-        image_dir=str(coco_root / "val2017"),
-        annotations_file=str(coco_root / "annotations" / "captions_val2017.json"),
+        image_dir=image_dir,
+        annotations_file=annotations_file,
         clip_processor=processor,
         tokenizer=tokenizer,
         subset_fraction=1.0,
@@ -273,7 +292,7 @@ def run_routing_ablation(
         "delta": {"absolute": float(delta), "percent": float(delta_percent)},
     }
 
-    output_dir = Path("results/routing_ablation")
+    output_dir = Path(output_dir or "results/routing_ablation")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     with open(output_dir / "routing_ablation_results.json", "w") as f:
@@ -357,12 +376,26 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num-samples", type=int, default=100, help="Number of samples to evaluate"
     )
-    parser.add_argument("--device", type=str, default="cuda", help="Device (cuda or cpu)")
+    parser.add_argument(
+        "--device", type=str, default=None, help="Device (default: cuda when available, else cpu)"
+    )
     parser.add_argument(
         "--training-config",
         type=str,
-        default="configs/training_config.yaml",
-        help="Path to training config file for model paths",
+        default=None,
+        help="Path to training config (default: $MOE_CONFIG, else configs/training_config.yaml)",
+    )
+    parser.add_argument(
+        "--image-dir", type=str, default=None, help="Image directory (default: <data>/val2017)"
+    )
+    parser.add_argument(
+        "--annotations",
+        type=str,
+        default=None,
+        help="COCO captions JSON (default: <data>/annotations/captions_val2017.json)",
+    )
+    parser.add_argument(
+        "--output-dir", type=str, default=None, help="Default: results/routing_ablation"
     )
 
     args = parser.parse_args()
@@ -373,4 +406,7 @@ if __name__ == "__main__":
         num_samples=args.num_samples,
         device=args.device,
         training_config=args.training_config,
+        image_dir=args.image_dir,
+        annotations_file=args.annotations,
+        output_dir=args.output_dir,
     )

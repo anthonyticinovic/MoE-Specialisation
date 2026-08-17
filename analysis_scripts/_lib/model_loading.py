@@ -21,7 +21,8 @@ from dataclasses import dataclass
 
 import torch
 
-from models.utils.common import register_moe_model
+from models.utils.checkpoints import load_matching_weights, state_dict_from
+from models.utils.common import get_device, get_model_dtype, register_moe_model
 
 logger = logging.getLogger(__name__)
 
@@ -52,10 +53,15 @@ def _set_routing_mode(llm, mode: str, temperature: float | None = None) -> None:
 
 def load_stage2_models(
     config: dict,
-    device: str,
+    device: str | None = None,
     stage2_checkpoint: str | None = None,
 ) -> LoadedModels:
     """Load CLIP + connector + Stage-2 MoE LLM with hard expert routing.
+
+    ``device=None`` resolves through ``get_device()``, so the same call runs on
+    a GPU node and on a laptop. Model dtype follows ``get_model_dtype()``:
+    bfloat16 on CUDA exactly as the paper runs used, float32 on CPU where
+    bfloat16 matmuls are unsupported or far slower.
 
     If ``stage2_checkpoint`` is given it overrides the default
     ``<output_dir>/stage2_checkpoints/llm_stage2_best.pth`` and is loaded with
@@ -72,6 +78,9 @@ def load_stage2_models(
     from models import VisionLanguageConnector
 
     register_moe_model()
+
+    if device is None:
+        device = get_device()
 
     paths = config["paths"]
     output_dir = paths["output_dir"]
@@ -91,28 +100,35 @@ def load_stage2_models(
         moe_model_path,
         trust_remote_code=True,
         local_files_only=True,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=get_model_dtype(),
         attn_implementation="eager",  # Required for output_attentions=True
     ).to(device)
 
+    # state_dict_from accepts both checkpoint shapes (bare state dict and full
+    # training checkpoint); load_matching_weights refuses a state dict that
+    # overlaps the model in no key, which is what a changed format looks like.
     if stage2_checkpoint:
-        logger.info(f"  - Loading Stage 2 expert weights from {stage2_checkpoint}")
-        expert_weights = torch.load(stage2_checkpoint, map_location="cpu")
+        stage2_path = stage2_checkpoint
+        map_location = "cpu"  # matches the original custom-checkpoint path
     else:
         stage2_path = os.path.join(output_dir, "stage2_checkpoints", "llm_stage2_best.pth")
-        logger.info(f"  - Loading Stage 2 expert weights from {stage2_path}")
-        expert_weights = torch.load(stage2_path, map_location=device)
-    # The default llm_stage2_best.pth is a raw state_dict; some checkpoints wrap
-    # it under "model_state_dict" (full training checkpoint) — handle both.
-    if isinstance(expert_weights, dict) and "model_state_dict" in expert_weights:
-        expert_weights = expert_weights["model_state_dict"]
-    llm.load_state_dict(expert_weights, strict=False)
+        map_location = device
+    logger.info(f"  - Loading Stage 2 expert weights from {stage2_path}")
+    load_matching_weights(
+        llm, state_dict_from(stage2_path, map_location=map_location), source=stage2_path
+    )
     llm.eval()
 
     _set_routing_mode(llm, "hard")
 
+    # Sized from the loaded backbones, not from the CLIP-L/Mistral-7B defaults,
+    # so the same code loads a connector trained against any pair of models
+    # (train_stage_1 builds it the same way).
     logger.info("  - Loading vision connector")
-    vision_connector = VisionLanguageConnector().to(device)
+    vision_connector = VisionLanguageConnector(
+        clip_hidden_size=vision_encoder.config.hidden_size,
+        llm_hidden_size=llm.config.hidden_size,
+    ).to(device)
     connector_path = os.path.join(output_dir, "vision_connector_stage1_best.pth")
     vision_connector.load_state_dict(torch.load(connector_path, map_location=device))
     vision_connector.eval()
@@ -123,7 +139,7 @@ def load_stage2_models(
 
 def load_stage3_models(
     config: dict,
-    device: str,
+    device: str | None,
     stage3_checkpoint: str,
     temperature: float = 0.01,
 ) -> LoadedModels:
@@ -132,21 +148,23 @@ def load_stage3_models(
     Loads the Stage-2 base first, then overrides with the Stage-3 checkpoint
     (full or portable format) and switches every MoE layer to soft routing.
     """
+    if device is None:
+        device = get_device()
     models = load_stage2_models(config, device)
 
     logger.info(f"  - Loading Stage 3 checkpoint from {stage3_checkpoint}")
-    checkpoint = torch.load(stage3_checkpoint, map_location=device)
+    checkpoint = torch.load(stage3_checkpoint, map_location=device, weights_only=False)
 
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
         logger.info("      Detected FULL checkpoint format")
-        models.llm.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        load_matching_weights(models.llm, checkpoint["model_state_dict"], source=stage3_checkpoint)
         logger.info(f"      Loaded LLM weights (epoch {checkpoint.get('epoch', 'unknown')})")
         if "connector_state_dict" in checkpoint:
             models.vision_connector.load_state_dict(checkpoint["connector_state_dict"])
             logger.info("      Loaded vision connector weights (Stage 3 trained)")
     else:
         logger.info("      Detected PORTABLE checkpoint format (state_dict only)")
-        models.llm.load_state_dict(checkpoint, strict=False)
+        load_matching_weights(models.llm, checkpoint, source=stage3_checkpoint)
         logger.info("      Loaded LLM weights (portable format)")
         logger.warning("       Note: Vision connector NOT updated (using Stage 1 weights)")
 

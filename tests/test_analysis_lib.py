@@ -115,3 +115,66 @@ class TestLoggingMigration:
         assert "setup_logging()" in source, (
             f"{path.name} is an entry point that logs but never calls setup_logging()"
         )
+
+
+class TestConfigAndDeviceSeam:
+    """The analysis scripts must resolve config and device the same way the
+    training scripts do.
+
+    An explicit ``configs/training_config.yaml`` default reaches
+    ``load_config`` as a real argument, which skips the ``MOE_CONFIG``
+    environment variable entirely. That is why the CPU demo could drive all
+    five training scripts but not one analysis script: pointing one at the demo
+    fixtures failed on the repo config's ``YOUR_PATH_HERE`` placeholders.
+    """
+
+    @pytest.mark.parametrize("path", ANALYSIS_MODULES, ids=lambda p: p.name)
+    def test_no_hardcoded_training_config_default(self, path):
+        defaults = [
+            node.lineno
+            for node in ast.walk(ast.parse(path.read_text()))
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value.endswith("configs/training_config.yaml")
+        ]
+        assert not defaults, (
+            f"{path.name}: hardcodes the training config at line(s) {defaults}. "
+            "Pass None and let models.utils.common.load_config resolve MOE_CONFIG."
+        )
+
+    @pytest.mark.parametrize("path", ANALYSIS_MODULES, ids=lambda p: p.name)
+    def test_no_analysis_script_loads_weights_without_the_guard(self, path):
+        """The analysis loaders read the same checkpoints the stages write.
+
+        `strict=False` accepts a state dict that matches the model in no key at
+        all: it loads nothing and returns normally. That is how Stages 2.5 and 3
+        spent months starting from their Stage 0 experts while logging success,
+        and `_lib/model_loading.py` had the same call.
+        """
+        assert "strict=False" not in path.read_text(), (
+            f"{path.name}: use models.utils.checkpoints.load_matching_weights "
+            "instead of a bare strict=False load"
+        )
+
+    @pytest.mark.parametrize("path", ANALYSIS_MODULES, ids=lambda p: p.name)
+    def test_no_unconditional_cuda_default(self, path):
+        """``device="cuda"`` as a default breaks the programmatic API on CPU.
+
+        Two analysers guarded the argparse default with ``is_available()`` and
+        then hardcoded ``"cuda"`` in the constructor, so they worked from the
+        command line and failed when imported.
+        """
+        offenders = []
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            defaults = node.args.defaults + [d for d in node.args.kw_defaults if d is not None]
+            offenders += [
+                f"{node.name}() line {d.lineno}"
+                for d in defaults
+                if isinstance(d, ast.Constant) and d.value == "cuda"
+            ]
+        assert not offenders, (
+            f"{path.name}: {offenders} default to CUDA. Default to None and "
+            "resolve with models.utils.common.get_device()."
+        )

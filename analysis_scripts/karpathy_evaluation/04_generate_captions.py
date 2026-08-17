@@ -18,7 +18,7 @@ from karpathy_utils import (
     save_json,
 )
 from tqdm import tqdm
-from models.utils.common import setup_logging
+from models.utils.common import get_device, setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,7 @@ def generate_captions(
     max_length: int = 20,
     temperature: float = 1.0,
     batch_size: int = 16,
-    device: str = "cuda",
+    device: str | None = None,
     stage_name: str = "stage2",
 ) -> list[dict]:
     """
@@ -54,6 +54,7 @@ def generate_captions(
     Returns:
         results: List of {image_id: int, caption: str} for COCO eval format
     """
+    device = device or get_device()
     model.eval()
     model.to(device)
 
@@ -332,7 +333,9 @@ def main():
     parser.add_argument("--max_length", type=int, default=20, help="Maximum caption length")
     parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size for generation")
-    parser.add_argument("--device", type=str, default="cuda", help="Device (cuda or cpu)")
+    parser.add_argument(
+        "--device", type=str, default=get_device(), help="Device (default: cuda if available)"
+    )
     parser.add_argument(
         "--num_images",
         type=int,

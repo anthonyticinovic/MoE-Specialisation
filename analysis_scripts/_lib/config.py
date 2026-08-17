@@ -11,15 +11,20 @@ from typing import Any
 
 from models.utils.common import load_config as _load_training_config
 
-_DEFAULT_TRAINING_CONFIG = "configs/training_config.yaml"
 
+def load_training_config(path: str | None = None) -> dict[str, Any]:
+    """Load and validate ``training_config.yaml`` (placeholder check included).
 
-def load_training_config(path: str = _DEFAULT_TRAINING_CONFIG) -> dict[str, Any]:
-    """Load and validate ``training_config.yaml`` (placeholder check included)."""
+    ``path=None`` defers to ``models.utils.common.load_config``, which resolves
+    the ``MOE_CONFIG`` environment variable before falling back to
+    ``configs/training_config.yaml``. Passing the default path explicitly — as
+    every analysis script used to — bypasses that variable, which is why the
+    CPU demo could reach the training scripts but not the analysis scripts.
+    """
     return _load_training_config(path)
 
 
-def get_paths(path: str = _DEFAULT_TRAINING_CONFIG) -> dict[str, str]:
+def get_paths(path: str | None = None) -> dict[str, str]:
     """Return just the ``paths:`` section of the training config."""
     return load_training_config(path)["paths"]
 

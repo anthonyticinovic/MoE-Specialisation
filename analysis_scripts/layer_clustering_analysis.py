@@ -68,7 +68,7 @@ class MoEClusteringAnalyzer(CrossModalityPurityAnalyzer):
     in MoE layers.
     """
 
-    def __init__(self, config_path: str = "configs/training_config.yaml", device: str = "cuda"):
+    def __init__(self, config_path: str | None = None, device: str | None = None):
         super().__init__(config_path, device)
         self.expert_confidence_threshold = 0.6  # Default threshold
 
@@ -514,7 +514,7 @@ def main():
     parser.add_argument(
         "--device",
         type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
+        default=None,
         help="Device to run on (cuda or cpu)",
     )
 

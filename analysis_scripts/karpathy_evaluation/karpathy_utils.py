@@ -29,7 +29,7 @@ from analysis_scripts._lib import (  # noqa: E402
     log_banner,
     save_json,
 )
-from models.utils.common import setup_logging
+from models.utils.common import get_device, setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +45,7 @@ __all__ = [
 ]
 
 
-def load_model_checkpoint(checkpoint_path: str, device: str = "cuda"):
+def load_model_checkpoint(checkpoint_path: str, device: str | None = None):
     """
     Load a trained model checkpoint (Stage 2 or Stage 3).
     Returns a wrapper object containing vision encoder, connector, and LLM.
@@ -70,6 +70,7 @@ def load_model_checkpoint(checkpoint_path: str, device: str = "cuda"):
     from models.utils.common import register_moe_model
 
     register_moe_model()
+    device = device or get_device()
 
     logger.info(f"\nLoading checkpoint from: {checkpoint_path}")
 

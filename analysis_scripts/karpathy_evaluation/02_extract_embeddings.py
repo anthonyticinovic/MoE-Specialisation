@@ -20,7 +20,7 @@ from karpathy_utils import (
     log_banner,
 )
 from tqdm import tqdm
-from models.utils.common import setup_logging
+from models.utils.common import get_device, setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -220,7 +220,9 @@ def main():
     )
     parser.add_argument("--layer", type=int, default=31, help="Layer index to extract from")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
-    parser.add_argument("--device", type=str, default="cuda", help="Device to use")
+    parser.add_argument(
+        "--device", type=str, default=get_device(), help="Device (default: cuda if available)"
+    )
 
     args = parser.parse_args()
 

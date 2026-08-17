@@ -25,7 +25,7 @@ from analysis_scripts._lib import (
     load_stage3_models,
     load_training_config,
 )
-from models.utils.common import setup_logging
+from models.utils.common import get_device, setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -43,10 +43,10 @@ class CrossModalityPurityAnalyzer:
 
     def __init__(
         self,
-        config_path: str = "configs/training_config.yaml",
-        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        config_path: str | None = None,
+        device: str | None = None,
     ):
-        self.device = device
+        self.device = device or get_device()
         self.config = self._load_config(config_path)
         self.image_generator = SyntheticImageGenerator()
 
@@ -62,7 +62,7 @@ class CrossModalityPurityAnalyzer:
 
         logger.info(f"Initialised analyzer on device: {self.device}")
 
-    def _load_config(self, config_path: str) -> dict:
+    def _load_config(self, config_path: str | None) -> dict:
         """Load training configuration (validated, placeholder-checked)."""
         return load_training_config(config_path)
 
@@ -1302,13 +1302,13 @@ def main():
     parser.add_argument(
         "--config",
         type=str,
-        default="configs/training_config.yaml",
-        help="Path to training config file",
+        default=None,
+        help="Path to training config (default: $MOE_CONFIG, else configs/training_config.yaml)",
     )
     parser.add_argument(
         "--device",
         type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
+        default=None,
         help="Device to run on (cuda/cpu)",
     )
     parser.add_argument(

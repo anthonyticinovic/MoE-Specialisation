@@ -10,6 +10,10 @@ Stage 0 weights, and the run logged that the checkpoint had loaded.
 These two helpers close that hole. ``state_dict_from`` accepts either shape, and
 ``load_matching_weights`` refuses to continue when a non-empty state dict
 matches nothing — the case that used to pass unnoticed.
+
+They live in the core rather than in ``training_scripts/_lib`` because the
+analysis scripts read the same checkpoint files and can fail the same way;
+``training_scripts._lib`` re-exports them so the stages import one name.
 """
 
 from __future__ import annotations

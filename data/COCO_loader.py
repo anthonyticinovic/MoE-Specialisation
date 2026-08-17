@@ -21,13 +21,20 @@ class COCO_Loader(Dataset):
         val_split_fraction=0.1,
         val_subset_fraction=1.0,  # Additional subsampling for validation set
         seed=42,  # Fixed seed for reproducible splits across all stages
+        max_length=128,  # Caption token budget; must match the training config
+        verify_images=True,  # Drop image IDs with no file on disk (one stat each)
     ):
+        if split not in ("train", "val"):
+            raise ValueError(f"split must be 'train' or 'val', got {split!r}")
+
         self.image_dir = image_dir
         self.coco = COCO(annotations_file)
         self.clip_processor = clip_processor
         self.tokenizer = tokenizer
+        self.max_length = max_length
 
-        # --- MODIFIED: Subset based on unique image IDs with fixed seed ---
+        # Subset based on unique image IDs with a fixed seed, so the train/val
+        # boundary is identical across every stage and every run.
         all_img_ids = list(sorted(self.coco.imgs.keys()))
 
         # Use a separate Random instance with fixed seed for reproducibility
@@ -58,25 +65,49 @@ class COCO_Loader(Dataset):
                 final_img_ids = val_img_ids
                 logger.info("Using %d unique images for validation.", len(final_img_ids))
 
-        # 3. Load annotations ONLY for the final set of image IDs
+        # 3. Drop image IDs whose file is missing, *after* the split so that a
+        # gap in the image directory cannot move the train/val boundary.
+        # __getitem__ has no way to skip a sample — the default collate stacks
+        # whatever it returns — so an unusable sample must never enter the
+        # dataset in the first place.
+        if verify_images:
+            present = [i for i in final_img_ids if os.path.exists(self._image_path(i))]
+            if len(present) < len(final_img_ids):
+                logger.warning(
+                    "Dropped %d of %d %s images with no file in %s.",
+                    len(final_img_ids) - len(present),
+                    len(final_img_ids),
+                    split,
+                    image_dir,
+                )
+            final_img_ids = present
+
+        # 4. Load annotations ONLY for the final set of image IDs
         ann_ids = self.coco.getAnnIds(imgIds=final_img_ids)
         self.annotations = self.coco.loadAnns(ann_ids)
+
+    def _image_path(self, image_id):
+        """COCO stores images as a zero-padded 12-digit id."""
+        return os.path.join(self.image_dir, f"{image_id:012d}.jpg")
 
     def __len__(self):
         return len(self.annotations)
 
     def __getitem__(self, idx):
         annotation = self.annotations[idx]
-        # Construct image path safely, handling potential missing leading zeros in image_id
-        image_filename = f"{annotation['image_id']:012d}.jpg"
-        image_path = os.path.join(self.image_dir, image_filename)
+        image_path = self._image_path(annotation["image_id"])
 
+        # Missing files are filtered out at construction, so reaching this is
+        # a real fault (the directory changed under the run). Raise rather than
+        # return a placeholder: the default collate would stack it silently.
         try:
             image = Image.open(image_path).convert("RGB")
-        except FileNotFoundError:
-            logger.warning("Image file not found at %s — skipping.", image_path)
-            # Return None or a placeholder to be handled in the dataloader's collate_fn if needed
-            return None
+        except FileNotFoundError as err:
+            raise FileNotFoundError(
+                f"{image_path} disappeared after the dataset was built. "
+                "Construct COCO_Loader with verify_images=True (the default) "
+                "and do not modify the image directory during a run."
+            ) from err
 
         caption = annotation["caption"]
 
@@ -89,7 +120,7 @@ class COCO_Loader(Dataset):
             return_tensors="pt",
             padding="max_length",
             truncation=True,
-            max_length=128,
+            max_length=self.max_length,
         )
         input_ids = tokenized_caption["input_ids"].squeeze(0)
         attention_mask = tokenized_caption["attention_mask"].squeeze(0)
