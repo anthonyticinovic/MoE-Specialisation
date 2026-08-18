@@ -4,12 +4,12 @@ Step 1: Preprocess Karpathy COCO split for evaluation.
 Extracts test set and prepares data structures for both retrieval and captioning.
 """
 
-import logging
 import argparse
 import json
+import logging
+import sys
 from collections import defaultdict
 from pathlib import Path
-import sys
 
 # Running this file directly puts *its own* directory on sys.path, not the repo
 # root, so the first-party imports below would fail. Add the root explicitly.

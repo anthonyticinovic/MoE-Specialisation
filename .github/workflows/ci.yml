@@ -34,9 +34,11 @@ jobs:
       # to the core meant CI never saw the resulting NameError. B905 is here
       # for the same reason — an unstrict zip() truncates to the shorter
       # sequence in silence, which in plotting and metrics code means a chart
-      # quietly missing its last layers rather than an error.
+      # quietly missing its last layers rather than an error. E722 likewise: a
+      # bare `except:` swallows KeyboardInterrupt and MemoryError alongside the
+      # error it meant to handle.
       - name: Ruff correctness rules (whole repo)
-        run: uv run ruff check --select F821,F811,F822,B905 .
+        run: uv run ruff check --select F821,F811,F822,B905,E722 .
       - name: Ruff check (core)
         run: uv run ruff check models/ data/ tests/
       - name: Ruff format (whole repo)

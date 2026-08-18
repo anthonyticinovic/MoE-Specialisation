@@ -294,7 +294,7 @@ def plot_alignment_curves(
     # Plot each concept's alignment curve
     for concept_name, similarities in curves.items():
         layers = sorted(similarities.keys())
-        values = [similarities[l] for l in layers]
+        values = [similarities[layer] for layer in layers]
         plt.plot(
             layers,
             values,

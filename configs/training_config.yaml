@@ -44,6 +44,8 @@ training_stage2.5:
   weight_decay: 0.01
   subset_fraction: 0.15
   gradient_accumulation_steps: 2
+  # Stage 2.5 is the only stage with a load-balancing term; Stage 3 and the
+  # dense control have no such loss, so the key belongs nowhere else.
   load_balancing_coeff: 0.0
 
 training_stage3:
@@ -54,7 +56,6 @@ training_stage3:
   subset_fraction: 0.5
   val_subset_fraction: 0.5
   gradient_accumulation_steps: 4
-  load_balancing_coeff: 0.00
   attention_dropout: 0.1
   expert_dropout: 0.1
   label_smoothing: 0.1
@@ -67,7 +68,6 @@ dense_control:
   weight_decay: 0.01
   subset_fraction: 0.2
   gradient_accumulation_steps: 4
-  load_balancing_coeff: 0.02
 
 dataloader:
   num_workers: 2

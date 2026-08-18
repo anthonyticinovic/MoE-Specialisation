@@ -240,7 +240,6 @@ def write_config(root: Path, fixtures: Path, output_dir: Path) -> Path:
             "subset_fraction": 1.0,
             "val_subset_fraction": 1.0,
             "gradient_accumulation_steps": 1,
-            "load_balancing_coeff": 0.01,
             "attention_dropout": 0.1,
             "expert_dropout": 0.1,
             "label_smoothing": 0.1,
@@ -253,7 +252,6 @@ def write_config(root: Path, fixtures: Path, output_dir: Path) -> Path:
             "weight_decay": 0.01,
             "subset_fraction": 1.0,
             "gradient_accumulation_steps": 1,
-            "load_balancing_coeff": 0.02,
         },
         # num_workers=0 keeps the demo single-process: faster for tiny datasets
         # and avoids worker start-up dominating the runtime.

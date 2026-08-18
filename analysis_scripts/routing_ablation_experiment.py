@@ -10,8 +10,8 @@ than flipped routing (vision=Expert 1, text=Expert 0).
 """
 
 import argparse
-import logging
 import json
+import logging
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -283,12 +283,12 @@ def run_routing_ablation(
         "normal_routing": {
             "mean": float(normal_mean),
             "std": float(normal_std),
-            "losses": [float(l) for l in normal_losses],
+            "losses": [float(loss) for loss in normal_losses],
         },
         "flipped_routing": {
             "mean": float(flipped_mean),
             "std": float(flipped_std),
-            "losses": [float(l) for l in flipped_losses],
+            "losses": [float(loss) for loss in flipped_losses],
         },
         "delta": {"absolute": float(delta), "percent": float(delta_percent)},
     }
@@ -309,17 +309,6 @@ def run_routing_ablation(
 
 def create_visualization(normal_losses, flipped_losses, output_dir):
     """Create clean box plot visualisation comparing normal vs flipped routing."""
-
-    import numpy as np
-
-    # Calculate statistics for display
-    normal_mean = np.mean(normal_losses)
-    normal_std = np.std(normal_losses)
-    flipped_mean = np.mean(flipped_losses)
-    flipped_std = np.std(flipped_losses)
-    delta = flipped_mean - normal_mean
-    delta_percent = (delta / normal_mean) * 100
-
     # Create single box plot with whiskers
     fig, ax = plt.subplots(figsize=(8, 6))
 

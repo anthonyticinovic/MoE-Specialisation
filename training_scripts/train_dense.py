@@ -88,7 +88,7 @@ def build_dense_llm(paths: dict[str, Any], ctx: RunContext) -> nn.Module:
 
     llm = AutoModelForCausalLM.from_pretrained(
         paths["mistral_local_path"],
-        torch_dtype=get_model_dtype(),
+        dtype=get_model_dtype(),
         attn_implementation=get_attn_implementation(),
         low_cpu_mem_usage=True,
     )

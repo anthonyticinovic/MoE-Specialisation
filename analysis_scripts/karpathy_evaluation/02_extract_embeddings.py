@@ -4,11 +4,11 @@ Step 2: Extract image and text embeddings for retrieval evaluation.
 Extracts final layer activations from vision and text encoders.
 """
 
-import logging
 import argparse
+import logging
+import sys
 import time
 from pathlib import Path
-import sys
 
 import numpy as np
 import torch
@@ -25,8 +25,8 @@ from analysis_scripts.karpathy_evaluation.karpathy_utils import (  # noqa: E402
     load_and_preprocess_image,
     load_json,
     load_model_checkpoint,
-    mean_pool_embeddings,
     log_banner,
+    mean_pool_embeddings,
 )
 from models.utils.common import get_device, setup_logging  # noqa: E402
 

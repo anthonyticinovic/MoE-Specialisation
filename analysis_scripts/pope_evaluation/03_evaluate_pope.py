@@ -4,9 +4,9 @@ Step 3: Evaluate POPE answers and compute metrics.
 Computes accuracy, precision, recall, F1 for object hallucination detection.
 """
 
-import logging
 import argparse
 import json
+import logging
 import sys
 from pathlib import Path
 

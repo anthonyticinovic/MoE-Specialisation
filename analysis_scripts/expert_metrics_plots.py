@@ -5,8 +5,8 @@ Extracted verbatim from ``plot_expert_metrics.py`` to keep the CLI/orchestration
 module small. Pure functions: take loaded metrics + an output dir, write files.
 """
 
-import logging
 import json
+import logging
 import os
 
 import matplotlib.patches as mpatches
@@ -152,7 +152,7 @@ def plot_expert_load_distribution(
     ax.set_ylabel("Expert Load (%)")
     ax.set_title("Expert Load Distribution Across Layers (Stage 3)")
     ax.set_xticks(x_positions)
-    ax.set_xticklabels([f"L{l}" for l in selected_layers], rotation=45, ha="right")
+    ax.set_xticklabels([f"L{layer}" for layer in selected_layers], rotation=45, ha="right")
     # Note: legend is created per-branch above (single-epoch or multi-epoch).
     # Do not call a generic legend() here which would override branch-specific layout.
     ax.set_ylim(0, 100)
@@ -202,7 +202,7 @@ def plot_routing_entropy(all_metrics, output_dir, selected_layers=None, selected
     ax.set_title("Routing Entropy Across Layers\n(Lower = More Decisive Routing)")
     ax.legend(loc="best")
     ax.set_xticks(selected_layers)
-    ax.set_xticklabels([f"L{l}" for l in selected_layers], rotation=45, ha="right")
+    ax.set_xticklabels([f"L{layer}" for layer in selected_layers], rotation=45, ha="right")
     ax.set_ylim(bottom=0)
     ax.grid(True, alpha=0.3)
 
@@ -255,7 +255,7 @@ def plot_high_confidence_fraction(
     )
     ax.legend(loc="best")
     ax.set_xticks(selected_layers)
-    ax.set_xticklabels([f"L{l}" for l in selected_layers], rotation=45, ha="right")
+    ax.set_xticklabels([f"L{layer}" for layer in selected_layers], rotation=45, ha="right")
     ax.set_ylim(0, 1.05)
     ax.grid(True, alpha=0.3)
 
@@ -333,7 +333,7 @@ def plot_visual_vs_text_routing(
     ax.set_title("Visual vs Text Token Routing Across Layers\n(% Routed to Expert 1)")
     ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", ncol=2)
     ax.set_xticks(selected_layers)
-    ax.set_xticklabels([f"L{l}" for l in selected_layers], rotation=45, ha="right")
+    ax.set_xticklabels([f"L{layer}" for layer in selected_layers], rotation=45, ha="right")
     ax.set_ylim(0, 100)
     ax.grid(True, alpha=0.3)
 
@@ -766,8 +766,8 @@ def plot_loss_and_specialization(all_metrics, output_dir, metrics_json_path, sel
         for i, e in enumerate(epochs)
         if train_loss[i] is not None and divergence_values[i] is not None
     ]
-    valid_train_loss = [l for l in train_loss if l is not None]
-    valid_val_loss = [l for l in val_loss if l is not None]
+    valid_train_loss = [value for value in train_loss if value is not None]
+    valid_val_loss = [value for value in val_loss if value is not None]
     valid_divergence = [d for d in divergence_values if d is not None]
 
     if not valid_epochs:
@@ -826,7 +826,7 @@ def plot_loss_and_specialization(all_metrics, output_dir, metrics_json_path, sel
 
     # Combined legend
     lines = line1 + line2 + line3
-    labels = [l.get_label() for l in lines]
+    labels = [line.get_label() for line in lines]
     ax1.legend(lines, labels, loc="upper right", fontsize=11, framealpha=0.95)
 
     ax1.set_title(

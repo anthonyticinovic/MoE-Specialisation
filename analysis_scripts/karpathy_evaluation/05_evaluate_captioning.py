@@ -4,8 +4,8 @@ Step 5: Evaluate generated captions using COCO metrics.
 Computes BLEU-1/2/3/4, CIDEr, METEOR, SPICE, ROUGE-L.
 """
 
-import logging
 import argparse
+import logging
 import sys
 from pathlib import Path
 

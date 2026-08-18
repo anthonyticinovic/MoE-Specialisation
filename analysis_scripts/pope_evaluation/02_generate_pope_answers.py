@@ -4,9 +4,9 @@ Step 2: Generate POPE answers from Stage 2 or Stage 3 model.
 Generates yes/no answers for POPE questions.
 """
 
-import logging
 import argparse
 import json
+import logging
 import sys
 import time
 from pathlib import Path

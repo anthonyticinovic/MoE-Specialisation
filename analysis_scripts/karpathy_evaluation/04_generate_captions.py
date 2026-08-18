@@ -3,11 +3,11 @@
 Step 4: Generate captions for Karpathy test images using beam search.
 """
 
-import logging
 import argparse
+import logging
+import sys
 import time
 from pathlib import Path
-import sys
 
 import torch
 from tqdm import tqdm

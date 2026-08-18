@@ -6,11 +6,11 @@ This analysis tests the hypothesis:
 - Stage 3 performs WORSE on out-of-distribution tasks (POPE, COCO captioning)
 """
 
-import logging
 import argparse
 import json
-from pathlib import Path
+import logging
 import sys
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np

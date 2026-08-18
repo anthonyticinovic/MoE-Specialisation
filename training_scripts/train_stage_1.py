@@ -68,9 +68,9 @@ def build_frozen_llm(paths: dict[str, Any], ctx: RunContext) -> nn.Module:
     float32.
     """
     load_kwargs: dict[str, Any] = (
-        {"load_in_8bit": True, "torch_dtype": torch.bfloat16}
+        {"load_in_8bit": True, "dtype": torch.bfloat16}
         if ctx.on_gpu
-        else {"torch_dtype": get_model_dtype()}
+        else {"dtype": get_model_dtype()}
     )
     llm = MistralForCausalLM.from_pretrained(paths["mistral_local_path"], **load_kwargs)
     if not ctx.on_gpu:

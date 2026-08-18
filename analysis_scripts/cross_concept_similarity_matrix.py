@@ -32,9 +32,9 @@ Config file format (JSON):
     }
 """
 
-import logging
 import argparse
 import json
+import logging
 import os
 
 import matplotlib.pyplot as plt
@@ -773,8 +773,8 @@ class CrossConceptSimilarityAnalyzer:
         cross_modal_matrix = matrix[half_n:, :half_n]
 
         # Extract corresponding labels
-        img_labels = [l.replace("img:", "") for l in labels[:half_n]]
-        txt_labels = [l.replace("txt:", "") for l in labels[half_n:]]
+        img_labels = [label.replace("img:", "") for label in labels[:half_n]]
+        txt_labels = [label.replace("txt:", "") for label in labels[half_n:]]
 
         # Compute statistics
         logger.info("\n   Cross-modal only statistics:")
@@ -835,7 +835,7 @@ class CrossConceptSimilarityAnalyzer:
         samples_per_concept: int,
         annotations_file: str,
         image_dir: str,
-        layers: list[int] = [31],
+        layers: list[int] | None = None,
         pooling: str = "mean",
         output_dir: str = "results/similarity_matrix/",
         seed: int = 42,
@@ -856,6 +856,12 @@ class CrossConceptSimilarityAnalyzer:
         Returns:
             Dictionary containing results for each layer
         """
+        # A mutable default is shared by every call to this method; a list is
+        # only safe as a default while nobody mutates it, and nothing enforces
+        # that. The last layer of the 7B model is the historical default.
+        if layers is None:
+            layers = [31]
+
         logger.info("=" * 80)
         logger.info("Cross-Concept Similarity Matrix Analysis")
         logger.info("=" * 80)

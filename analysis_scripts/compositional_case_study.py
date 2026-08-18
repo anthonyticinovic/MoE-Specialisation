@@ -35,9 +35,9 @@ Manifest file format (JSON):
     }
 """
 
-import logging
 import argparse
 import json
+import logging
 import os
 
 import matplotlib.pyplot as plt
@@ -410,8 +410,8 @@ class CompositionalCaseStudyAnalyzer:
         stage3_cross = stage3_matrix[half_n:, :half_n]
 
         # Extract labels
-        img_labels = [l.replace("img:", "") for l in labels[:half_n]]
-        txt_labels = [l.replace("txt:", "") for l in labels[half_n:]]
+        img_labels = [label.replace("img:", "") for label in labels[:half_n]]
+        txt_labels = [label.replace("txt:", "") for label in labels[half_n:]]
 
         logger.info("\nCreating cross-modal comparison visualization...")
         logger.info(

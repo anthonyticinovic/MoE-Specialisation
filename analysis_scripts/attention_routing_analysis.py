@@ -11,9 +11,9 @@ Usage:
         --device cuda
 """
 
-import logging
 import argparse
 import json
+import logging
 import os
 
 import numpy as np

@@ -21,9 +21,12 @@ classifiers = [
 dependencies = [
     "torch>=2.1.0",
     "torchvision>=0.16.0",
-    # Capped below 5: the paper was produced on the transformers 4.x line and
-    # v5 changes Mistral model internals (numerics/behaviour boundary).
-    "transformers>=4.40.0,<5",
+    # Floored at 4.56: `from_pretrained(dtype=...)` was introduced there, and
+    # the older `torch_dtype=` spelling now logs a deprecation warning on every
+    # model load. Capped below 5: the paper was produced on the transformers 4.x
+    # line and v5 changes Mistral model internals (a numerics/behaviour
+    # boundary). uv.lock pins the exact version the results were produced with.
+    "transformers>=4.56.0,<5",
     "datasets>=2.14.0",
     "Pillow>=10.0.0",
     "numpy>=1.24.0",

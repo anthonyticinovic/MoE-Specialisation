@@ -9,13 +9,13 @@ POPE evaluates object hallucination with 3 difficulty levels:
 - Adversarial: Objects that co-occur with image objects
 """
 
-import logging
 import argparse
 import json
+import logging
 import random
+import sys
 from collections import Counter
 from pathlib import Path
-import sys
 
 # Running this file directly puts *its own* directory on sys.path, not the repo
 # root, so the first-party imports below would fail. Add the root explicitly.

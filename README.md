@@ -4,6 +4,7 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
 [![uv](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/uv/main/assets/badge/v0.json)](https://github.com/astral-sh/uv)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![CI](https://github.com/anthonyticinovic/MoE-Specialisation/actions/workflows/ci.yml/badge.svg)](https://github.com/anthonyticinovic/MoE-Specialisation/actions/workflows/ci.yml)
 [![Paper](https://img.shields.io/badge/paper-AAAI%202026%20Workshop-b31b1b.svg)](https://proceedings.mlr.press/v332/)
 
 Research code for [*Expert Collapse and Compositional Failure in Simple Multimodal MoE*](https://raw.githubusercontent.com/mlresearch/v332/main/assets/ticinovic26a/ticinovic26a.pdf)
@@ -52,6 +53,10 @@ cluster.
 
 `make check` runs the lint, the tests and the demo together; so does CI, on
 every push.
+
+For *why* the code is shaped this way — two experts and not eight, a fixed mask
+before a learned gate, what FSDP forced, and what I would do differently — see
+[`docs/design.md`](docs/design.md).
 
 ## Overview
 
@@ -167,152 +172,53 @@ Then edit all `YOUR_PATH_HERE` placeholders in `configs/training_config.yaml`.
 `load_config()` validates these on startup and fails fast with a clear message
 if any are left unfilled.
 
-### Stage 0 - Create the MoE model
+### Running the stages
 
-```bash
-python -m models.utils.create_moe_model \
-    --base-model /path/to/Mistral-7B-v0.3 \
-    --output     /path/to/Mistral-7B-MoE
-```
+| Step | Command | Produces |
+|------|---------|----------|
+| 0 | `python -m models.utils.create_moe_model --base-model <Mistral-7B> --output <MoE>` | MoE model dir (`trust_remote_code`) |
+| 1 | `python training_scripts/train_stage_1.py` | `vision_connector_stage1_best.pth` |
+| 2 | `torchrun --nproc_per_node=4 training_scripts/train_stage_2.py` | `stage2_checkpoints/llm_stage2_best.pth` |
+| 2.5 | `torchrun --nproc_per_node=4 training_scripts/train_stage_2.5.py` | `stage2_5_checkpoints/` (learned router) |
+| 3 | `torchrun --nproc_per_node=4 training_scripts/train_stage_3.py` | `stage3_checkpoints/` + `outputs/expert_metrics/` |
+| dense | `torchrun --nproc_per_node=4 training_scripts/train_dense.py` | `dense_checkpoints/` (control baseline) |
 
-### Stage 1 - Train the vision connector (1 GPU)
-
-```bash
-# Locally or via SLURM:
-export PYTHONPATH="${PWD}:${PYTHONPATH}"
-python training_scripts/train_stage_1.py
-# SLURM: sbatch hpc/training_scripts/train_stage_1.sbatch
-```
-
-### Stages 2, 2.5, 3 - Multi-GPU training (FSDP)
-
-```bash
-# 4-GPU example:
-export PYTHONPATH="${PWD}:${PYTHONPATH}"
-torchrun --nproc_per_node=4 training_scripts/train_stage_2.py
-torchrun --nproc_per_node=4 training_scripts/train_stage_2.5.py
-torchrun --nproc_per_node=4 training_scripts/train_stage_3.py
-
-# SLURM wrappers:
-sbatch hpc/training_scripts/train_stage_2.sbatch
-sbatch hpc/training_scripts/train_stage_2.5.sbatch
-sbatch hpc/training_scripts/train_stage_3.sbatch
-```
+`export PYTHONPATH="${PWD}:${PYTHONPATH}"` first, so `trust_remote_code` can
+find the custom model classes. Each stage has a SLURM wrapper —
+`sbatch hpc/training_scripts/train_stage_<n>.sbatch`.
 
 > Stages 2–3 require at least 4× A100/H100 GPUs. Before submitting, set your
 > checkout and virtualenv paths in `hpc/cluster_env.sh` (or export
 > `MOE_PROJECT_DIR` / `MOE_VENV`) and adapt the `#SBATCH` headers. See
 > [`hpc/README.md`](hpc/README.md).
 
+Stage 3's `expert_metrics/` is what [`paper_metrics/`](paper_metrics/README.md)
+expects, so a completed run makes `make figures` work without a GPU thereafter.
+Then run the analyses — see [`docs/running-the-analyses.md`](docs/running-the-analyses.md).
+
 ## Analysis Scripts
 
-All analysis scripts are in `analysis_scripts/`. They require a trained checkpoint and the paths configured in `configs/training_config.yaml` (or the relevant JSON config in `configs/`).
+All analysis scripts live in `analysis_scripts/` and need a checkpoint you have
+trained. They resolve paths through `MOE_CONFIG`, falling back to
+`configs/training_config.yaml`, and pick CUDA or CPU automatically — the same
+mechanism the CPU demo uses to drive them.
 
-### Expert routing & specialisation
+| Script | Question it answers |
+|---|---|
+| `routing_ablation_experiment.py` | Does swapping the two experts cost loss? (the specialisation check `make demo` runs) |
+| `plot_expert_metrics.py` | How did expert load, entropy and confidence move across Stage 3 epochs? |
+| `cross_concept_similarity_matrix.py` | How similar are image and text representations of the same concept, layer by layer? |
+| `cross_modality_purity.py` | How separable are the two experts' representations for one concept? |
+| `layer_clustering_analysis.py` | Do per-layer activations cluster by modality or by concept? |
+| `compositional_case_study.py` | Colour–object binding: does the model compose attributes? |
+| `pope_evaluation/` | Object hallucination (random / popular / adversarial) |
+| `karpathy_evaluation/` | COCO Karpathy retrieval (R@k) and captioning (CIDEr, BLEU, METEOR, ROUGE) |
+| `llava_evaluation/` | LLaVA-Wild open-ended instruction following |
 
-```bash
-# Routing ablation: compare normal vs. flipped routing to verify specialisation
-python analysis_scripts/routing_ablation_experiment.py \
-    --checkpoint /path/to/stage2_best.pth \
-    --data       /path/to/coco
-
-# Expert utilisation metrics across epochs (reads JSON files from training)
-python analysis_scripts/plot_expert_metrics.py \
-    --metrics_dir /path/to/outputs/expert_metrics \
-    --layers all_layers
-```
-
-Analysis scripts write to `results/`, which is git-ignored. `make figures` is a
-shortcut for the command above, reading the committed metrics in
-[`paper_metrics/`](paper_metrics/README.md) instead of a run of your own — once
-those are added.
-
-### Concept-level analysis
-
-```bash
-# Cross-concept similarity matrix (2N×2N image-text similarity at each layer)
-python analysis_scripts/cross_concept_similarity_matrix.py \
-    --config-file configs/similarity_matrix.json \
-    --mode stage2   # or stage3
-
-# Cross-modality purity (how separable are expert representations per concept?)
-python analysis_scripts/cross_modality_purity.py \
-    --concepts dog cat car bus \
-    --layers 0 8 16 24 31
-
-# Layer-wise clustering of expert activations
-python analysis_scripts/layer_clustering_analysis.py \
-    --config configs/clustering_analysis.json
-
-# Compositional case study (colour-object binding)
-python analysis_scripts/compositional_case_study.py \
-    --config-file configs/compositional_case_study.json
-
-# Stage 2 vs Stage 3 similarity matrix comparison plot
-python analysis_scripts/create_stage_comparison.py \
-    --stage2-dir results/similarity_matrix/stage2 \
-    --stage3-dir results/similarity_matrix/stage3
-```
-
-### Benchmark evaluation
-
-#### POPE (object hallucination)
-
-```bash
-# Generates pope_{random,popular,adversarial}.json into the output dir.
-python analysis_scripts/pope_evaluation/01_generate_pope_questions.py \
-    --annotations_file /path/to/coco/annotations/instances_val2017.json \
-    --output_dir       results/pope_evaluation
-
-# Run once per difficulty (see pope_evaluation/README.md for the full loop).
-python analysis_scripts/pope_evaluation/02_generate_pope_answers.py \
-    --questions_file  results/pope_evaluation/pope_random.json \
-    --image_dir       /path/to/coco/val2017 \
-    --checkpoint_path /path/to/checkpoint.pth \
-    --output_dir      results/pope_evaluation
-
-python analysis_scripts/pope_evaluation/03_evaluate_pope.py \
-    --stage2_dir results/pope_evaluation \
-    --output_dir results/pope_evaluation
-```
-
-#### Karpathy COCO split (retrieval + captioning)
-
-```bash
-# Preprocess Karpathy split JSON
-python analysis_scripts/karpathy_evaluation/01_preprocess_karpathy.py \
-    --karpathy_json /path/to/dataset_coco.json
-
-# Extract embeddings for retrieval
-python analysis_scripts/karpathy_evaluation/02_extract_embeddings.py \
-    --image_base_dir /path/to/coco \
-    --checkpoint_path /path/to/checkpoint.pth
-
-# Evaluate retrieval (R@1, R@5, R@10)
-python analysis_scripts/karpathy_evaluation/03_evaluate_retrieval.py
-
-# Generate captions
-python analysis_scripts/karpathy_evaluation/04_generate_captions.py \
-    --image_base_dir /path/to/coco \
-    --checkpoint_path /path/to/checkpoint.pth
-
-# Score captions (CIDEr, BLEU, METEOR, ROUGE)
-python analysis_scripts/karpathy_evaluation/05_evaluate_captioning.py
-
-# Visualise results
-python analysis_scripts/karpathy_evaluation/06_visualize_results.py
-```
-
-#### LLaVA-Wild (instruction following)
-
-```bash
-python analysis_scripts/llava_evaluation/01_llava_wild_eval.py \
-    --checkpoint /path/to/checkpoint.pth
-
-python analysis_scripts/llava_evaluation/02_compare_results.py \
-    --stage2 results/llava_wild/stage2 \
-    --stage3 results/llava_wild/stage3
-```
+**The commands for all of these are in
+[`docs/running-the-analyses.md`](docs/running-the-analyses.md)**; each evaluation
+sub-pipeline additionally has its own README with the full loop and expected
+outputs. Output goes to `results/`, which is git-ignored.
 
 ## Repository Structure
 
@@ -337,6 +243,9 @@ MoE-Specialisation/
 │   ├── pope_evaluation/      # POPE hallucination benchmark
 │   └── llava_evaluation/     # LLaVA-Wild evaluation
 ├── demo/                     # CPU end-to-end demo: fixtures, runner, invariants
+├── docs/
+│   ├── design.md             # Why the architecture and pipeline are shaped this way
+│   └── running-the-analyses.md  # Every analysis/benchmark command
 ├── tests/                    # CPU-only pytest suite + behavioural oracle
 ├── paper_metrics/            # Committed Stage 3 metrics for `make figures`
 ├── configs/
@@ -348,24 +257,11 @@ MoE-Specialisation/
     └── model_scripts/        # SLURM job script for model creation
 ```
 
-## Reproduce the paper
+## Dependencies
 
-The full pipeline, in order, with the artifacts each stage produces:
-
-| Step | Command | Produces |
-|------|---------|----------|
-| 0 | `python -m models.utils.create_moe_model --base-model <Mistral-7B> --output <MoE>` | MoE model dir (`trust_remote_code`) |
-| 1 | `python training_scripts/train_stage_1.py` | `vision_connector_stage1_best.pth` |
-| 2 | `torchrun --nproc_per_node=4 training_scripts/train_stage_2.py` | `stage2_checkpoints/llm_stage2_best.pth` |
-| 2.5 | `torchrun --nproc_per_node=4 training_scripts/train_stage_2.5.py` | `stage2_5_checkpoints/` (learned router) |
-| 3 | `torchrun --nproc_per_node=4 training_scripts/train_stage_3.py` | `stage3_checkpoints/` + `outputs/expert_metrics/` |
-
-Then run the analysis scripts (see above) against the resulting checkpoints.
-Stage 3's `expert_metrics/` is also what [`paper_metrics/`](paper_metrics/README.md)
-expects, so a completed run makes `make figures` work without a GPU thereafter.
-
-The `uv.lock` pins the exact dependency set; exact paper figures used the
-`transformers` 4.x line (the dependency is capped `<5`).
+`uv.lock` pins the exact dependency set the results were produced with.
+`transformers` is floored at 4.56 (where `from_pretrained(dtype=...)` was
+introduced) and capped below 5, which changes Mistral internals.
 
 ## Development
 
@@ -375,7 +271,7 @@ uv run pre-commit install
 
 make lint     # ruff (correctness repo-wide, style on the core) + mypy
 make format   # apply ruff formatting
-make test     # CPU-only pytest suite (~8s)
+make test     # CPU-only pytest suite (~9s)
 make demo     # the whole pipeline on CPU against synthetic fixtures
 make check    # lint + test + demo
 ```
@@ -387,11 +283,12 @@ green while the pipeline itself is broken.
 ruff and mypy are strict on the maintained core (`models/`, `data/`, `tests/`);
 the research scripts (`training_scripts/`, `analysis_scripts/`) are held to
 formatting plus the correctness rules that catch undefined names
-(`F821`/`F811`/`F822`) and unstrict `zip()` (`B905`). A missing import once left
-two training scripts unrunnable on `main` for months, and the narrower lint
-scope was why nothing noticed; `zip()` is on the same list because it truncates
-to the shorter sequence in silence, which in plotting code means a chart quietly
-missing its last layers rather than an error.
+(`F821`/`F811`/`F822`), unstrict `zip()` (`B905`) and bare `except:` (`E722`).
+A missing import once left two training scripts unrunnable on `main` for months,
+and the narrower lint scope was why nothing noticed. The other two are on the
+list for the same reason: an unstrict `zip()` truncates to the shorter sequence
+in silence, and a bare `except:` swallows `KeyboardInterrupt` alongside whatever
+it meant to catch.
 
 The suite covers four levels, deliberately:
 

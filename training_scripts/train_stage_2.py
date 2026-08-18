@@ -87,7 +87,7 @@ def build_moe_llm(paths: dict[str, Any], ctx: RunContext) -> nn.Module:
         paths["moe_model_path"],
         trust_remote_code=True,
         local_files_only=True,
-        torch_dtype=get_model_dtype(),
+        dtype=get_model_dtype(),
         attn_implementation=get_attn_implementation(),
     )
 

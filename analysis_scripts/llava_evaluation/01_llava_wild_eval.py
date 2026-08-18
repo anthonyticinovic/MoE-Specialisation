@@ -8,9 +8,9 @@ This tests whether Stage 3 performs better on its TRAINING distribution
 (elaborate conversational answers) vs structured tasks (POPE, captioning).
 """
 
-import logging
 import argparse
 import json
+import logging
 import random
 import sys
 from pathlib import Path

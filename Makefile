@@ -17,7 +17,7 @@ help:
 	@echo "make clean-demo  Remove demo_output/"
 
 lint:
-	$(PY) ruff check --select F821,F811,F822,B905 .
+	$(PY) ruff check --select F821,F811,F822,B905,E722 .
 	$(PY) ruff check models/ data/ tests/
 	$(PY) ruff format --check .
 	$(PY) mypy

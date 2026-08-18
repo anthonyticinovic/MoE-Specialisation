@@ -9,9 +9,9 @@ Usage:
     python analysis_scripts/cross_modality_purity.py --concepts circle --top-k 20
 """
 
-import logging
 import argparse
 import json
+import logging
 import os
 
 import numpy as np

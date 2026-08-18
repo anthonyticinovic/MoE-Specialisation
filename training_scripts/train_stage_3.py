@@ -104,7 +104,7 @@ def build_llm(paths: dict[str, Any], train_params: dict[str, Any], ctx: RunConte
         paths["moe_model_path"],
         trust_remote_code=True,
         local_files_only=True,
-        torch_dtype=get_model_dtype(),
+        dtype=get_model_dtype(),
         attn_implementation=get_attn_implementation(),
         low_cpu_mem_usage=True,
     )
@@ -758,7 +758,6 @@ def main() -> None:
     loader_params = config["dataloader"]
     num_epochs = train_params["num_epochs"]
     output_dir = paths["output_dir"]
-    stage2_checkpoint_dir = os.path.join(output_dir, "stage2_checkpoints")
     stage3_checkpoint_dir = os.path.join(output_dir, "stage3_checkpoints")
 
     ctx = build_run_context(

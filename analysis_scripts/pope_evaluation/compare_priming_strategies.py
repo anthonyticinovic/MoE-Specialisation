@@ -5,10 +5,11 @@ Shows whether priming Stage 3 with "fake previous answers" improves performance
 by exploiting its learned multi-turn conversation behaviour.
 """
 
-import logging
 import argparse
 import json
+import logging
 from pathlib import Path
+
 from models.utils.common import setup_logging
 
 logger = logging.getLogger(__name__)

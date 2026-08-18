@@ -8,39 +8,20 @@ This script visualises the representation space created by MoE layers to see
 if the router and experts are separating inputs by modality or concept.
 
 Usage:
-    # Analyse using config file
+    # Analyse using a config file
     python analysis_scripts/layer_clustering_analysis.py \
         --config configs/clustering_analysis.json
-    
+
     # Override config parameters
-    python analysis_scripts/layer_clu        ax.set_xlabel("Dimension 1", fontsize=12)
-        ax.set_ylabel("Dimension 2", fontsize=12)
-        ax.set_title(f"Layer {layer_idx} - Expert Selection with Routing Confidence", fontsize=14, fontweight='bold')
-        ax.legend(loc='upper left', framealpha=0.9, title="Expert Choice")
-        ax.grid(True, alpha=0.3)
-        
-        # Add colorbar for confidence
-        from matplotlib.colors import Normalize
-        from matplotlib.cm import ScalarMappable
-        # Colorbar is just a reference for the confidence gradient
-        
-        # Create a colormap that goes from white to gray (for visualisation reference)
-        # This represents the confidence gradient
-        # Use the actual confidence threshold from the config
-        norm = Normalize(vmin=self.expert_confidence_threshold, vmax=1.0)
-        sm = ScalarMappable(cmap=plt.cm.Greys, norm=norm)
-        sm.set_array([])
-        
-        cbar = plt.colorbar(sm, ax=ax, pad=0.02, aspect=30)
-        cbar.set_label('Routing Confidence', rotation=270, labelpad=20, fontsize=11) \
+    python analysis_scripts/layer_clustering_analysis.py \
         --config configs/clustering_analysis.json \
         --layers 31 \
         --reduction-method tsne
 """
 
-import logging
 import argparse
 import json
+import logging
 import os
 from collections import Counter
 
@@ -471,15 +452,22 @@ class MoEClusteringAnalyzer(CrossModalityPurityAnalyzer):
                 "n_samples": len(labels),
             }
 
-        # Compute metrics
+        # Compute metrics. Both scorers raise ValueError on degenerate input —
+        # duplicate points, or a cluster with a single member. The fallbacks
+        # below are the neutral value for each metric, but they are also
+        # indistinguishable from a genuine result, so the failure is logged:
+        # a silhouette of 0.0 otherwise reads as "no cluster structure" when it
+        # in fact means "the score could not be computed".
         try:
             silhouette = silhouette_score(coords_2d, labels)
-        except:
+        except ValueError as err:
+            logger.warning("Silhouette score failed (%s) — reporting 0.0", err)
             silhouette = 0.0
 
         try:
             davies_bouldin = davies_bouldin_score(coords_2d, labels)
-        except:
+        except ValueError as err:
+            logger.warning("Davies-Bouldin index failed (%s) — reporting inf", err)
             davies_bouldin = float("inf")
 
         return {

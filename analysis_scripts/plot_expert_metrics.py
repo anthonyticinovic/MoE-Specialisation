@@ -15,9 +15,9 @@ Usage:
 """
 
 import argparse
-import logging
 import glob
 import json
+import logging
 import os
 
 from analysis_scripts import expert_metrics_plots as emp

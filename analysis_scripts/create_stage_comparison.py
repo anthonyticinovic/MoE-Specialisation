@@ -5,14 +5,15 @@ Reads the JSON outputs from cross_concept_similarity_matrix.py for both stages
 and creates comparison plots with independent color scales for better interpretability.
 """
 
-import logging
 import argparse
 import json
+import logging
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
+
 from models.utils.common import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -55,8 +56,8 @@ def create_comparison_plot(
     stage3_cross = stage3_matrix[half_n:, :half_n]
 
     # Extract labels
-    img_labels = [l.replace("img:", "") for l in stage2_labels[:half_n]]
-    txt_labels = [l.replace("txt:", "") for l in stage2_labels[half_n:]]
+    img_labels = [label.replace("img:", "") for label in stage2_labels[:half_n]]
+    txt_labels = [label.replace("txt:", "") for label in stage2_labels[half_n:]]
 
     # Compute statistics
     logger.info(f"\nLayer {layer} Statistics:")

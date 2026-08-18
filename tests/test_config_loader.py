@@ -1,5 +1,7 @@
 """Tests for models.utils.common shared helpers."""
 
+from pathlib import Path
+
 import pytest
 import yaml
 
@@ -138,3 +140,39 @@ class TestRegisterMoEModel:
         register_moe_model()
         resolved = AutoConfig.for_model("mistral_moe")
         assert isinstance(resolved, MistralMoEConfig)
+
+
+class TestNoDeadConfigKeys:
+    """Every per-stage hyperparameter must be read by the stage that owns it.
+
+    `load_balancing_coeff` sat under `training_stage3` and `dense_control` while
+    only Stage 2.5 ever read it. The dense entry was the worse of the two: the
+    dense control has no experts, so a load-balancing coefficient is not merely
+    unused but meaningless — and a `0.00` under Stage 3 reads as "the term
+    exists and is disabled", which was never true.
+    """
+
+    REPO = Path(__file__).parent.parent
+    # Config section → the script that consumes it.
+    SECTIONS = {
+        "training_stage1": "train_stage_1.py",
+        "training_stage2": "train_stage_2.py",
+        "training_stage2.5": "train_stage_2.5.py",
+        "training_stage3": "train_stage_3.py",
+        "dense_control": "train_dense.py",
+    }
+
+    @pytest.mark.parametrize("section,script", SECTIONS.items())
+    def test_every_key_is_read_by_its_stage(self, section, script):
+        config = yaml.safe_load((self.REPO / "configs" / "training_config.yaml").read_text())
+        # A stage reads its parameters either directly or through _lib.
+        sources = [(self.REPO / "training_scripts" / script).read_text()]
+        sources += [p.read_text() for p in (self.REPO / "training_scripts" / "_lib").glob("*.py")]
+        haystack = "\n".join(sources)
+
+        dead = [key for key in config[section] if f'"{key}"' not in haystack]
+        assert not dead, (
+            f"{section}: {dead} appear in training_config.yaml but {script} never "
+            "reads them. A config key nothing consumes documents behaviour that "
+            "does not exist."
+        )

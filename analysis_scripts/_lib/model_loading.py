@@ -100,7 +100,7 @@ def load_stage2_models(
         moe_model_path,
         trust_remote_code=True,
         local_files_only=True,
-        torch_dtype=get_model_dtype(),
+        dtype=get_model_dtype(),
         attn_implementation="eager",  # Required for output_attentions=True
     ).to(device)
 

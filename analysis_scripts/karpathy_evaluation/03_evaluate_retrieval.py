@@ -4,10 +4,10 @@ Step 3: Evaluate retrieval metrics (Image-to-Text and Text-to-Image).
 Computes R@1, R@5, R@10 for both directions.
 """
 
-import logging
 import argparse
-from pathlib import Path
+import logging
 import sys
+from pathlib import Path
 
 import numpy as np
 

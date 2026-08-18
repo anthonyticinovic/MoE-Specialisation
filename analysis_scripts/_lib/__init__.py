@@ -13,8 +13,8 @@ from analysis_scripts._lib.io import (
     format_time,
     load_and_preprocess_image,
     load_json,
-    mean_pool_embeddings,
     log_banner,
+    mean_pool_embeddings,
     save_json,
 )
 from analysis_scripts._lib.model_loading import (

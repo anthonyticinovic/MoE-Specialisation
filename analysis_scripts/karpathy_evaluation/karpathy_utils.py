@@ -19,8 +19,8 @@ from analysis_scripts._lib import (
     get_paths,
     load_and_preprocess_image,
     load_json,
-    mean_pool_embeddings,
     log_banner,
+    mean_pool_embeddings,
     save_json,
 )
 from models.utils.common import get_device
@@ -97,7 +97,7 @@ def load_model_checkpoint(checkpoint_path: str, device: str | None = None):
         moe_model_path,
         trust_remote_code=True,
         local_files_only=True,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
     )
 
