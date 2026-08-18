@@ -217,6 +217,12 @@ So the duplication stays, the reasoning is recorded at the top of
 them without meaning to. Keeping each stage independently readable and
 independently reproducible was worth more here than DRY.
 
+What *did* come out of `train_stage_3.py` is its construction code — model,
+data, checkpoint loading and resumption, now in
+[`_lib/stage3_setup.py`](../training_scripts/_lib/stage3_setup.py). That is
+mechanical setup with no numerics in it, so moving it is verifiable by the
+demo's exact-equality baseline; the forward pass is not.
+
 ## 6. How correctness is checked without a GPU
 
 The problem: the pipeline needs 4× H100 and a week, and almost every failure

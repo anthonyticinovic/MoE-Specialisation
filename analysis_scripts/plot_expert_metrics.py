@@ -20,6 +20,7 @@ import json
 import logging
 import os
 
+from analysis_scripts import expert_metrics_evolution_plots as eme
 from analysis_scripts import expert_metrics_plots as emp
 from models.utils.common import setup_logging
 
@@ -164,16 +165,16 @@ def main():
     emp.plot_visual_vs_text_routing(all_metrics, args.output_dir, selected_layers)
 
     logger.info("\nGenerating specialisation evolution plot...")
-    emp.plot_specialization_evolution(all_metrics, args.output_dir)
+    eme.plot_specialization_evolution(all_metrics, args.output_dir)
 
     logger.info("\nGenerating aggregate summary...")
-    emp.plot_aggregate_summary(all_metrics, args.output_dir)
+    eme.plot_aggregate_summary(all_metrics, args.output_dir)
 
     logger.info("\nGenerating the headline plots...")
     logger.info("   (Modality specialisation, routing confidence, loss correlation)")
 
-    emp.plot_modality_specialization_divergence(all_metrics, args.output_dir, selected_epochs)
-    emp.plot_routing_confidence_evolution(all_metrics, args.output_dir, selected_epochs)
+    eme.plot_modality_specialization_divergence(all_metrics, args.output_dir, selected_epochs)
+    eme.plot_routing_confidence_evolution(all_metrics, args.output_dir, selected_epochs)
 
     # A training run writes the loss history beside the expert_metrics/ directory.
     training_metrics_path = args.training_metrics or os.path.join(
@@ -184,12 +185,12 @@ def main():
             "No training metrics at %s — skipping the loss plot. Pass --training_metrics.",
             training_metrics_path,
         )
-    emp.plot_loss_and_specialization(
+    eme.plot_loss_and_specialization(
         all_metrics, args.output_dir, training_metrics_path, selected_epochs
     )
 
     logger.info("\nGenerating text report...")
-    emp.generate_report(all_metrics, args.output_dir)
+    eme.generate_report(all_metrics, args.output_dir)
 
     logger.info(f"\n{'=' * 80}")
     logger.info("COMPLETE!")

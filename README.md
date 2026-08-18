@@ -236,7 +236,7 @@ MoE-Specialisation/
 │   ├── COCO_loader.py        # COCO captions dataset
 │   └── LLaVA_loader.py       # LLaVA-Instruct-150K dataset
 ├── training_scripts/         # One script per training stage
-│   └── _lib/                 # Shared runtime, pipeline, checkpoint and metric code
+│   └── _lib/                 # Shared runtime, pipeline and metric code + Stage 3 setup
 ├── analysis_scripts/         # Expert analysis and benchmark evaluation
 │   ├── _lib/                 # Shared model loading, I/O and plotting helpers
 │   ├── karpathy_evaluation/  # COCO Karpathy split pipeline
@@ -296,7 +296,7 @@ The suite covers four levels, deliberately:
 |---|---|---|
 | Numerics | `tests/test_training_dry_run.py` | A tiny synthetic model must produce bit-identical loss and grad-norm against a recorded baseline. If those move, a refactor changed training numerics. |
 | Behaviour | `tests/test_training_steps.py`, `tests/test_analysis_model_loading.py` | Each stage runs a real epoch and must change **exactly** the parameters it claims to train, with gradients reaching all of them, and must resume from its own checkpoint. The analysis loaders are then driven against the checkpoints those stages produced. |
-| Structure | `tests/test_training_scripts_structure.py`, `tests/test_analysis_lib.py` | Every script stays inert on import, reuses `_lib` rather than re-implementing FSDP, and never loads weights with a bare `strict=False`. No analysis script may hardcode the config path or default to CUDA — both would put it back out of the demo's reach. Also checks the SLURM scripts point at files that exist. |
+| Structure | `tests/test_training_scripts_structure.py`, `tests/test_analysis_lib.py` | Every script stays inert on import, reuses `_lib` rather than re-implementing FSDP, and never loads weights with a bare `strict=False`. No analysis script may hardcode the config path or default to CUDA — both would put it back out of the demo's reach. No source file may exceed 800 lines. Also checks the SLURM scripts point at files that exist. |
 | End-to-end | `make demo` | 14 executable invariants over a full CPU pipeline run, including the routing ablation. A partial run (`--stages 0 1`) skips the checks whose stages did not run rather than failing them. |
 
 ## Citation

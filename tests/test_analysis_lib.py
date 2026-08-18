@@ -224,3 +224,29 @@ class TestAnalysisModulesAreImportable:
         assert any(isinstance(n, ast.FunctionDef) and n.name == "main" for n in tree.body), (
             f"{path.name} builds its parser but has no main() to call"
         )
+
+
+REPO = ANALYSIS_DIR.parent
+SOURCE_FILES = sorted(
+    path
+    for directory in ("models", "data", "training_scripts", "analysis_scripts", "demo", "tests")
+    for path in (REPO / directory).rglob("*.py")
+)
+MAX_LINES = 800
+
+
+@pytest.mark.parametrize("path", SOURCE_FILES, ids=lambda p: p.name)
+def test_no_source_file_is_oversized(path):
+    """No file over 800 lines.
+
+    Four files were over when this was added — two analysers of 1382 and 1071
+    lines, a plotting module of 843 and `train_stage_3.py` at 839. The guideline
+    is worth enforcing rather than rediscovering: a reviewer opening a
+    1,400-line module learns nothing about the design from it, and a file that
+    large is where dead code and mangled docstrings survive unnoticed.
+    """
+    count = len(path.read_text().splitlines())
+    assert count <= MAX_LINES, (
+        f"{path.relative_to(REPO)} is {count} lines. Split it along a seam that "
+        "already exists — extraction vs metrics, analysis vs plotting, setup vs loop."
+    )
