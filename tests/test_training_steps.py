@@ -13,32 +13,15 @@ runs is reachable from a test without a GPU, a checkpoint, or COCO.
 from __future__ import annotations
 
 import copy
-import importlib.util
 import shutil
-import sys
 from pathlib import Path
 from typing import Any
 
 import pytest
 import torch
-import yaml
 
-from demo import build_fixtures
-from models.utils.common import register_moe_model
-from models.utils.create_moe_model import create_moe_model
-from training_scripts._lib import RunContext, build_run_context, teardown, wrap_with_fsdp
-
-SCRIPT_DIR = Path(__file__).parent.parent / "training_scripts"
-
-# Stage name → (filename, config section). Stage 2.5's filename is not a valid
-# identifier, so every stage is loaded by path for consistency.
-STAGES: dict[str, tuple[str, str]] = {
-    "stage_1": ("train_stage_1.py", "training_stage1"),
-    "stage_2": ("train_stage_2.py", "training_stage2"),
-    "stage_2_5": ("train_stage_2.5.py", "training_stage2.5"),
-    "stage_3": ("train_stage_3.py", "training_stage3"),
-    "dense": ("train_dense.py", "dense_control"),
-}
+from tests.pipeline import NEEDS_PRIOR_STAGES, STAGES, load_stage, train_epoch
+from training_scripts._lib import RunContext, wrap_with_fsdp
 
 # What each stage claims to train, as substrings of the LLM parameter names.
 # Stage 1 trains only the connector, so its LLM must stay entirely frozen.
@@ -49,33 +32,6 @@ TRAINABLE_INTENT: dict[str, set[str]] = {
     "stage_3": {"mlp.experts.", "mlp.gate.", "self_attn."},
     "dense": {"mlp.", "self_attn."},
 }
-
-# Stage 2.5 and Stage 3 load the Stage 1 connector and the Stage 2 experts, so
-# they need a directory where those stages have already run.
-NEEDS_PRIOR_STAGES = ("stage_2_5", "stage_3")
-
-
-def _load_stage(name: str) -> Any:
-    """Import a training script by path, once per session."""
-    module_name = f"_test_{name}"
-    if module_name in sys.modules:
-        return sys.modules[module_name]
-    spec = importlib.util.spec_from_file_location(module_name, SCRIPT_DIR / STAGES[name][0])
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def _train(module: Any, name: str, setup: Any, ctx: RunContext) -> float:
-    """Run one epoch and return the training loss.
-
-    Stage 2.5 also reports its loss components and the router temperature; the
-    total is first.
-    """
-    result = module.train_one_epoch(setup, ctx, 0, 1)
-    return float(result[0]) if isinstance(result, tuple) else float(result)
 
 
 def _validate(module: Any, name: str, setup: Any, ctx: RunContext) -> float:
@@ -131,48 +87,6 @@ def _changed_since(setup: Any, before: dict[str, torch.Tensor]) -> set[str]:
     }
 
 
-@pytest.fixture(scope="session")
-def run_context() -> RunContext:
-    """One process group for the whole module, torn down at the end.
-
-    The distributed stages join a group even single-process on CPU, and
-    ``init_distributed`` is idempotent, so all five stages share this context
-    exactly as they would share a rank on a cluster.
-    """
-    ctx = build_run_context(distributed=True, seed=42, stage_name="tests")
-    yield ctx
-    teardown()
-
-
-@pytest.fixture(scope="session")
-def fixtures_config(tmp_path_factory, monkeypatch_session) -> dict[str, Any]:
-    """Build the synthetic fixtures and the Stage 0 MoE model once.
-
-    This is the demo's own fixture builder, so a test failing here means the
-    demo is broken too — which is the intended coupling.
-    """
-    root = tmp_path_factory.mktemp("training_steps")
-    config_path = build_fixtures.build(root, num_images=8)
-    create_moe_model(
-        str(root / "fixtures" / "base_llm"),
-        str(root / "fixtures" / "moe_model"),
-        seed=42,
-    )
-    # The scripts resolve their config through MOE_CONFIG; setting it here is
-    # exactly how the demo points them at the miniature setup.
-    monkeypatch_session.setenv("MOE_CONFIG", str(config_path))
-    register_moe_model()
-    return yaml.safe_load(config_path.read_text())
-
-
-@pytest.fixture(scope="session")
-def monkeypatch_session():
-    """Session-scoped monkeypatch — pytest's built-in one is function-scoped."""
-    patcher = pytest.MonkeyPatch()
-    yield patcher
-    patcher.undo()
-
-
 @pytest.fixture
 def config_in(fixtures_config, tmp_path):
     """A copy of the demo config writing its outputs to an empty directory.
@@ -190,34 +104,6 @@ def config_in(fixtures_config, tmp_path):
     return build
 
 
-@pytest.fixture(scope="session")
-def prior_stages(tmp_path_factory, fixtures_config, run_context) -> Path:
-    """An output directory where Stage 1 and Stage 2 have run and checkpointed.
-
-    Built once and treated as read-only by the tests that consume it.
-    """
-    output_dir = tmp_path_factory.mktemp("prior_stages")
-    config = copy.deepcopy(fixtures_config)
-    config["paths"]["output_dir"] = str(output_dir)
-
-    stage_1 = _load_stage("stage_1")
-    setup = stage_1.build_setup(
-        config["paths"], config["training_stage1"], config["dataloader"], 1, run_context
-    )
-    _train(stage_1, "stage_1", setup, run_context)
-    stage_1.save_checkpoints(setup, str(output_dir), 1.0, float("inf"))
-
-    stage_2 = _load_stage("stage_2")
-    setup_2, _, _, _ = stage_2.build_setup(
-        config["paths"], config["training_stage2"], config["dataloader"], 1, run_context
-    )
-    _train(stage_2, "stage_2", setup_2, run_context)
-    stage_2.save_checkpoints(
-        setup_2, run_context, str(output_dir / "stage2_checkpoints"), 0, 1.0, float("inf")
-    )
-    return output_dir
-
-
 @pytest.fixture
 def writable_prior_stages(tmp_path, prior_stages) -> Path:
     """A private copy of the Stage 1/2 artifacts, for tests that write there."""
@@ -231,7 +117,7 @@ def build_stage(config_in, run_context, prior_stages):
     """Assemble a stage against a clean output directory."""
 
     def build(name: str, output_dir: Path | None = None) -> Any:
-        module = _load_stage(name)
+        module = load_stage(name)
         if output_dir is None and name in NEEDS_PRIOR_STAGES:
             output_dir = prior_stages
         config = config_in(output_dir)
@@ -254,7 +140,7 @@ class TestTrainingStep:
 
     def test_epoch_returns_a_finite_loss(self, name, build_stage, run_context):
         module, setup, _ = build_stage(name)
-        loss = _train(module, name, setup, run_context)
+        loss = train_epoch(module, setup, run_context)
         assert torch.isfinite(torch.tensor(loss)), f"{name} produced a non-finite loss"
         assert loss > 0.0, f"{name} produced a zero loss — the batch guard may be swallowing it"
 
@@ -269,7 +155,7 @@ class TestTrainingStep:
         expected = {n for n, p in _parameters(setup).items() if p.requires_grad}
 
         before = _snapshot(setup)
-        _train(module, name, setup, run_context)
+        train_epoch(module, setup, run_context)
         changed = _changed_since(setup, before)
 
         assert not (changed - expected), (
@@ -349,7 +235,7 @@ class TestCheckpointRoundTrip:
         module, setup, config = build_stage("stage_2", tmp_path / "resume")
         checkpoint_dir = tmp_path / "resume" / "stage2_checkpoints"
 
-        _train(module, "stage_2", setup, run_context)
+        train_epoch(module, setup, run_context)
         module.save_checkpoints(setup, run_context, str(checkpoint_dir), 0, 0.5, float("inf"))
         trained = {n: p.detach().clone() for n, p in setup.llm.named_parameters()}
 
@@ -377,7 +263,7 @@ class TestCheckpointRoundTrip:
         module, setup, _ = build_stage("stage_2_5", writable_prior_stages)
         checkpoint_dir = writable_prior_stages / "stage2_5_checkpoints"
 
-        _train(module, "stage_2_5", setup, run_context)
+        train_epoch(module, setup, run_context)
         module.save_checkpoints(setup, run_context, str(checkpoint_dir), 0, 0.5, float("inf"))
         trained = {n: p.detach().clone() for n, p in setup.llm.named_parameters()}
 
@@ -397,7 +283,7 @@ class TestCheckpointRoundTrip:
         module, setup, _ = build_stage("stage_3", writable_prior_stages)
         checkpoint_dir = writable_prior_stages / "stage3_checkpoints"
 
-        _train(module, "stage_3", setup, run_context)
+        train_epoch(module, setup, run_context)
         module.save_checkpoints(setup, run_context, str(checkpoint_dir), 0, 0.5, float("inf"))
         trained = {n: p.detach().clone() for n, p in setup.llm.named_parameters()}
 
@@ -416,7 +302,7 @@ class TestCheckpointRoundTrip:
         output_dir = tmp_path / "best"
         module, setup, _ = build_stage("stage_1", output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)  # main() does this before saving
-        _train(module, "stage_1", setup, run_context)
+        train_epoch(module, setup, run_context)
 
         best = module.save_checkpoints(setup, str(output_dir), 2.0, float("inf"))
         assert best == pytest.approx(2.0)
@@ -507,7 +393,7 @@ class TestConfigResolution:
 
     def test_stage_reads_batch_size_from_the_config(self, build_stage, config_in, run_context):
         """A changed config value must reach the dataloader, not a constant."""
-        module = _load_stage("stage_1")
+        module = load_stage("stage_1")
         config = config_in()
         config["training_stage1"] = {**config["training_stage1"], "batch_size": 2}
         setup = module.build_setup(

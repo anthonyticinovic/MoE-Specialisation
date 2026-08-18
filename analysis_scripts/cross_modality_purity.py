@@ -383,7 +383,7 @@ class CrossModalityPurityAnalyzer:
         top_probs, top_indices = torch.topk(probs, top_k)
         return {
             self.tokenizer.decode([idx.item()]).strip(): prob.item()
-            for prob, idx in zip(top_probs, top_indices)
+            for prob, idx in zip(top_probs, top_indices, strict=True)
         }
 
     def compute_cosine_similarity(self, concept: str, layer: int, pooling: str = "cls") -> float:
@@ -539,7 +539,9 @@ class CrossModalityPurityAnalyzer:
 
         # Compute similarity at each layer
         similarities = {}
-        for layer_idx, (vis_state, txt_state) in enumerate(zip(vision_states, text_states)):
+        for layer_idx, (vis_state, txt_state) in enumerate(
+            zip(vision_states, text_states, strict=True)
+        ):
             # Pool representations
             vis_rep = self._pool_representation(vis_state, pooling, modality="vision")
             txt_rep = self._pool_representation(txt_state, pooling, modality="text")
@@ -864,7 +866,7 @@ class CrossModalityPurityAnalyzer:
         concept2_clip_tokens = None
         concept2_connector_tokens = None
 
-        for idx, (image, label) in enumerate(zip(images, labels)):
+        for idx, (image, label) in enumerate(zip(images, labels, strict=True)):
             pixel_values = self.clip_processor(images=image, return_tensors="pt").pixel_values.to(
                 self.device
             )

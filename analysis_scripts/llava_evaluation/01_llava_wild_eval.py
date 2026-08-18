@@ -18,12 +18,19 @@ from pathlib import Path
 import torch
 from tqdm import tqdm
 
-# Add parent directories to path
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-sys.path.insert(0, str(Path(__file__).parent.parent / "karpathy_evaluation"))
+# Running this file directly puts *its own* directory on sys.path, not the repo
+# root, so the first-party imports below would fail. Add the root explicitly.
+# This replaces sys.path edits that were spread across several modules and
+# depended on import order to take effect before they were needed.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from karpathy_utils import load_and_preprocess_image, load_model_checkpoint, log_banner, save_json
-from models.utils.common import get_device, setup_logging
+from analysis_scripts.karpathy_evaluation.karpathy_utils import (
+    load_and_preprocess_image,
+    load_model_checkpoint,
+    log_banner,
+    save_json,
+)  # noqa: E402
+from models.utils.common import get_device, setup_logging  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -170,7 +177,7 @@ def evaluate_response_simple(response, reference=None):
         score -= 10  # Too long
 
     # Repetition check (detect "a laptop, a laptop, a laptop")
-    unique_bigrams = set(zip(tokens[:-1], tokens[1:]))
+    unique_bigrams = set(zip(tokens[:-1], tokens[1:], strict=True))
     repetition_ratio = len(unique_bigrams) / max(num_tokens - 1, 1)
     if repetition_ratio > 0.7:
         score += 15  # Low repetition (good)

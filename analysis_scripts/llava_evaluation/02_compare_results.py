@@ -10,10 +10,18 @@ import logging
 import argparse
 import json
 from pathlib import Path
+import sys
 
 import matplotlib.pyplot as plt
 import numpy as np
-from models.utils.common import setup_logging
+
+# Running this file directly puts *its own* directory on sys.path, not the repo
+# root, so the first-party imports below would fail. Add the root explicitly.
+# This replaces sys.path edits that were spread across several modules and
+# depended on import order to take effect before they were needed.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from models.utils.common import setup_logging  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +31,28 @@ def load_results(json_path):
     with open(json_path) as f:
         data = json.load(f)
     return data
+
+
+def paired_scores(stage2_data, stage3_data):
+    """Return the two score lists, refusing to pair runs of different lengths.
+
+    Everything downstream pairs these by position — the win counts, the tie
+    count, the side-by-side samples and the per-sample scatter. If the two runs
+    evaluated different numbers of samples that pairing compares unrelated
+    samples, and the failure surfaces much later as an opaque matplotlib error
+    about mismatched x/y sizes. Fail here, with the reason.
+    """
+    s2_scores = [r["score"] for r in stage2_data["results"]]
+    s3_scores = [r["score"] for r in stage3_data["results"]]
+
+    if len(s2_scores) != len(s3_scores):
+        raise ValueError(
+            f"Stage 2 evaluated {len(s2_scores)} samples and Stage 3 evaluated "
+            f"{len(s3_scores)}. This comparison pairs them by position, so the "
+            "results would compare different samples. Re-run the missing side, "
+            "or filter both to their common sample ids first."
+        )
+    return s2_scores, s3_scores
 
 
 def analyze_results(stage2_data, stage3_data):
@@ -51,8 +81,7 @@ def analyze_results(stage2_data, stage3_data):
     )
 
     # Distribution analysis
-    s2_scores = [r["score"] for r in stage2_data["results"]]
-    s3_scores = [r["score"] for r in stage3_data["results"]]
+    s2_scores, s3_scores = paired_scores(stage2_data, stage3_data)
 
     if len(s2_scores) == 0 or len(s3_scores) == 0:
         logger.error("\nERROR: No samples were evaluated!")
@@ -143,8 +172,7 @@ def analyze_results(stage2_data, stage3_data):
 
 def create_plots(stage2_data, stage3_data, output_dir):
     """Create comparison visualisations."""
-    s2_scores = [r["score"] for r in stage2_data["results"]]
-    s3_scores = [r["score"] for r in stage3_data["results"]]
+    s2_scores, s3_scores = paired_scores(stage2_data, stage3_data)
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
@@ -201,7 +229,7 @@ def create_plots(stage2_data, stage3_data, output_dir):
     ax.grid(True, alpha=0.3, axis="y")
 
     # Add annotations
-    for i, (s2, s3) in enumerate(zip(s2_values, s3_values)):
+    for i, (s2, s3) in enumerate(zip(s2_values, s3_values, strict=True)):
         ax.text(i - width / 2, s2 + 2, f"{s2:.0f}", ha="center", va="bottom", fontsize=10)
         ax.text(i + width / 2, s3 + 2, f"{s3:.0f}", ha="center", va="bottom", fontsize=10)
 
@@ -217,8 +245,8 @@ def create_plots(stage2_data, stage3_data, output_dir):
     ax.grid(True, alpha=0.3)
 
     # Count winners
-    s2_wins = sum(1 for s2, s3 in zip(s2_scores, s3_scores) if s2 > s3)
-    s3_wins = sum(1 for s2, s3 in zip(s2_scores, s3_scores) if s3 > s2)
+    s2_wins = sum(1 for s2, s3 in zip(s2_scores, s3_scores, strict=True) if s2 > s3)
+    s3_wins = sum(1 for s2, s3 in zip(s2_scores, s3_scores, strict=True) if s3 > s2)
     ties = len(s2_scores) - s2_wins - s3_wins
     ax.text(
         0.05,

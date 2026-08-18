@@ -7,9 +7,18 @@ import logging
 import argparse
 import time
 from pathlib import Path
+import sys
 
 import torch
-from karpathy_utils import (
+from tqdm import tqdm
+
+# Running this file directly puts *its own* directory on sys.path, not the repo
+# root, so the first-party imports below would fail. Add the root explicitly.
+# This replaces sys.path edits that were spread across several modules and
+# depended on import order to take effect before they were needed.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from analysis_scripts.karpathy_evaluation.karpathy_utils import (  # noqa: E402
     format_time,
     load_and_preprocess_image,
     load_json,
@@ -17,8 +26,7 @@ from karpathy_utils import (
     log_banner,
     save_json,
 )
-from tqdm import tqdm
-from models.utils.common import get_device, setup_logging
+from models.utils.common import get_device, setup_logging  # noqa: E402
 
 logger = logging.getLogger(__name__)
 

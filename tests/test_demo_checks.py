@@ -225,3 +225,25 @@ class TestAnalysisChecks:
         """Equal losses mean routing made no difference — the experts are copies."""
         path = self._results(tmp_path, [1.0, 1.1], [1.0, 1.1])
         assert not checks.check_flipped_routing_is_worse(path).passed
+
+
+class TestPartialRunSkips:
+    """A partial run must not invent failures for stages it never executed.
+
+    `--stages 0 1` is a normal way to use the demo. The analysis checks were
+    added after this convention existed and initially failed the whole run
+    when the analysis stage had simply not been asked for.
+    """
+
+    def test_analysis_check_skips_when_the_stage_did_not_run(self, tmp_path):
+        result = checks.check_routing_ablation_ran(tmp_path / "absent.json", stage_ran=False)
+        assert result.skipped and result.passed
+
+    def test_analysis_check_fails_when_the_stage_ran_and_wrote_nothing(self, tmp_path):
+        result = checks.check_routing_ablation_ran(tmp_path / "absent.json", stage_ran=True)
+        assert not result.passed and not result.skipped
+
+    def test_partial_run_reports_no_failures(self, tmp_path):
+        """The end-to-end version of the above, through run_all()."""
+        results = checks.run_all(tmp_path, {}, stages=["0", "1"])
+        assert not [r for r in results if not r.passed]

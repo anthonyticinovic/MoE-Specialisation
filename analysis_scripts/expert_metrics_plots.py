@@ -107,7 +107,7 @@ def plot_expert_load_distribution(
         colors = plt.cm.viridis(np.linspace(0, 1, len(epochs)))
         handles = []
         labels = []
-        for epoch_idx, (epoch, color) in enumerate(zip(epochs, colors)):
+        for epoch_idx, (epoch, color) in enumerate(zip(epochs, colors, strict=True)):
             metrics = all_metrics[epoch]
             expert_0_loads = []
             expert_1_loads = []
@@ -179,7 +179,7 @@ def plot_routing_entropy(all_metrics, output_dir, selected_layers=None, selected
         epochs = selected_epochs
     fig, ax = plt.subplots(figsize=(12, 6))
     colors = plt.cm.viridis(np.linspace(0, 1, len(epochs)))
-    for epoch, color in zip(epochs, colors):
+    for epoch, color in zip(epochs, colors, strict=True):
         entropies_across_layers = []
 
         for layer_idx in selected_layers:
@@ -230,7 +230,7 @@ def plot_high_confidence_fraction(
         epochs = selected_epochs
     fig, ax = plt.subplots(figsize=(12, 6))
     colors = plt.cm.viridis(np.linspace(0, 1, len(epochs)))
-    for epoch, color in zip(epochs, colors):
+    for epoch, color in zip(epochs, colors, strict=True):
         high_conf_across_layers = []
 
         for layer_idx in selected_layers:
@@ -284,7 +284,7 @@ def plot_visual_vs_text_routing(
         epochs = selected_epochs
     fig, ax = plt.subplots(figsize=(12, 6))
     colors = plt.cm.viridis(np.linspace(0, 1, len(epochs)))
-    for epoch, color in zip(epochs, colors):
+    for epoch, color in zip(epochs, colors, strict=True):
         visual_expert1_across_layers = []
         text_expert1_across_layers = []
 
@@ -462,7 +462,7 @@ def plot_aggregate_summary(all_metrics, output_dir):
     ax1.set_ylabel("Load (%)", fontsize=12)
     ax1.set_title("Aggregate Expert Load Distribution", fontsize=13, fontweight="bold")
     ax1.set_ylim(0, 100)
-    for i, (expert, load) in enumerate(zip(experts, loads)):
+    for i, (expert, load) in enumerate(zip(experts, loads, strict=True)):
         ax1.text(
             i, load + 3, f"{load:.1f}%", ha="center", va="bottom", fontweight="bold", fontsize=11
         )
@@ -484,7 +484,7 @@ def plot_aggregate_summary(all_metrics, output_dir):
         ax2.set_ylabel("% Visual Tokens", fontsize=12)
         ax2.set_title("Visual Token Routing", fontsize=13, fontweight="bold")
         ax2.set_ylim(0, 100)
-        for i, (expert, load) in enumerate(zip(visual_experts, visual_loads)):
+        for i, (expert, load) in enumerate(zip(visual_experts, visual_loads, strict=True)):
             ax2.text(
                 i,
                 load + 3,
@@ -507,7 +507,7 @@ def plot_aggregate_summary(all_metrics, output_dir):
         ax3.set_ylabel("% Text Tokens", fontsize=12)
         ax3.set_title("Text Token Routing", fontsize=13, fontweight="bold")
         ax3.set_ylim(0, 100)
-        for i, (expert, load) in enumerate(zip(text_experts, text_loads)):
+        for i, (expert, load) in enumerate(zip(text_experts, text_loads, strict=True)):
             ax3.text(
                 i,
                 load + 3,

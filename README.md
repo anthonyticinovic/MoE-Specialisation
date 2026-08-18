@@ -386,18 +386,21 @@ green while the pipeline itself is broken.
 
 ruff and mypy are strict on the maintained core (`models/`, `data/`, `tests/`);
 the research scripts (`training_scripts/`, `analysis_scripts/`) are held to
-formatting plus the correctness rules (`F821`/`F811`/`F822`) that catch
-undefined names — a missing import once left two training scripts unrunnable on
-`main` for months, and the narrower lint scope was why nothing noticed.
+formatting plus the correctness rules that catch undefined names
+(`F821`/`F811`/`F822`) and unstrict `zip()` (`B905`). A missing import once left
+two training scripts unrunnable on `main` for months, and the narrower lint
+scope was why nothing noticed; `zip()` is on the same list because it truncates
+to the shorter sequence in silence, which in plotting code means a chart quietly
+missing its last layers rather than an error.
 
 The suite covers four levels, deliberately:
 
 | Level | Where | What it protects |
 |---|---|---|
 | Numerics | `tests/test_training_dry_run.py` | A tiny synthetic model must produce bit-identical loss and grad-norm against a recorded baseline. If those move, a refactor changed training numerics. |
-| Behaviour | `tests/test_training_steps.py` | Each stage runs a real epoch and must change **exactly** the parameters it claims to train, with gradients reaching all of them, and must resume from its own checkpoint. |
+| Behaviour | `tests/test_training_steps.py`, `tests/test_analysis_model_loading.py` | Each stage runs a real epoch and must change **exactly** the parameters it claims to train, with gradients reaching all of them, and must resume from its own checkpoint. The analysis loaders are then driven against the checkpoints those stages produced. |
 | Structure | `tests/test_training_scripts_structure.py`, `tests/test_analysis_lib.py` | Every script stays inert on import, reuses `_lib` rather than re-implementing FSDP, and never loads weights with a bare `strict=False`. No analysis script may hardcode the config path or default to CUDA — both would put it back out of the demo's reach. Also checks the SLURM scripts point at files that exist. |
-| End-to-end | `make demo` | 14 executable invariants over a full CPU pipeline run, including the routing ablation. |
+| End-to-end | `make demo` | 14 executable invariants over a full CPU pipeline run, including the routing ablation. A partial run (`--stages 0 1`) skips the checks whose stages did not run rather than failing them. |
 
 ## Citation
 

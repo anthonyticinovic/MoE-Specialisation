@@ -43,7 +43,6 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
-import torch
 
 from analysis_scripts._lib import compute_cosine_similarity_matrix, load_analysis_config
 

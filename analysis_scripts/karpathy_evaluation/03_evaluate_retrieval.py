@@ -7,10 +7,18 @@ Computes R@1, R@5, R@10 for both directions.
 import logging
 import argparse
 from pathlib import Path
+import sys
 
 import numpy as np
-from karpathy_utils import log_banner, save_json
-from models.utils.common import setup_logging
+
+# Running this file directly puts *its own* directory on sys.path, not the repo
+# root, so the first-party imports below would fail. Add the root explicitly.
+# This replaces sys.path edits that were spread across several modules and
+# depended on import order to take effect before they were needed.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from analysis_scripts.karpathy_evaluation.karpathy_utils import log_banner, save_json  # noqa: E402
+from models.utils.common import setup_logging  # noqa: E402
 
 logger = logging.getLogger(__name__)
 

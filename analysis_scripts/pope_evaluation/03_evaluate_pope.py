@@ -10,11 +10,14 @@ import json
 import sys
 from pathlib import Path
 
-# pope_utils lives alongside this script
-sys.path.insert(0, str(Path(__file__).parent))
+# Running this file directly puts *its own* directory on sys.path, not the repo
+# root, so the first-party imports below would fail. Add the root explicitly.
+# This replaces sys.path edits that were spread across several modules and
+# depended on import order to take effect before they were needed.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from pope_utils import compute_metrics  # noqa: E402
-from models.utils.common import setup_logging
+from analysis_scripts.pope_evaluation.pope_utils import compute_metrics  # noqa: E402
+from models.utils.common import setup_logging  # noqa: E402
 
 logger = logging.getLogger(__name__)
 

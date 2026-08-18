@@ -205,18 +205,24 @@ def _checks_section(results: list[checks.CheckResult]) -> list[str]:
 
 
 def write_report(
-    output_root: Path, results: list[tuple[str, bool, float]]
+    output_root: Path,
+    results: list[tuple[str, bool, float]],
+    stages: list[str] | None = None,
 ) -> tuple[Path, list[checks.CheckResult]]:
     """Write figures plus demo_report.md.
 
     Returns the report path and the invariant results, so the caller can fail
     the run when an invariant breaks even though every stage exited zero.
+
+    ``stages`` is the list the run actually executed. A check whose stage was
+    not run must skip rather than fail — a partial run (``--stages 0 1``) is a
+    normal thing to do and must not report invented failures.
     """
     runs_dir = output_root / "runs"
     figures_dir = output_root / "figures"
     figures_dir.mkdir(parents=True, exist_ok=True)
 
-    check_results = checks.run_all(output_root, STAGE_METRIC_FILES)
+    check_results = checks.run_all(output_root, STAGE_METRIC_FILES, stages)
 
     lines = [
         "# CPU demo report",

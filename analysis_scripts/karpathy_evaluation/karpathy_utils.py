@@ -9,18 +9,12 @@ unchanged. Only Karpathy-specific code lives in this file.
 """
 
 import logging
-import sys
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 
-# Add project root to path so `analysis_scripts._lib` is importable when these
-# scripts are run directly from the karpathy_evaluation/ directory.
-project_root = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(project_root))
-
-from analysis_scripts._lib import (  # noqa: E402
+from analysis_scripts._lib import (
     format_time,
     get_paths,
     load_and_preprocess_image,
@@ -29,7 +23,7 @@ from analysis_scripts._lib import (  # noqa: E402
     log_banner,
     save_json,
 )
-from models.utils.common import get_device, setup_logging
+from models.utils.common import get_device
 
 logger = logging.getLogger(__name__)
 
@@ -219,9 +213,3 @@ def extract_layer_activations(
         raise RuntimeError(f"Failed to extract activations from layer {layer_idx}")
 
     return activations["output"]
-
-
-if __name__ == "__main__":
-    setup_logging()
-    logger.info("Testing karpathy_utils.py...")
-    logger.info("Utilities module loaded successfully")

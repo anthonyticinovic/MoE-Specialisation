@@ -1,6 +1,7 @@
 """Unit tests for the shared analysis_scripts._lib helpers."""
 
 import ast
+import importlib
 import json
 from pathlib import Path
 
@@ -177,4 +178,49 @@ class TestConfigAndDeviceSeam:
         assert not offenders, (
             f"{path.name}: {offenders} default to CUDA. Default to None and "
             "resolve with models.utils.common.get_device()."
+        )
+
+
+class TestAnalysisModulesAreImportable:
+    """Every analysis module must import as part of the package.
+
+    Five karpathy scripts used ``from karpathy_utils import ...``, which
+    resolves only because Python puts a script's *own* directory on
+    ``sys.path`` when you run it as a script. They ran, but no test could
+    reach ``main()`` — and the repo-root ``sys.path`` edit lived in
+    ``karpathy_utils`` itself, so whether a sibling's ``from models...``
+    import worked depended on which import ran first.
+    """
+
+    @pytest.mark.parametrize("path", ANALYSIS_MODULES, ids=lambda p: p.name)
+    def test_module_imports(self, path):
+        dotted = path.relative_to(ANALYSIS_DIR.parent).with_suffix("").as_posix().replace("/", ".")
+        assert importlib.import_module(dotted) is not None
+
+    @pytest.mark.parametrize("path", ANALYSIS_MODULES, ids=lambda p: p.name)
+    def test_no_flat_sibling_imports(self, path):
+        """``from karpathy_utils import`` only works by accident of cwd."""
+        siblings = {p.stem for p in ANALYSIS_DIR.rglob("*.py") if p.name != "__init__.py"}
+        flat = [
+            node.module
+            for node in ast.walk(ast.parse(path.read_text()))
+            if isinstance(node, ast.ImportFrom)
+            and node.level == 0
+            and (node.module or "").split(".")[0] in siblings
+        ]
+        assert not flat, (
+            f"{path.name} imports {flat} by bare module name. Use the full "
+            "package path so the module is importable from anywhere."
+        )
+
+    @pytest.mark.parametrize("path", ANALYSIS_MODULES, ids=lambda p: p.name)
+    def test_entry_points_expose_main(self, path):
+        """A script whose work is trapped in ``if __name__ == "__main__"`` can
+        only be tested by launching a subprocess and reading files off disk."""
+        source = path.read_text()
+        if "__main__" not in source or "ArgumentParser" not in source:
+            return
+        tree = ast.parse(source)
+        assert any(isinstance(n, ast.FunctionDef) and n.name == "main" for n in tree.body), (
+            f"{path.name} builds its parser but has no main() to call"
         )

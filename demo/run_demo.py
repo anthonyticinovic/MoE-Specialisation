@@ -171,7 +171,7 @@ def main() -> int:
             logger.error("\nPipeline stopped at %s.", label)
             break
 
-    report_path, check_results = report.write_report(output_root, results)
+    report_path, check_results = report.write_report(output_root, results, args.stages)
     total = sum(elapsed for _, _, elapsed in results)
 
     stages_ok = all(ok for _, ok, _ in results) and len(results) == len(args.stages)

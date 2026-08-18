@@ -31,9 +31,12 @@ jobs:
       # formatting-only (same scoping rationale as mypy below).
       # Correctness rules run everywhere, including the research scripts: a
       # refactor once removed an import that was still used, and scoping ruff
-      # to the core meant CI never saw the resulting NameError.
-      - name: Ruff undefined names (whole repo)
-        run: uv run ruff check --select F821,F811,F822 .
+      # to the core meant CI never saw the resulting NameError. B905 is here
+      # for the same reason — an unstrict zip() truncates to the shorter
+      # sequence in silence, which in plotting and metrics code means a chart
+      # quietly missing its last layers rather than an error.
+      - name: Ruff correctness rules (whole repo)
+        run: uv run ruff check --select F821,F811,F822,B905 .
       - name: Ruff check (core)
         run: uv run ruff check models/ data/ tests/
       - name: Ruff format (whole repo)

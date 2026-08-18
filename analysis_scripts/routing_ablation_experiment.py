@@ -9,6 +9,7 @@ Expected: Normal routing (vision=Expert 0, text=Expert 1) should have lower loss
 than flipped routing (vision=Expert 1, text=Expert 0).
 """
 
+import argparse
 import logging
 import json
 from pathlib import Path
@@ -356,10 +357,13 @@ def create_visualization(normal_losses, flipped_losses, output_dir):
     logger.info(f"Visualisation saved to: {output_dir / 'routing_ablation_comparison.png'}")
 
 
-if __name__ == "__main__":
-    setup_logging()
-    import argparse
+def main(argv: list[str] | None = None) -> dict:
+    """Parse arguments and run the ablation. Returns the results dict.
 
+    Split out of the ``__main__`` block so a test can call it: the training
+    scripts were given a ``main()`` for the same reason, and this is the one
+    analysis script the CPU demo executes.
+    """
     parser = argparse.ArgumentParser(description="Expert routing ablation study")
     parser.add_argument(
         "--checkpoint",
@@ -398,9 +402,9 @@ if __name__ == "__main__":
         "--output-dir", type=str, default=None, help="Default: results/routing_ablation"
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    results = run_routing_ablation(
+    return run_routing_ablation(
         checkpoint_path=args.checkpoint,
         data_path=args.data,
         num_samples=args.num_samples,
@@ -410,3 +414,8 @@ if __name__ == "__main__":
         annotations_file=args.annotations,
         output_dir=args.output_dir,
     )
+
+
+if __name__ == "__main__":
+    setup_logging()
+    main()

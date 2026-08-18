@@ -387,7 +387,7 @@ def check_losses_finite(runs_dir: Path, metric_files: dict[str, str]) -> CheckRe
 # ----------------------------------------------------------------------------
 
 
-def check_routing_ablation_ran(results_path: Path) -> CheckResult:
+def check_routing_ablation_ran(results_path: Path, stage_ran: bool = True) -> CheckResult:
     """The analysis script must produce a complete, finite result file.
 
     This is the only invariant that covers the analysis half of the repo. It
@@ -395,9 +395,15 @@ def check_routing_ablation_ran(results_path: Path) -> CheckResult:
     non-default config used to raise on the ``YOUR_PATH_HERE`` placeholder,
     because the loader took an explicit default path and never consulted
     ``MOE_CONFIG``.
+
+    ``stage_ran`` distinguishes the two reasons the file can be absent. A
+    partial run (``--stages 0 1``) skips; a run that executed the analysis
+    stage and still produced nothing fails.
     """
     name = "analysis: routing ablation produced results"
     if not results_path.exists():
+        if not stage_ran:
+            return _skip(name, "Analysis stage not run")
         return _fail(name, f"{results_path} was not written")
 
     results = json.loads(results_path.read_text())
@@ -447,8 +453,16 @@ def check_flipped_routing_is_worse(results_path: Path) -> CheckResult:
 # ----------------------------------------------------------------------------
 
 
-def run_all(output_root: Path, metric_files: dict[str, str]) -> list[CheckResult]:
-    """Run every invariant against a completed demo run."""
+def run_all(
+    output_root: Path, metric_files: dict[str, str], stages: list[str] | None = None
+) -> list[CheckResult]:
+    """Run every invariant against a completed demo run.
+
+    ``stages`` is the list the run executed; ``None`` means "assume all of
+    them". A check whose stage never ran skips, so a partial run does not
+    report failures it could not possibly have avoided.
+    """
+    ran_analysis = stages is None or "analysis" in stages
     fixtures = output_root / "fixtures"
     runs = output_root / "runs"
     moe_dir = fixtures / "moe_model"
@@ -477,6 +491,6 @@ def run_all(output_root: Path, metric_files: dict[str, str]) -> list[CheckResult
         check_all_layers_reported(metrics, expected_layers),
         check_checkpoints_finite(runs),
         check_losses_finite(runs, metric_files),
-        check_routing_ablation_ran(ablation),
+        check_routing_ablation_ran(ablation, ran_analysis),
         check_flipped_routing_is_worse(ablation),
     ]

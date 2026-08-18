@@ -9,8 +9,14 @@ import argparse
 import sys
 from pathlib import Path
 
-from karpathy_utils import log_banner, save_json
-from models.utils.common import setup_logging
+# Running this file directly puts *its own* directory on sys.path, not the repo
+# root, so the first-party imports below would fail. Add the root explicitly.
+# This replaces sys.path edits that were spread across several modules and
+# depended on import order to take effect before they were needed.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from analysis_scripts.karpathy_evaluation.karpathy_utils import log_banner, save_json  # noqa: E402
+from models.utils.common import setup_logging  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +99,7 @@ def evaluate_captions(references_json: str, generated_json: str) -> dict:
         ]:
             score, scores = scorer.compute_score(gts, res)
             if isinstance(method, list):
-                for sc, m in zip(score, method):
+                for sc, m in zip(score, method, strict=True):
                     coco_eval.eval[m] = sc
             else:
                 coco_eval.eval[method] = score
