@@ -27,6 +27,29 @@ logger = logging.getLogger(__name__)
 EXPERT_KEY = ".mlp.experts."
 GATE_KEY = ".mlp.gate."
 
+# Everything ``plot_expert_metrics.py`` must produce. Module-level so the test
+# that proves the check can fail builds its fixture from the same list rather
+# than a second copy of it — two copies would agree with each other after a
+# rename and stop agreeing with the plotting code.
+EXPECTED_FIGURES = frozenset(
+    {
+        "expert_load_distribution.png",
+        "routing_entropy.png",
+        "high_confidence_fraction.png",
+        "visual_vs_text_routing.png",
+        "specialization_evolution.png",
+        "aggregate_summary.png",
+        "specialization_divergence.png",
+        "routing_confidence_evolution.png",
+        "loss_and_specialization.png",
+        "expert_metrics_report.txt",
+    }
+)
+
+# A matplotlib figure that raised part-way still leaves a small file behind, so
+# "the file exists" is not enough; anything under this is a stub, not a plot.
+MIN_FIGURE_BYTES = 1024
+
 
 @dataclass
 class CheckResult:
@@ -457,33 +480,20 @@ def check_expert_metric_figures(figures_dir: Path, stage_ran: bool = True) -> Ch
     metric key was renamed out from under it.
     """
     name = "analysis: expert metric figures produced"
-    expected = {
-        "expert_load_distribution.png",
-        "routing_entropy.png",
-        "high_confidence_fraction.png",
-        "visual_vs_text_routing.png",
-        "specialization_evolution.png",
-        "aggregate_summary.png",
-        "specialization_divergence.png",
-        "routing_confidence_evolution.png",
-        "loss_and_specialization.png",
-        "expert_metrics_report.txt",
-    }
     if not figures_dir.exists():
         if not stage_ran:
             return _skip(name, "Figures stage not run")
         return _fail(name, f"{figures_dir} was not written")
 
     produced = {path.name for path in figures_dir.iterdir()}
-    missing = sorted(expected - produced)
+    missing = sorted(EXPECTED_FIGURES - produced)
     if missing:
         return _fail(name, f"{len(missing)} missing: {missing}")
 
-    # A matplotlib figure that raised part-way can still leave a stub behind.
-    empty = sorted(p.name for p in figures_dir.iterdir() if p.stat().st_size < 1024)
+    empty = sorted(p.name for p in figures_dir.iterdir() if p.stat().st_size < MIN_FIGURE_BYTES)
     if empty:
         return _fail(name, f"suspiciously small output: {empty}")
-    return _ok(name, f"{len(expected)} figures and the report, all non-trivial")
+    return _ok(name, f"{len(EXPECTED_FIGURES)} figures and the report, all non-trivial")
 
 
 def check_report_matches_the_metrics(figures_dir: Path, metrics: dict | None) -> CheckResult:

@@ -1,10 +1,10 @@
 {
   "concepts": [
-    "person",          
-    "dog",           
-    "cat",               
-    "horse",          
-    "elephant",          
+    "person",
+    "dog",
+    "cat",
+    "horse",
+    "elephant",
     "bear"
   ],
   "samples_per_concept": 50,

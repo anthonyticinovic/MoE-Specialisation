@@ -3,10 +3,17 @@
 A check that can never fail is worse than no check: it looks like coverage and
 provides none. Each test here corrupts exactly the property one invariant is
 supposed to protect, and asserts that the invariant notices.
+
+The two module-level tests at the bottom keep that true. The claim "each
+invariant has a test that proves it can fail" was made in `docs/design.md` while
+four of the sixteen had no such test — the count had drifted twice and nothing
+was watching. It is enforced now rather than asserted.
 """
 
+import inspect
 import json
 import math
+from pathlib import Path
 
 import pytest
 import torch
@@ -113,6 +120,191 @@ class TestStage2Checks:
         result = checks.check_only_experts_trained(moe_dir, ckpt)
         assert not result.passed
         assert "frozen tensors changed" in result.detail
+
+
+class TestStage25Checks:
+    """Stage 2.5 trains the gate and nothing else — both halves must be checked.
+
+    The invariant has two failure modes and they mean opposite things: a moved
+    expert is a freezing bug, an unmoved gate is a training bug. A check that
+    only noticed one would pass on a Stage 2.5 that did nothing at all.
+    """
+
+    def _checkpoint(self, path, state):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"model_state_dict": {k: v.clone() for k, v in state.items()}}, path)
+        return path
+
+    @pytest.fixture
+    def stage2(self, moe_dir, tmp_path):
+        """A Stage 2 checkpoint, and the state to derive Stage 2.5 ones from."""
+        from safetensors.torch import load_file
+
+        state = load_file(str(moe_dir / "model.safetensors"))
+        return state, self._checkpoint(tmp_path / "stage2.pth", state)
+
+    def test_passes_when_only_the_gates_moved(self, stage2, tmp_path):
+        state, before = stage2
+        after = {k: v.clone() for k, v in state.items()}
+        key = next(k for k in after if checks.GATE_KEY in k)
+        after[key] = after[key] + 0.1
+
+        result = checks.check_only_gates_trained(
+            before, self._checkpoint(tmp_path / "b.pth", after)
+        )
+        assert result.passed and not result.skipped
+
+    def test_fails_when_an_expert_moved(self, stage2, tmp_path):
+        """The freezing bug: Stage 2.5 must not update the experts."""
+        state, before = stage2
+        after = {k: v.clone() for k, v in state.items()}
+        after[next(k for k in after if checks.GATE_KEY in k)] += 0.1
+        after[next(k for k in after if checks.EXPERT_KEY in k)] += 0.1
+
+        result = checks.check_only_gates_trained(
+            before, self._checkpoint(tmp_path / "b.pth", after)
+        )
+        assert not result.passed
+        assert "expert tensors changed" in result.detail
+
+    def test_fails_when_no_gate_moved(self, stage2, tmp_path):
+        """The silent no-op: the router never trained and nothing said so."""
+        state, before = stage2
+        result = checks.check_only_gates_trained(
+            before, self._checkpoint(tmp_path / "b.pth", state)
+        )
+        assert not result.passed
+        assert "router did not train" in result.detail
+
+
+class TestReportedEntropyBounds:
+    """The per-stage metrics history has its own entropy, and its own ceiling.
+
+    Separate from ``check_routing_entropy_bounds``: that one reads the
+    ExpertUsageTracker dump, this one reads what Stage 2.5 recorded per epoch.
+    Both can be wrong independently.
+    """
+
+    def _history(self, tmp_path, entropy):
+        runs = tmp_path / "runs"
+        runs.mkdir(exist_ok=True)
+        (runs / "training_metrics_stage2.5.json").write_text(json.dumps({"entropy": entropy}))
+        return runs
+
+    def _check(self, runs):
+        return checks.check_reported_entropy_bounds(
+            runs, "training_metrics_stage2.5.json", "stage2.5"
+        )
+
+    def test_passes_within_ln2(self, tmp_path):
+        assert self._check(self._history(tmp_path, [0.69, 0.65, 0.4])).passed
+
+    def test_fails_above_ln2(self, tmp_path):
+        """A per-layer entropy summed instead of averaged scales with depth."""
+        runs = self._history(tmp_path, [0.65, 2 * math.log(2)])
+        result = self._check(runs)
+        assert not result.passed
+        assert "summed rather than averaged" in result.detail
+
+    def test_negative_entropy_is_caught(self, tmp_path):
+        assert not self._check(self._history(tmp_path, [-0.1])).passed
+
+    def test_skips_when_the_stage_never_ran(self, tmp_path):
+        runs = tmp_path / "runs"
+        runs.mkdir()
+        result = self._check(runs)
+        assert result.skipped and result.passed
+
+    def test_skips_when_no_entropy_was_recorded(self, tmp_path):
+        result = self._check(self._history(tmp_path, []))
+        assert result.skipped and result.passed
+
+
+class TestExpertMetricFigures:
+    """The figure pipeline must produce every output, and none of them a stub."""
+
+    def _figures(self, tmp_path, *, omit=None, stub=None):
+        directory = tmp_path / "expert_metrics"
+        directory.mkdir()
+        for name in checks.EXPECTED_FIGURES - {omit}:
+            size = 10 if name == stub else checks.MIN_FIGURE_BYTES * 2
+            (directory / name).write_bytes(b"x" * size)
+        return directory
+
+    def test_passes_when_every_output_is_present_and_substantial(self, tmp_path):
+        assert checks.check_expert_metric_figures(self._figures(tmp_path)).passed
+
+    def test_fails_when_a_figure_is_missing(self, tmp_path):
+        """A plotting routine raised, or a metric key was renamed under it."""
+        result = checks.check_expert_metric_figures(
+            self._figures(tmp_path, omit="routing_entropy.png")
+        )
+        assert not result.passed
+        assert "routing_entropy.png" in result.detail
+
+    def test_fails_on_a_stub_left_by_a_figure_that_raised(self, tmp_path):
+        """The failure mode 'the file exists' would miss: a truncated PNG."""
+        result = checks.check_expert_metric_figures(
+            self._figures(tmp_path, stub="aggregate_summary.png")
+        )
+        assert not result.passed
+        assert "suspiciously small" in result.detail
+
+    def test_skips_when_the_figures_stage_did_not_run(self, tmp_path):
+        result = checks.check_expert_metric_figures(tmp_path / "absent", stage_ran=False)
+        assert result.skipped and result.passed
+
+    def test_fails_when_the_stage_ran_and_wrote_nothing(self, tmp_path):
+        result = checks.check_expert_metric_figures(tmp_path / "absent", stage_ran=True)
+        assert not result.passed and not result.skipped
+
+
+class TestReportMatchesTheMetrics:
+    """The figures are images; the report is the only output that can be read back.
+
+    So it stands in for all of them. If the plotting code starts reading the
+    wrong key, every figure is wrong and only this notices.
+    """
+
+    AGGREGATE = {
+        "expert_load_distribution": {"expert_0": 43.44, "expert_1": 56.56},
+        "avg_routing_entropy": 0.6603,
+    }
+
+    def _report(self, tmp_path, text):
+        directory = tmp_path / "expert_metrics"
+        directory.mkdir(exist_ok=True)
+        (directory / "expert_metrics_report.txt").write_text(text)
+        return directory
+
+    def _metrics(self):
+        return {"per_layer": [], "aggregate": self.AGGREGATE}
+
+    def test_passes_when_the_report_quotes_the_json(self, tmp_path):
+        directory = self._report(tmp_path, "expert_0: 43.44%\nexpert_1: 56.56%\nentropy: 0.6603\n")
+        assert checks.check_report_matches_the_metrics(directory, self._metrics()).passed
+
+    def test_fails_when_a_load_does_not_match(self, tmp_path):
+        """The wrong-key regression: plausible numbers, from the wrong place."""
+        directory = self._report(tmp_path, "expert_0: 34.44%\nexpert_1: 56.56%\nentropy: 0.6603\n")
+        result = checks.check_report_matches_the_metrics(directory, self._metrics())
+        assert not result.passed
+        assert "expert_0 load" in result.detail
+
+    def test_fails_when_the_entropy_does_not_match(self, tmp_path):
+        directory = self._report(tmp_path, "expert_0: 43.44%\nexpert_1: 56.56%\nentropy: 0.1234\n")
+        result = checks.check_report_matches_the_metrics(directory, self._metrics())
+        assert not result.passed
+        assert "routing entropy" in result.detail
+
+    def test_skips_without_a_report(self, tmp_path):
+        result = checks.check_report_matches_the_metrics(tmp_path, self._metrics())
+        assert result.skipped and result.passed
+
+    def test_skips_without_metrics(self, tmp_path):
+        directory = self._report(tmp_path, "anything")
+        result = checks.check_report_matches_the_metrics(directory, None)
+        assert result.skipped and result.passed
 
 
 class TestMetricChecks:
@@ -247,3 +439,32 @@ class TestPartialRunSkips:
         """The end-to-end version of the above, through run_all()."""
         results = checks.run_all(tmp_path, {}, stages=["0", "1"])
         assert not [r for r in results if not r.passed]
+
+
+def _invariants() -> set[str]:
+    return {
+        name
+        for name, obj in inspect.getmembers(checks, inspect.isfunction)
+        if name.startswith("check_") and obj.__module__ == checks.__name__
+    }
+
+
+def test_every_invariant_is_wired_into_run_all():
+    """A check nobody calls protects nothing, however good it looks."""
+    called = inspect.getsource(checks.run_all)
+    orphans = sorted(name for name in _invariants() if f"{name}(" not in called)
+    assert not orphans, f"defined but never run by run_all(): {orphans}"
+
+
+def test_every_invariant_is_covered_by_a_test_here():
+    """The ratchet on this file. See the module docstring for why it exists.
+
+    Naming the check is the minimum bar, not proof the test is a good one — but
+    it is the bar that was silently missed, and it is the one a reviewer counts.
+    """
+    source = Path(__file__).read_text()
+    uncovered = sorted(name for name in _invariants() if f"checks.{name}(" not in source)
+    assert not uncovered, (
+        f"{len(uncovered)} invariant(s) with no test proving they can fail: {uncovered}. "
+        "Corrupt the property each one protects and assert it notices."
+    )

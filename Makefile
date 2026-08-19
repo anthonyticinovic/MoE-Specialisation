@@ -8,7 +8,7 @@ FIGURES ?= results/figures
 LAYERS ?= all_layers
 
 help:
-	@echo "make lint        Ruff lint (correctness everywhere, style on the core) + mypy"
+	@echo "make lint        Ruff lint + format check (whole repo) + mypy"
 	@echo "make format      Apply ruff formatting"
 	@echo "make test        CPU-only pytest suite"
 	@echo "make demo        Run the whole pipeline on CPU against synthetic fixtures"
@@ -17,8 +17,7 @@ help:
 	@echo "make clean-demo  Remove demo_output/"
 
 lint:
-	$(PY) ruff check --select F821,F811,F822,B905,E722 .
-	$(PY) ruff check models/ data/ tests/
+	$(PY) ruff check .
 	$(PY) ruff format --check .
 	$(PY) mypy
 

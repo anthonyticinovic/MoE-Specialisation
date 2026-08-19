@@ -27,20 +27,17 @@ jobs:
         # to exclude here.
         run: uv sync --group dev
       # Fail-fast: any step below failing fails the run.
-      # Strict lint on the maintained core; research scripts are held to
-      # formatting-only (same scoping rationale as mypy below).
-      # Correctness rules run everywhere, including the research scripts: a
-      # refactor once removed an import that was still used, and scoping ruff
-      # to the core meant CI never saw the resulting NameError. B905 is here
-      # for the same reason — an unstrict zip() truncates to the shorter
-      # sequence in silence, which in plotting and metrics code means a chart
-      # quietly missing its last layers rather than an error. E722 likewise: a
-      # bare `except:` swallows KeyboardInterrupt and MemoryError alongside the
-      # error it meant to handle.
-      - name: Ruff correctness rules (whole repo)
-        run: uv run ruff check --select F821,F811,F822,B905,E722 .
-      - name: Ruff check (core)
-        run: uv run ruff check models/ data/ tests/
+      # The full rule set runs on the whole repo, research scripts included.
+      # This used to be scoped to models/, data/ and tests/, with only five
+      # correctness rules applied elsewhere — and that scope is what let a
+      # refactor remove an import that was still used, leaving two training
+      # scripts unrunnable on main for months. The research scripts now pass
+      # the same rules the core does, so there is nothing left for the
+      # narrower scope to protect and everything for it to hide. Note that
+      # `ruff format` cannot substitute: it will not split a long comment or
+      # string literal, which is exactly what E501 catches.
+      - name: Ruff check (whole repo)
+        run: uv run ruff check .
       - name: Ruff format (whole repo)
         run: uv run ruff format --check .
       - name: Mypy (models/, data/)

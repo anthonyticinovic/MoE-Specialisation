@@ -1,13 +1,13 @@
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.6.9
+    # Pinned to the version uv.lock resolves, so the hook, `make lint` and CI
+    # all run the same binary. It was pinned at v0.6.9 against a resolved
+    # 0.15.x, and the two disagreed: the hook failed on a UP038 that the
+    # project's own ruff no longer reports. Bump this and the lock together.
+    rev: v0.15.13
     hooks:
       - id: ruff
-        name: ruff correctness rules (whole repo)
-        args: [--select, "F821,F811,F822,B905,E722"]
-      - id: ruff
-        name: ruff (core only)
-        files: ^(models|data|tests)/
+        name: ruff (whole repo)
         args: [--fix]
       - id: ruff-format
         name: ruff-format (whole repo)

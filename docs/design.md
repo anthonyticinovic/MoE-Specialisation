@@ -236,8 +236,9 @@ reimplemented. What differs is scale and device — CPU fallbacks for FSDP, 8-bi
 loading and FlashAttention, all keyed off a single `on_gpu` flag on
 `RunContext`.
 
-On top of that sit **14 executable invariants** (`demo/checks.py`), each tied to
-a design decision above, each with a test that proves it can fail:
+On top of that sit **16 executable invariants** (`demo/checks.py`), each tied to
+a design decision above, and each with a test in `tests/test_demo_checks.py`
+that corrupts the property and proves the invariant notices:
 
 - the two experts start bit-identical (§1: they are copies of the base FFN) and
   have diverged after Stage 2 (§2);
