@@ -199,7 +199,10 @@ def plot_aggregate_summary(all_metrics, output_dir):
         ax3.grid(True, alpha=0.3, axis="y")
 
     fig.suptitle("Aggregate Expert Metrics Summary (Stage 3)", fontsize=16, fontweight="bold")
-    plt.tight_layout(rect=[0, 0, 1, 0.96])  # Leave space for suptitle
+    # These axes come from add_gridspec, which tight_layout cannot reflow — it
+    # warned on every call that the result "might be incorrect". The gridspec
+    # already carries the spacing, so leave the room for the suptitle directly.
+    fig.subplots_adjust(top=0.86)
     plt.savefig(os.path.join(output_dir, "aggregate_summary.png"))
     plt.close()
     logger.info("  Saved: aggregate_summary.png")

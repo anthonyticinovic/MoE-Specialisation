@@ -48,8 +48,9 @@ STAGES: dict[str, tuple[str, list[str]]] = {
         [sys.executable, "training_scripts/train_dense.py"],
     ),
     "analysis": ("Analysis — routing ablation", []),  # filled in at runtime (needs paths)
+    "figures": ("Analysis — expert metric figures", []),  # filled in at runtime
 }
-DEFAULT_STAGES = ["0", "1", "2", "2.5", "3", "dense", "analysis"]
+DEFAULT_STAGES = ["0", "1", "2", "2.5", "3", "dense", "analysis", "figures"]
 
 
 def _reset_run_artifacts(output_root: Path) -> None:
@@ -149,6 +150,25 @@ def main() -> int:
             str(args.num_images),
             "--output-dir",
             str(output_root / "analysis" / "routing_ablation"),
+        ],
+    )
+
+    # The second analysis step. Stage 3 writes its routing metrics during the
+    # run, so this needs no model and no data of its own — it turns the demo's
+    # own JSON into the figures the paper's routing analysis is built from.
+    STAGES["figures"] = (
+        "Analysis — expert metric figures",
+        [
+            sys.executable,
+            "analysis_scripts/plot_expert_metrics.py",
+            "--metrics_dir",
+            str(output_root / "runs" / "expert_metrics"),
+            "--output_dir",
+            str(output_root / "analysis" / "expert_metrics"),
+            "--layers",
+            "all_layers",
+            "--training_metrics",
+            str(output_root / "runs" / "training_metrics_stage3.json"),
         ],
     )
 

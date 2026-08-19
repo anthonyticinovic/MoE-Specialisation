@@ -43,7 +43,14 @@ def extract_epoch_number(filename):
     return None
 
 
-def main():
+def main(argv: list[str] | None = None) -> int:
+    """Parse arguments, plot, and return an exit code.
+
+    Takes ``argv`` so a test can call it instead of launching a subprocess, and
+    returns a code rather than ``None`` so a refusal to plot is visible to
+    whatever invoked it — the out-of-range guard below used to return quietly
+    and let the script exit 0 having produced nothing.
+    """
     parser = argparse.ArgumentParser(
         description="Plot expert utilisation metrics from Stage 3 training"
     )
@@ -80,7 +87,7 @@ def main():
             "Defaults to the parent of --metrics_dir, which is where a training run puts it."
         ),
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
@@ -149,7 +156,7 @@ def main():
                 num_layers,
                 num_layers - 1,
             )
-            return
+            return 1
 
     logger.info(f"\n{'=' * 80}")
     logger.info("GENERATING PLOTS")
@@ -212,8 +219,9 @@ def main():
     logger.info("\n  Text report:")
     logger.info("    • expert_metrics_report.txt")
     logger.info("")
+    return 0
 
 
 if __name__ == "__main__":
     setup_logging()
-    main()
+    raise SystemExit(main())

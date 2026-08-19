@@ -122,12 +122,13 @@ inconsistent FSDP `device_id` across stages — are fixed and have been removed;
 a third, about three files exceeding the 800-line guideline, is obsolete since
 those files were split and a test now enforces the limit.
 
-- **One analysis entry point of twenty is executed by anything.** Every module
+- **Two analysis entry points of twenty are executed by anything.** Every module
   here imports, and `_lib/model_loading.py` has behavioural tests, but only
-  `routing_ablation_experiment.py` is actually run — by the CPU demo, on every
-  push. The other nineteen are checked for shape (no `print`, no hardcoded
-  config path, no CUDA default, no bare `strict=False`) and not for behaviour.
-  Treat their outputs as un-regression-tested.
+  `routing_ablation_experiment.py` and `plot_expert_metrics.py` are actually run
+  — by the CPU demo, on every push. The other eighteen are checked for shape (no
+  `print`, no hardcoded config path, no CUDA default, no bare `strict=False`, no
+  failure reported at INFO) and not for behaviour. Treat their outputs as
+  un-regression-tested.
 - **Duplication across the analysers.** `extract_concept_samples` is
   implemented three times (in `cross_concept_similarity_matrix.py`,
   `cross_modality_purity.py` and `layer_clustering_analysis.py`) and

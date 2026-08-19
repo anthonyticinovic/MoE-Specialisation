@@ -448,6 +448,71 @@ def check_flipped_routing_is_worse(results_path: Path) -> CheckResult:
     return _ok(name, f"{len(pairs)}/{len(pairs)} samples worse when flipped (+{delta:.1f}% mean)")
 
 
+def check_expert_metric_figures(figures_dir: Path, stage_ran: bool = True) -> CheckResult:
+    """``plot_expert_metrics.py`` must turn Stage 3's JSON into every figure.
+
+    The second analysis entry point the demo executes. It reads only what the
+    run itself produced, so it needs no model and no data — which is what makes
+    covering it cheap. A missing figure means a plotting routine raised, or a
+    metric key was renamed out from under it.
+    """
+    name = "analysis: expert metric figures produced"
+    expected = {
+        "expert_load_distribution.png",
+        "routing_entropy.png",
+        "high_confidence_fraction.png",
+        "visual_vs_text_routing.png",
+        "specialization_evolution.png",
+        "aggregate_summary.png",
+        "specialization_divergence.png",
+        "routing_confidence_evolution.png",
+        "loss_and_specialization.png",
+        "expert_metrics_report.txt",
+    }
+    if not figures_dir.exists():
+        if not stage_ran:
+            return _skip(name, "Figures stage not run")
+        return _fail(name, f"{figures_dir} was not written")
+
+    produced = {path.name for path in figures_dir.iterdir()}
+    missing = sorted(expected - produced)
+    if missing:
+        return _fail(name, f"{len(missing)} missing: {missing}")
+
+    # A matplotlib figure that raised part-way can still leave a stub behind.
+    empty = sorted(p.name for p in figures_dir.iterdir() if p.stat().st_size < 1024)
+    if empty:
+        return _fail(name, f"suspiciously small output: {empty}")
+    return _ok(name, f"{len(expected)} figures and the report, all non-trivial")
+
+
+def check_report_matches_the_metrics(figures_dir: Path, metrics: dict | None) -> CheckResult:
+    """The text report must quote the numbers that are actually in the JSON.
+
+    The figures are images — nothing can read them back. The report is the one
+    output whose contents can be checked against its input, so it stands in for
+    all of them: if the plotting code is reading the wrong key, this catches it.
+    """
+    name = "analysis: report agrees with the metrics it was built from"
+    report = figures_dir / "expert_metrics_report.txt"
+    if metrics is None or not report.exists():
+        return _skip(name, "No metrics or no report")
+
+    text = report.read_text()
+    aggregate = metrics["aggregate"]
+    expected = {
+        "expert_0 load": aggregate["expert_load_distribution"]["expert_0"],
+        "expert_1 load": aggregate["expert_load_distribution"]["expert_1"],
+        "routing entropy": aggregate["avg_routing_entropy"],
+    }
+    for label, value in expected.items():
+        # The report prints loads to 2dp and entropy to 4dp.
+        rendered = f"{value:.2f}" if "load" in label else f"{value:.4f}"
+        if rendered not in text:
+            return _fail(name, f"final epoch's {label} ({rendered}) does not appear in the report")
+    return _ok(name, f"{len(expected)} aggregate values match the final epoch's JSON")
+
+
 # ----------------------------------------------------------------------------
 # Driver
 # ----------------------------------------------------------------------------
@@ -463,12 +528,14 @@ def run_all(
     report failures it could not possibly have avoided.
     """
     ran_analysis = stages is None or "analysis" in stages
+    ran_figures = stages is None or "figures" in stages
     fixtures = output_root / "fixtures"
     runs = output_root / "runs"
     moe_dir = fixtures / "moe_model"
     stage2_ckpt = runs / "stage2_checkpoints" / "llm_stage2_best.pth"
     stage2_5_ckpt = runs / "stage2_5_checkpoints" / "llm_stage2_5_best.pth"
     ablation = output_root / "analysis" / "routing_ablation" / "routing_ablation_results.json"
+    figures = output_root / "analysis" / "expert_metrics"
 
     metrics_files = sorted((runs / "expert_metrics").glob("expert_metrics_epoch_*.json"))
     metrics = json.loads(metrics_files[-1].read_text()) if metrics_files else None
@@ -493,4 +560,6 @@ def run_all(
         check_losses_finite(runs, metric_files),
         check_routing_ablation_ran(ablation, ran_analysis),
         check_flipped_routing_is_worse(ablation),
+        check_expert_metric_figures(figures, ran_figures),
+        check_report_matches_the_metrics(figures, metrics),
     ]

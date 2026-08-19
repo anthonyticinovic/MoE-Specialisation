@@ -14,18 +14,18 @@ See the paper for the full method and results.
 
 ## Run it in 30 seconds (no GPU, no data, no downloads)
 
-The full pipeline — Stage 0 → 1 → 2 → 2.5 → 3, the dense control, and one
-analysis script — runs on a laptop CPU against generated fixtures:
+The full pipeline — Stage 0 → 1 → 2 → 2.5 → 3, the dense control, and two
+analysis scripts — runs on a laptop CPU against generated fixtures:
 
 ```bash
 uv sync --group dev
 make demo
 ```
 
-About 20 seconds. It writes 12 checkpoints, routing metrics, four figures, the
+About 25 seconds. It writes 12 checkpoints, routing metrics, 13 figures, the
 routing-ablation results and a one-page `demo_output/demo_report.md`.
 
-The report leads with **14 executable invariants** — properties that must hold
+The report leads with **16 executable invariants** — properties that must hold
 for the pipeline to be correct, not just for it to exit zero. Among them: the
 two experts must start bit-identical (Stage 0 copies the base FFN into both) and
 must have diverged after Stage 2; hard routing must dispatch each token to
@@ -40,10 +40,11 @@ This runs the **real training scripts**, not a reimplementation: the same
 `train_stage_*.py` files used on the H100 cluster, pointed at a miniature config
 via `MOE_CONFIG`. What differs is only scale and device — a 2-layer/64-hidden
 Mistral, a 4-patch CLIP tower, 24 synthetic images, and CPU fallbacks for FSDP,
-8-bit loading and FlashAttention. Nothing is stubbed. The final step drives
-`analysis_scripts/routing_ablation_experiment.py` against the Stage 2
-checkpoint the run just produced, so the analysis code is covered by the same
-mechanism.
+8-bit loading and FlashAttention. Nothing is stubbed. The last two steps drive
+`analysis_scripts/routing_ablation_experiment.py` against the Stage 2 checkpoint
+and `analysis_scripts/plot_expert_metrics.py` against Stage 3's routing metrics
+— both reading only what the run itself produced, so the analysis code is
+covered by the same mechanism.
 
 It is a smoke test, not a result: a randomly-initialised 2-layer model cannot
 caption anything, and the routing metrics sit near an even split. The point is
@@ -271,7 +272,7 @@ uv run pre-commit install
 
 make lint     # ruff (correctness repo-wide, style on the core) + mypy
 make format   # apply ruff formatting
-make test     # CPU-only pytest suite (~9s)
+make test     # CPU-only pytest suite (~10s)
 make demo     # the whole pipeline on CPU against synthetic fixtures
 make check    # lint + test + demo
 ```
@@ -295,9 +296,9 @@ The suite covers four levels, deliberately:
 | Level | Where | What it protects |
 |---|---|---|
 | Numerics | `tests/test_training_dry_run.py` | A tiny synthetic model must produce bit-identical loss and grad-norm against a recorded baseline. If those move, a refactor changed training numerics. |
-| Behaviour | `tests/test_training_steps.py`, `tests/test_analysis_model_loading.py` | Each stage runs a real epoch and must change **exactly** the parameters it claims to train, with gradients reaching all of them, and must resume from its own checkpoint. The analysis loaders are then driven against the checkpoints those stages produced. |
+| Behaviour | `tests/test_training_steps.py`, `tests/test_analysis_model_loading.py`, `tests/test_expert_metrics_pipeline.py` | Each stage runs a real epoch and must change **exactly** the parameters it claims to train, with gradients reaching all of them, and must resume from its own checkpoint. The analysis loaders and the metrics→figures pipeline are then driven against what those stages produced. |
 | Structure | `tests/test_training_scripts_structure.py`, `tests/test_analysis_lib.py` | Every script stays inert on import, reuses `_lib` rather than re-implementing FSDP, and never loads weights with a bare `strict=False`. No analysis script may hardcode the config path or default to CUDA — both would put it back out of the demo's reach. No source file may exceed 800 lines. Also checks the SLURM scripts point at files that exist. |
-| End-to-end | `make demo` | 14 executable invariants over a full CPU pipeline run, including the routing ablation. A partial run (`--stages 0 1`) skips the checks whose stages did not run rather than failing them. |
+| End-to-end | `make demo` | 16 executable invariants over a full CPU pipeline run, including the routing ablation and the figure pipeline. A partial run (`--stages 0 1`) skips the checks whose stages did not run rather than failing them. |
 
 ## Citation
 
