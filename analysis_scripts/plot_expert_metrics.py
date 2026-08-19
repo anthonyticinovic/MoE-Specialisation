@@ -11,7 +11,9 @@ Generates per-layer and aggregate metrics plots showing:
 5. Expert specialisation evolution across epochs
 
 Usage:
-    python analysis_scripts/plot_expert_metrics.py --metrics_dir /path/to/expert_metrics --output_dir results/expert_metrics
+    python analysis_scripts/plot_expert_metrics.py \
+        --metrics_dir /path/to/expert_metrics \
+        --output_dir results/expert_metrics
 """
 
 import argparse
@@ -43,14 +45,7 @@ def extract_epoch_number(filename):
     return None
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Parse arguments, plot, and return an exit code.
-
-    Takes ``argv`` so a test can call it instead of launching a subprocess, and
-    returns a code rather than ``None`` so a refusal to plot is visible to
-    whatever invoked it — the out-of-range guard below used to return quietly
-    and let the script exit 0 having produced nothing.
-    """
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Plot expert utilisation metrics from Stage 3 training"
     )
@@ -82,94 +77,82 @@ def main(argv: list[str] | None = None) -> int:
         "--training_metrics",
         type=str,
         default=None,
-        help=(
-            "training_metrics_stage3.json for the loss plot. "
-            "Defaults to the parent of --metrics_dir, which is where a training run puts it."
-        ),
+        help="Path to training_metrics_stage3.json (default: beside --metrics_dir)",
     )
-    args = parser.parse_args(argv)
+    return parser
 
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
 
-    logger.info("=" * 80)
-    logger.info("EXPERT METRICS VISUALISATION")
-    logger.info("=" * 80)
-    logger.info(f"Metrics directory: {args.metrics_dir}")
-    logger.info(f"Output directory:  {args.output_dir}\n")
-
-    # Find all expert metrics files
-    metrics_files = glob.glob(os.path.join(args.metrics_dir, "expert_metrics_epoch_*.json"))
+def _load_all_metrics(metrics_dir: str) -> dict[int, dict] | None:
+    """Read every ``expert_metrics_epoch_*.json``, keyed by epoch number."""
+    metrics_files = glob.glob(os.path.join(metrics_dir, "expert_metrics_epoch_*.json"))
     if not metrics_files:
-        logger.error(f"No expert metrics files found in {args.metrics_dir}")
-        logger.info("   Expected files matching pattern: expert_metrics_epoch_*.json")
-        return
-    logger.info(f"Found {len(metrics_files)} epoch(s) of metrics:")
-    # Load all metrics
+        logger.error("No expert metrics files found in %s", metrics_dir)
+        logger.error("   Expected files matching pattern: expert_metrics_epoch_*.json")
+        return None
+
+    logger.info("Found %d epoch(s) of metrics:", len(metrics_files))
     all_metrics = {}
     for metrics_file in sorted(metrics_files):
         epoch = extract_epoch_number(os.path.basename(metrics_file))
         if epoch is not None:
-            metrics = load_expert_metrics(metrics_file)
-            all_metrics[epoch] = metrics
-            logger.info(f"   Epoch {epoch}: {os.path.basename(metrics_file)}")
+            all_metrics[epoch] = load_expert_metrics(metrics_file)
+            logger.info("   Epoch %d: %s", epoch, os.path.basename(metrics_file))
+
     if not all_metrics:
-        logger.error("Failed to load any metrics files")
-        return
+        logger.error("Found %d file(s) but none carried a parseable epoch", len(metrics_files))
+        return None
+    return all_metrics
 
-    # Parse epochs argument
-    available_epochs = sorted(all_metrics.keys())
-    if args.epochs:
-        selected_epochs = set()
-        for part in args.epochs.split(","):
-            part = part.strip()
-            if "-" in part:
-                start, end = part.split("-")
-                selected_epochs.update(range(int(start), int(end) + 1))
-            else:
-                selected_epochs.add(int(part))
-        selected_epochs = sorted(e for e in selected_epochs if e in available_epochs)
-        if not selected_epochs:
-            logger.error(f"No matching epochs found for --epochs {args.epochs}")
-            return
-    else:
-        selected_epochs = available_epochs
 
-    # Filter all_metrics to selected epochs
-    all_metrics = {e: all_metrics[e] for e in selected_epochs}
+def _select_epochs(spec: str | None, available: list[int]) -> list[int] | None:
+    """Parse an ``--epochs`` spec like ``1,2,5`` or ``1-5,7``. None means all."""
+    if not spec:
+        return available
 
-    # Parse layers argument
-    # If 'all_layers', use all available layers from the first epoch
-    num_layers = len(next(iter(all_metrics.values()))["per_layer"])
-    if args.layers.strip() == "all_layers":
-        selected_layers = list(range(num_layers))
-    else:
-        selected_layers = [int(x) for x in args.layers.strip().split()]
-        # The default sampling assumes the paper's 32-layer model. Say so
-        # plainly rather than failing with an IndexError deep inside a plot.
-        out_of_range = [layer for layer in selected_layers if layer >= num_layers]
-        if out_of_range:
-            logger.error(
-                "Requested layer(s) %s but these metrics cover %d layer(s) (0-%d). "
-                "Pass --layers 'all_layers' or a subset in range.",
-                out_of_range,
-                num_layers,
-                num_layers - 1,
-            )
-            return 1
+    wanted: set[int] = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if "-" in part:
+            start, end = part.split("-")
+            wanted.update(range(int(start), int(end) + 1))
+        else:
+            wanted.add(int(part))
 
-    logger.info(f"\n{'=' * 80}")
-    logger.info("GENERATING PLOTS")
-    logger.info("=" * 80)
-    logger.info(f"Selected layers: {selected_layers}")
-    logger.info(f"Selected epochs: {selected_epochs}\n")
+    selected = sorted(epoch for epoch in wanted if epoch in available)
+    if not selected:
+        logger.error("No matching epochs found for --epochs %s (have %s)", spec, available)
+        return None
+    return selected
 
-    # Generate all plots
+
+def _select_layers(spec: str, num_layers: int) -> list[int] | None:
+    """Parse a ``--layers`` spec, rejecting indices the metrics do not cover."""
+    if spec.strip() == "all_layers":
+        return list(range(num_layers))
+
+    selected = [int(x) for x in spec.strip().split()]
+    # The default sampling assumes the paper's 32-layer model. Say so plainly
+    # rather than failing with an IndexError deep inside a plot.
+    out_of_range = [layer for layer in selected if layer >= num_layers]
+    if out_of_range:
+        logger.error(
+            "Requested layer(s) %s but these metrics cover %d layer(s) (0-%d). "
+            "Pass --layers 'all_layers' or a subset in range.",
+            out_of_range,
+            num_layers,
+            num_layers - 1,
+        )
+        return None
+    return selected
+
+
+def _render(all_metrics: dict, args, layers: list[int], epochs: list[int]) -> None:
+    """Draw every figure and write the text report."""
     logger.info("Generating per-layer plots...")
-    emp.plot_expert_load_distribution(all_metrics, args.output_dir, selected_layers)
-    emp.plot_routing_entropy(all_metrics, args.output_dir, selected_layers)
-    emp.plot_high_confidence_fraction(all_metrics, args.output_dir, selected_layers)
-    emp.plot_visual_vs_text_routing(all_metrics, args.output_dir, selected_layers)
+    emp.plot_expert_load_distribution(all_metrics, args.output_dir, layers)
+    emp.plot_routing_entropy(all_metrics, args.output_dir, layers)
+    emp.plot_high_confidence_fraction(all_metrics, args.output_dir, layers)
+    emp.plot_visual_vs_text_routing(all_metrics, args.output_dir, layers)
 
     logger.info("\nGenerating specialisation evolution plot...")
     eme.plot_specialization_evolution(all_metrics, args.output_dir)
@@ -179,9 +162,8 @@ def main(argv: list[str] | None = None) -> int:
 
     logger.info("\nGenerating the headline plots...")
     logger.info("   (Modality specialisation, routing confidence, loss correlation)")
-
-    eme.plot_modality_specialization_divergence(all_metrics, args.output_dir, selected_epochs)
-    eme.plot_routing_confidence_evolution(all_metrics, args.output_dir, selected_epochs)
+    eme.plot_modality_specialization_divergence(all_metrics, args.output_dir, epochs)
+    eme.plot_routing_confidence_evolution(all_metrics, args.output_dir, epochs)
 
     # A training run writes the loss history beside the expert_metrics/ directory.
     training_metrics_path = args.training_metrics or os.path.join(
@@ -192,33 +174,53 @@ def main(argv: list[str] | None = None) -> int:
             "No training metrics at %s — skipping the loss plot. Pass --training_metrics.",
             training_metrics_path,
         )
-    eme.plot_loss_and_specialization(
-        all_metrics, args.output_dir, training_metrics_path, selected_epochs
-    )
+    eme.plot_loss_and_specialization(all_metrics, args.output_dir, training_metrics_path, epochs)
 
     logger.info("\nGenerating text report...")
     eme.generate_report(all_metrics, args.output_dir)
 
-    logger.info(f"\n{'=' * 80}")
-    logger.info("COMPLETE!")
+
+def main(argv: list[str] | None = None) -> int:
+    """Parse arguments, plot, and return an exit code.
+
+    Takes ``argv`` so a test can call it instead of launching a subprocess, and
+    returns a code rather than ``None`` so a refusal to plot is visible to
+    whatever invoked it — every guard below used to ``return`` bare and let the
+    script exit 0 having produced nothing.
+    """
+    args = _build_parser().parse_args(argv)
+    os.makedirs(args.output_dir, exist_ok=True)
+
     logger.info("=" * 80)
-    logger.info(f"\nAll plots saved to: {args.output_dir}/")
-    logger.info("\nGenerated files:")
-    logger.info("  Per-layer analysis:")
-    logger.info("    • expert_load_distribution.png")
-    logger.info("    • routing_entropy.png")
-    logger.info("    • high_confidence_fraction.png")
-    logger.info("    • visual_vs_text_routing.png")
-    logger.info("\n  Epoch-wise evolution:")
-    logger.info("    • specialization_evolution.png")
-    logger.info("    • aggregate_summary.png")
-    logger.info("\n  Headline plots:")
-    logger.info("    • specialization_divergence.png        (Modality specialisation over time)")
-    logger.info("    • routing_confidence_evolution.png     (Confidence & entropy trends)")
-    logger.info("    • loss_and_specialization.png          (Loss vs specialisation dual-axis)")
-    logger.info("\n  Text report:")
-    logger.info("    • expert_metrics_report.txt")
-    logger.info("")
+    logger.info("EXPERT METRICS VISUALISATION")
+    logger.info("=" * 80)
+    logger.info("Metrics directory: %s", args.metrics_dir)
+    logger.info("Output directory:  %s\n", args.output_dir)
+
+    all_metrics = _load_all_metrics(args.metrics_dir)
+    if all_metrics is None:
+        return 1
+
+    epochs = _select_epochs(args.epochs, sorted(all_metrics))
+    if epochs is None:
+        return 1
+    all_metrics = {epoch: all_metrics[epoch] for epoch in epochs}
+
+    layers = _select_layers(args.layers, len(next(iter(all_metrics.values()))["per_layer"]))
+    if layers is None:
+        return 1
+
+    logger.info("\n%s", "=" * 80)
+    logger.info("GENERATING PLOTS")
+    logger.info("=" * 80)
+    logger.info("Selected layers: %s", layers)
+    logger.info("Selected epochs: %s\n", epochs)
+
+    _render(all_metrics, args, layers, epochs)
+
+    logger.info("\n%s", "=" * 80)
+    logger.info("COMPLETE! All plots saved to: %s", args.output_dir)
+    logger.info("=" * 80)
     return 0
 
 

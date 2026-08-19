@@ -86,12 +86,14 @@ class PurityMetricsMixin:
                 if should_debug:
                     logger.info("      Text single: pos 1 (excluding BOS at pos 0)")
             elif seq_len > 2:
-                # Multi-token concept: average all tokens from position 1 onwards (excluding only BOS)
+                # Multi-token concept: average all tokens from position 1 onwards
+                # (excluding only BOS)
                 concept_tokens = hidden_state[:, 1:, :]
                 representation = concept_tokens.mean(dim=1).squeeze(0)
                 if should_debug:
                     logger.info(
-                        f"      Text multi: pos [1:] of {seq_len} → {concept_tokens.shape[1]} tokens averaged (excluding BOS only)"
+                        f"      Text multi: pos [1:] of {seq_len} → {concept_tokens.shape[1]} "
+                        f"tokens averaged (excluding BOS only)"
                     )
             else:
                 # Edge case: only BOS token (shouldn't happen)
@@ -340,10 +342,12 @@ class PurityMetricsMixin:
                 connector_embeddings.append(connector_embedding)
 
             logger.info(
-                f"  CLIP ({pooling_desc}) for '{label}': shape={clip_embedding.shape}, norm={np.linalg.norm(clip_embedding):.2f}"
+                f"  CLIP ({pooling_desc}) for '{label}': shape={clip_embedding.shape}, "
+                f"norm={np.linalg.norm(clip_embedding):.2f}"
             )
             logger.info(
-                f"  Connector ({pooling_desc}) for '{label}': shape={connector_embedding.shape}, norm={np.linalg.norm(connector_embedding):.2f}"
+                f"  Connector ({pooling_desc}) for '{label}': shape={connector_embedding.shape}, "
+                f"norm={np.linalg.norm(connector_embedding):.2f}"
             )
 
         # Compute 2×2 similarity matrices
@@ -368,7 +372,8 @@ class PurityMetricsMixin:
             f"\n  CLIP ({pooling_desc}): {labels[0]} vs {labels[1]} = {clip_matrix[0, 1]:.4f}"
         )
         logger.info(
-            f"  Connector ({pooling_desc}): {labels[0]} vs {labels[1]} = {connector_matrix[0, 1]:.4f}"
+            f"  Connector ({pooling_desc}): {labels[0]} vs {labels[1]} = "
+            f"{connector_matrix[0, 1]:.4f}"
         )
 
         return clip_matrix, connector_matrix, labels
@@ -481,10 +486,12 @@ class PurityMetricsMixin:
 
             logger.info(f"  {label}:")
             logger.info(
-                f"      CLIP variance: std={clip_variance['std']:.4f}, range=[{clip_variance['min']:.3f}, {clip_variance['max']:.3f}]"
+                f"      CLIP variance: std={clip_variance['std']:.4f}, "
+                f"range=[{clip_variance['min']:.3f}, {clip_variance['max']:.3f}]"
             )
             logger.info(
-                f"      Connector variance: std={connector_variance['std']:.4f}, range=[{connector_variance['min']:.3f}, {connector_variance['max']:.3f}]"
+                f"      Connector variance: std={connector_variance['std']:.4f}, "
+                f"range=[{connector_variance['min']:.3f}, {connector_variance['max']:.3f}]"
             )
 
         return results
@@ -532,7 +539,7 @@ class PurityMetricsMixin:
         concept2_clip_tokens = None
         concept2_connector_tokens = None
 
-        for idx, (image, label) in enumerate(zip(images, labels, strict=True)):
+        for idx, (image, _label) in enumerate(zip(images, labels, strict=True)):
             pixel_values = self.clip_processor(images=image, return_tensors="pt").pixel_values.to(
                 self.device
             )
@@ -573,10 +580,12 @@ class PurityMetricsMixin:
             connector_similarities.append(float(conn_sim))
 
         logger.info(
-            f"  Position 0 (CLS): CLIP={clip_similarities[0]:.4f}, Connector={connector_similarities[0]:.4f}"
+            f"  Position 0 (CLS): CLIP={clip_similarities[0]:.4f}, "
+            f"Connector={connector_similarities[0]:.4f}"
         )
         logger.info(
-            f"  Positions 1-256 (patches): CLIP_mean={np.mean(clip_similarities[1:]):.4f}, Connector_mean={np.mean(connector_similarities[1:]):.4f}"
+            f"  Positions 1-256 (patches): CLIP_mean={np.mean(clip_similarities[1:]):.4f}, "
+            f"Connector_mean={np.mean(connector_similarities[1:]):.4f}"
         )
 
         return {

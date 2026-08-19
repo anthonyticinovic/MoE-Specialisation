@@ -138,7 +138,7 @@ def plot_clustering_analysis(
             color = (1 - scaled_conf) * np.array([1.0, 1.0, 1.0]) + scaled_conf * base_color
             colors.append(color)
 
-        scatter = ax.scatter(
+        ax.scatter(
             coords_2d[mask, 0],
             coords_2d[mask, 1],
             c=colors,
@@ -178,6 +178,59 @@ def plot_clustering_analysis(
     plt.savefig(expert_path, dpi=300, bbox_inches="tight")
     plt.close()
     logger.info(f"      Saved: {expert_path}")
+
+
+def _write_expert_modality_section(f, df):
+    """The expert-vs-modality contingency table and its interpretation.
+
+    Split out of ``generate_clustering_report`` to keep that function under
+    the 120-line limit; it is the one self-contained section of the report.
+    """
+    # Expert-Modality alignment analysis
+    f.write("## Expert-Modality Alignment Analysis\n\n")
+
+    # Create contingency table
+    contingency = pd.crosstab(df["modality"], df["expert_choice"], normalize="index") * 100
+    f.write("### Routing Pattern by Modality (% of samples)\n\n")
+
+    # Try to use markdown format, fallback to string representation
+    try:
+        f.write(contingency.to_markdown())
+    except ImportError:
+        # Fallback if tabulate is not available
+        f.write("```\n")
+        f.write(str(contingency))
+        f.write("\n```")
+    f.write("\n\n")
+
+    # Interpretation
+    f.write("### Interpretation\n\n")
+    if "Expert 0" in contingency.columns and "Expert 1" in contingency.columns:
+        vision_to_0 = contingency.loc["vision", "Expert 0"] if "vision" in contingency.index else 0
+        vision_to_1 = contingency.loc["vision", "Expert 1"] if "vision" in contingency.index else 0
+        text_to_0 = contingency.loc["text", "Expert 0"] if "text" in contingency.index else 0
+        text_to_1 = contingency.loc["text", "Expert 1"] if "text" in contingency.index else 0
+
+        f.write(f"- Vision tokens: {vision_to_0:.1f}% → Expert 0, {vision_to_1:.1f}% → Expert 1\n")
+        f.write(f"- Text tokens: {text_to_0:.1f}% → Expert 0, {text_to_1:.1f}% → Expert 1\n\n")
+
+        # Determine specialisation pattern
+        if vision_to_0 > 70 and text_to_1 > 70:
+            f.write(
+                "**Strong modality specialization detected**: Vision → Expert 0, Text → Expert 1\n"
+            )
+        elif vision_to_1 > 70 and text_to_0 > 70:
+            f.write(
+                "**Strong modality specialization detected**: Vision → Expert 1, Text → Expert 0\n"
+            )
+        elif max(vision_to_0, vision_to_1) < 60 or max(text_to_0, text_to_1) < 60:
+            f.write(
+                "**Weak modality specialization**: Routing is relatively balanced across experts\n"
+            )
+        else:
+            f.write(
+                "**Moderate modality specialization**: Some preference but not strongly separated\n"
+            )
 
 
 def generate_clustering_report(
@@ -225,7 +278,8 @@ def generate_clustering_report(
         for label_type in ["concept", "modality", "expert"]:
             m = metrics[label_type]
             f.write(
-                f"| {label_type.capitalize()} | {m['silhouette_score']:.4f} | {m['davies_bouldin_index']:.4f} | {m['n_clusters']} | {m['n_samples']} |\n"
+                f"| {label_type.capitalize()} | {m['silhouette_score']:.4f} | "
+                f"{m['davies_bouldin_index']:.4f} | {m['n_clusters']} | {m['n_samples']} |\n"
             )
 
         f.write("\n")
@@ -233,7 +287,8 @@ def generate_clustering_report(
         # Metric interpretation
         f.write("### Metric Interpretation\n\n")
         f.write(
-            "- **Silhouette Score**: Measures how well samples are clustered (-1 to 1, higher is better)\n"
+            "- **Silhouette Score**: Measures how well samples are clustered (-1 to 1, higher is "
+            "better)\n"
         )
         f.write("  - Score > 0.5: Strong clustering\n")
         f.write("  - Score 0.2-0.5: Moderate clustering\n")
@@ -243,56 +298,6 @@ def generate_clustering_report(
         f.write("  - Score 1.0-2.0: Moderate separation\n")
         f.write("  - Score > 2.0: Poorly separated clusters\n\n")
 
-        # Expert-Modality alignment analysis
-        f.write("## Expert-Modality Alignment Analysis\n\n")
-
-        # Create contingency table
-        contingency = pd.crosstab(df["modality"], df["expert_choice"], normalize="index") * 100
-        f.write("### Routing Pattern by Modality (% of samples)\n\n")
-
-        # Try to use markdown format, fallback to string representation
-        try:
-            f.write(contingency.to_markdown())
-        except ImportError:
-            # Fallback if tabulate is not available
-            f.write("```\n")
-            f.write(str(contingency))
-            f.write("\n```")
-        f.write("\n\n")
-
-        # Interpretation
-        f.write("### Interpretation\n\n")
-        if "Expert 0" in contingency.columns and "Expert 1" in contingency.columns:
-            vision_to_0 = (
-                contingency.loc["vision", "Expert 0"] if "vision" in contingency.index else 0
-            )
-            vision_to_1 = (
-                contingency.loc["vision", "Expert 1"] if "vision" in contingency.index else 0
-            )
-            text_to_0 = contingency.loc["text", "Expert 0"] if "text" in contingency.index else 0
-            text_to_1 = contingency.loc["text", "Expert 1"] if "text" in contingency.index else 0
-
-            f.write(
-                f"- Vision tokens: {vision_to_0:.1f}% → Expert 0, {vision_to_1:.1f}% → Expert 1\n"
-            )
-            f.write(f"- Text tokens: {text_to_0:.1f}% → Expert 0, {text_to_1:.1f}% → Expert 1\n\n")
-
-            # Determine specialisation pattern
-            if vision_to_0 > 70 and text_to_1 > 70:
-                f.write(
-                    "**Strong modality specialization detected**: Vision → Expert 0, Text → Expert 1\n"
-                )
-            elif vision_to_1 > 70 and text_to_0 > 70:
-                f.write(
-                    "**Strong modality specialization detected**: Vision → Expert 1, Text → Expert 0\n"
-                )
-            elif max(vision_to_0, vision_to_1) < 60 or max(text_to_0, text_to_1) < 60:
-                f.write(
-                    "**Weak modality specialization**: Routing is relatively balanced across experts\n"
-                )
-            else:
-                f.write(
-                    "**Moderate modality specialization**: Some preference but not strongly separated\n"
-                )
+        _write_expert_modality_section(f, df)
 
     logger.info(f"      Saved: {report_path}")

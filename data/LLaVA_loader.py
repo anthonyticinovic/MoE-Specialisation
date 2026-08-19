@@ -163,6 +163,113 @@ class LLaVA_Loader(Dataset):
     def __len__(self):
         return len(self.data)
 
+    def _load_pixel_values(self, sample: dict[str, Any]) -> torch.Tensor:
+        """Read the sample's image and run it through the CLIP processor.
+
+        Missing files are filtered out at construction. A blank-image fallback
+        here would train the model on black pixels paired with a real caption
+        and report nothing but a warning, so fail instead.
+        """
+        image_path = os.path.join(self.image_dir, sample["image"])
+        try:
+            image = Image.open(image_path).convert("RGB")
+        except OSError as err:
+            raise OSError(
+                f"Could not read {image_path}, which existed when the dataset "
+                "was built. Do not modify the image directory during a run."
+            ) from err
+
+        return self.clip_processor(images=image, return_tensors="pt")["pixel_values"].squeeze(0)
+
+    def _tokenise_conversation(
+        self, conversations: list[dict[str, str]], idx: int
+    ) -> tuple[list[int], list[bool]]:
+        """Flatten every Q&A turn into one token sequence plus an answer mask.
+
+        Returns the token ids and, parallel to them, ``True`` wherever the token
+        should contribute to the loss — the answers and the final EOS, never the
+        questions. Both are plain lists; turning them into tensors is the next
+        step's job, kept separate so neither name is ever rebound from list to
+        tensor (which is what made this file untypeable).
+        """
+        if len(conversations) % 2 != 0:
+            # Odd turn count: truncate to the last complete Q&A pair.
+            conversations = conversations[: len(conversations) - 1]
+
+        # _load_data admits only samples with >= 2 turns, and dropping one odd
+        # turn from >= 2 still leaves >= 2, so this holds by construction.
+        assert len(conversations) >= 2, f"sample {idx} reached __getitem__ with no Q&A pair"
+
+        token_ids: list[int] = []
+        answer_mask: list[bool] = []
+
+        for turn in range(0, len(conversations), 2):
+            question = conversations[turn]["value"]
+            answer = conversations[turn + 1]["value"]
+
+            # The <image> placeholder appears in the first question only.
+            question = question.replace("<image>", "").replace("\n", " ").strip()
+
+            question_ids = self._encode(question, add_special_tokens=turn == 0)
+            answer_ids = self._encode(answer.strip(), add_special_tokens=False)
+
+            token_ids.extend(question_ids)
+            answer_mask.extend([False] * len(question_ids))
+            token_ids.extend(answer_ids)
+            answer_mask.extend([True] * len(answer_ids))
+
+        token_ids.append(self.tokenizer.eos_token_id)
+        answer_mask.append(True)  # EOS contributes to loss
+
+        return token_ids, answer_mask
+
+    def _encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+        """Tokenise one turn. Only the first question carries the BOS token."""
+        encoding = self.tokenizer(
+            text,
+            truncation=False,
+            add_special_tokens=add_special_tokens,
+            return_tensors="pt",
+        )
+        return encoding["input_ids"].squeeze(0).tolist()
+
+    def _to_padded_tensors(
+        self, token_ids: list[int], answer_mask: list[bool], idx: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Truncate or pad to ``max_length`` and build the three model inputs.
+
+        Returns ``(input_ids, attention_mask, labels, answer_mask)``. The trailing
+        answer mask is only needed by the debug dump, and covers the real tokens
+        rather than the padding.
+        """
+        ids = torch.tensor(token_ids[: self.max_length], dtype=torch.long)
+        mask = torch.tensor(answer_mask[: self.max_length], dtype=torch.bool)
+
+        if len(token_ids) > self.max_length and self.debug:
+            answers_left = int(mask.sum().item())
+            if answers_left < 5:
+                logger.debug("Sample %d truncated to only %d answer tokens.", idx, answers_left)
+
+        # Questions are masked with -100 so only answers contribute to the loss.
+        labels = torch.where(mask, ids, torch.tensor(-100))
+
+        real_length = len(ids)
+        padding = self.max_length - real_length
+        if padding > 0:
+            pad_id = self.tokenizer.pad_token_id
+            ids = torch.cat([ids, torch.full((padding,), pad_id, dtype=torch.long)])
+            labels = torch.cat([labels, torch.full((padding,), -100, dtype=torch.long)])
+            attention_mask = torch.cat(
+                [
+                    torch.ones(real_length, dtype=torch.long),
+                    torch.zeros(padding, dtype=torch.long),
+                ]
+            )
+        else:
+            attention_mask = torch.ones(real_length, dtype=torch.long)
+
+        return ids.long(), attention_mask.long(), labels.long(), mask
+
     def __getitem__(self, idx):
         """
         Returns:
@@ -172,158 +279,15 @@ class LLaVA_Loader(Dataset):
             labels: Token IDs with questions masked as -100, answers unmasked
         """
         sample = self.data[idx]
-
-        # Load and process image
-        image_filename = sample["image"]
-        image_path = os.path.join(self.image_dir, image_filename)
-
-        # Missing files are filtered out at construction. A blank-image
-        # fallback here would train the model on black pixels paired with a
-        # real caption and report nothing but a warning, so fail instead.
-        try:
-            image = Image.open(image_path).convert("RGB")
-        except OSError as err:
-            raise OSError(
-                f"Could not read {image_path}, which existed when the dataset "
-                "was built. Do not modify the image directory during a run."
-            ) from err
-
-        # Process image with CLIP
-        pixel_values = self.clip_processor(images=image, return_tensors="pt")[
-            "pixel_values"
-        ].squeeze(0)
-
-        # Extract ALL Q&A pairs from conversations
-        conversations = sample["conversations"]
-
-        # Validate: conversations must have even length (question-answer pairs)
-        if len(conversations) % 2 != 0:
-            # If odd, truncate to last complete Q&A pair
-            conversations = conversations[: len(conversations) - 1]
-
-        # _load_data admits only samples with >= 2 turns, and dropping one odd
-        # turn from >= 2 still leaves >= 2, so this holds by construction.
-        assert len(conversations) >= 2, f"sample {idx} reached __getitem__ with no Q&A pair"
-
-        # Build combined sequence with proper masking
-        # Start with BOS token (included in first question tokenization)
-        combined_ids = []
-        label_mask = []  # True = compute loss (answer), False = mask (question)
-
-        for i in range(0, len(conversations), 2):
-            question_text = conversations[i]["value"]
-            answer_text = conversations[i + 1]["value"]
-
-            # Remove <image> placeholder from question (only appears in first question)
-            question_text = question_text.replace("<image>", "").replace("\n", " ").strip()
-            answer_text = answer_text.strip()
-
-            # Tokenize question
-            if i == 0:
-                # First question: include BOS token
-                question_encoding = self.tokenizer(
-                    question_text,
-                    truncation=False,
-                    add_special_tokens=True,  # Includes BOS
-                    return_tensors="pt",
-                )
-            else:
-                # Subsequent questions: no BOS (already have it)
-                question_encoding = self.tokenizer(
-                    question_text,
-                    truncation=False,
-                    add_special_tokens=False,
-                    return_tensors="pt",
-                )
-
-            question_ids = question_encoding["input_ids"].squeeze(0).tolist()
-
-            # Tokenize answer (never add special tokens for answers)
-            answer_encoding = self.tokenizer(
-                answer_text,
-                truncation=False,
-                add_special_tokens=False,
-                return_tensors="pt",
-            )
-            answer_ids = answer_encoding["input_ids"].squeeze(0).tolist()
-
-            # Add to combined sequence
-            combined_ids.extend(question_ids)
-            label_mask.extend([False] * len(question_ids))  # Questions masked
-
-            combined_ids.extend(answer_ids)
-            label_mask.extend([True] * len(answer_ids))  # Answers NOT masked
-
-        # Add EOS token at the end
-        combined_ids.append(self.tokenizer.eos_token_id)
-        label_mask.append(True)  # EOS contributes to loss
-
-        # Convert to tensors
-        combined_ids = torch.tensor(combined_ids, dtype=torch.long)
-        label_mask = torch.tensor(label_mask, dtype=torch.bool)
-
-        # CRITICAL: Handle truncation if sequence too long
-        max_length = self.max_length
-        if len(combined_ids) > max_length:
-            # Truncate from the end
-            combined_ids = combined_ids[:max_length]
-            label_mask = label_mask[:max_length]
-
-            # Check if we have at least some answer tokens left
-            num_answer_tokens = label_mask.sum().item()
-            if num_answer_tokens < 5:
-                # Very few answer tokens remain - warn but continue
-                if self.debug:
-                    logger.debug(
-                        "Sample %d truncated to only %d answer tokens.", idx, num_answer_tokens
-                    )
-
-        # Create labels: -100 for questions, actual token IDs for answers
-        labels = torch.where(
-            label_mask,
-            combined_ids,  # Answer tokens: keep IDs
-            torch.tensor(-100),  # Question tokens: mask with -100
+        pixel_values = self._load_pixel_values(sample)
+        token_ids, answer_mask = self._tokenise_conversation(sample["conversations"], idx)
+        input_ids, attention_mask, labels, real_answer_mask = self._to_padded_tensors(
+            token_ids, answer_mask, idx
         )
 
-        # CRITICAL: Handle padding
-        current_length = len(combined_ids)
-        padding_length = max_length - current_length
-
-        if padding_length > 0:
-            # Pad input_ids with pad_token_id
-            input_ids = torch.cat(
-                [
-                    combined_ids,
-                    torch.full((padding_length,), self.tokenizer.pad_token_id, dtype=torch.long),
-                ]
-            )
-
-            # Pad labels with -100 (masked)
-            labels = torch.cat([labels, torch.full((padding_length,), -100, dtype=torch.long)])
-
-            # Attention mask: 1 for real tokens, 0 for padding
-            attention_mask = torch.cat(
-                [
-                    torch.ones(current_length, dtype=torch.long),
-                    torch.zeros(padding_length, dtype=torch.long),
-                ]
-            )
-        else:
-            # No padding needed
-            input_ids = combined_ids
-            attention_mask = torch.ones(len(input_ids), dtype=torch.long)
-
-        # Debug logging for first 3 samples
         if self.debug and self.debug_counter < 3:
-            self._debug_print_sample(
-                idx, input_ids, labels, attention_mask, label_mask[:current_length]
-            )
+            self._debug_print_sample(idx, input_ids, labels, attention_mask, real_answer_mask)
             self.debug_counter += 1
-
-        # Final dtype validation
-        input_ids = input_ids.long()
-        labels = labels.long()
-        attention_mask = attention_mask.long()
 
         return pixel_values, input_ids, attention_mask, labels
 

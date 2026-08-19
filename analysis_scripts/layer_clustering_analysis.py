@@ -53,84 +53,6 @@ class MoEClusteringAnalyzer(CrossModalityPurityAnalyzer):
         super().__init__(config_path, device)
         self.expert_confidence_threshold = 0.6  # Default threshold
 
-    def extract_concept_samples(
-        self, annotations_file: str, concepts: list[str], samples_per_concept: int, seed: int = 42
-    ) -> dict[str, list[dict]]:
-        """
-        Extract balanced samples from COCO annotations for specified concepts.
-
-        Args:
-            annotations_file: Path to COCO annotations JSON
-            concepts: List of concept keywords (e.g., ["cat", "dog", "car"])
-            samples_per_concept: Target number of samples per concept
-            seed: Random seed for reproducibility
-
-        Returns:
-            Dict mapping concept -> list of sample dicts with keys:
-                - 'image_id': COCO image ID
-                - 'caption': Image caption
-                - 'image_path': Full path to image file
-        """
-        logger.info("Extracting concept samples from COCO annotations...")
-        logger.info(f"   Concepts: {concepts}")
-        logger.info(f"   Target: {samples_per_concept} samples per concept")
-
-        # Load COCO annotations
-        with open(annotations_file) as f:
-            coco_data = json.load(f)
-
-        # Build image_id -> image_path mapping
-        image_id_to_path = {}
-        for img in coco_data["images"]:
-            image_id_to_path[img["id"]] = img["file_name"]
-
-        # Set random seed
-        np.random.seed(seed)
-
-        # Extract samples for each concept
-        concept_samples = {concept: [] for concept in concepts}
-
-        for annotation in coco_data["annotations"]:
-            caption = annotation["caption"].lower()
-            image_id = annotation["image_id"]
-
-            # Check which concepts appear in this caption
-            matching_concepts = [c for c in concepts if c.lower() in caption.split()]
-
-            # Skip if multiple specified concepts appear (ambiguous)
-            if len(matching_concepts) > 1:
-                continue
-
-            # Skip if no concepts match
-            if len(matching_concepts) == 0:
-                continue
-
-            # Add to the matching concept's sample list
-            concept = matching_concepts[0]
-            if len(concept_samples[concept]) < samples_per_concept:
-                concept_samples[concept].append(
-                    {
-                        "image_id": image_id,
-                        "caption": annotation["caption"],
-                        "image_path": image_id_to_path[image_id],
-                        "concept": concept,
-                    }
-                )
-
-        # Print statistics
-        logger.info("\n   Extracted samples:")
-        for concept, samples in concept_samples.items():
-            logger.info(f"      {concept}: {len(samples)} samples")
-
-        # Warn if any concept is under-sampled
-        for concept, samples in concept_samples.items():
-            if len(samples) < samples_per_concept:
-                logger.warning(
-                    f"    Warning: Only found {len(samples)} samples for '{concept}' (target: {samples_per_concept})"
-                )
-
-        return concept_samples
-
     def _extract_expert_choice(
         self, routing_probs: torch.Tensor, confidence_threshold: float = 0.6
     ) -> str:
@@ -183,7 +105,8 @@ class MoEClusteringAnalyzer(CrossModalityPurityAnalyzer):
                 - 'caption': str (COCO caption)
         """
         logger.info(
-            f"\nCollecting representations from {sum(len(s) for s in concept_samples.values())} samples..."
+            f"\nCollecting representations from {sum(len(s) for s in concept_samples.values())} "
+            f"samples..."
         )
         logger.info(f"   Target layers: {target_layers}")
         logger.info(f"   Pooling: {pooling}")
@@ -581,7 +504,9 @@ def main():
                 coords_2d=coords_2d, labels=df[column_name].values, label_type=label_type
             )
             logger.info(
-                f"   {label_type.capitalize()} clustering - Silhouette: {metrics[label_type]['silhouette_score']:.4f}, Davies-Bouldin: {metrics[label_type]['davies_bouldin_index']:.4f}"
+                f"   {label_type.capitalize()} clustering - Silhouette: "
+                f"{metrics[label_type]['silhouette_score']:.4f}, Davies-Bouldin: "
+                f"{metrics[label_type]['davies_bouldin_index']:.4f}"
             )
 
         # Generate report

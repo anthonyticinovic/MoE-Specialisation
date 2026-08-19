@@ -141,7 +141,7 @@ def plot_aggregate_summary(all_metrics, output_dir):
     ax1.set_ylabel("Load (%)", fontsize=12)
     ax1.set_title("Aggregate Expert Load Distribution", fontsize=13, fontweight="bold")
     ax1.set_ylim(0, 100)
-    for i, (expert, load) in enumerate(zip(experts, loads, strict=True)):
+    for i, (_expert, load) in enumerate(zip(experts, loads, strict=True)):
         ax1.text(
             i, load + 3, f"{load:.1f}%", ha="center", va="bottom", fontweight="bold", fontsize=11
         )
@@ -163,7 +163,7 @@ def plot_aggregate_summary(all_metrics, output_dir):
         ax2.set_ylabel("% Visual Tokens", fontsize=12)
         ax2.set_title("Visual Token Routing", fontsize=13, fontweight="bold")
         ax2.set_ylim(0, 100)
-        for i, (expert, load) in enumerate(zip(visual_experts, visual_loads, strict=True)):
+        for i, (_expert, load) in enumerate(zip(visual_experts, visual_loads, strict=True)):
             ax2.text(
                 i,
                 load + 3,
@@ -186,7 +186,7 @@ def plot_aggregate_summary(all_metrics, output_dir):
         ax3.set_ylabel("% Text Tokens", fontsize=12)
         ax3.set_title("Text Token Routing", fontsize=13, fontweight="bold")
         ax3.set_ylim(0, 100)
-        for i, (expert, load) in enumerate(zip(text_experts, text_loads, strict=True)):
+        for i, (_expert, load) in enumerate(zip(text_experts, text_loads, strict=True)):
             ax3.text(
                 i,
                 load + 3,
@@ -388,6 +388,47 @@ def plot_routing_confidence_evolution(all_metrics, output_dir, selected_epochs=N
     logger.info("  Saved: routing_confidence_evolution.png")
 
 
+def _loss_and_divergence(all_metrics, training_metrics, epochs):
+    """Line the loss history up with the per-epoch specialisation divergence.
+
+    Returns the epochs that have both, plus the three parallel series. An epoch
+    missing from either side drops out of all four together — they are plotted
+    against each other, so a gap in one has to be a gap in all.
+    """
+    train_loss = []
+    val_loss = []
+    divergence_values = []
+
+    for epoch in epochs:
+        # Find corresponding epoch in training metrics
+        if epoch in training_metrics["epoch"]:
+            idx = training_metrics["epoch"].index(epoch)
+            train_loss.append(training_metrics["train_loss"][idx])
+            val_loss.append(training_metrics["val_loss"][idx])
+        else:
+            train_loss.append(None)
+            val_loss.append(None)
+
+        # Compute specialisation divergence
+        agg = all_metrics[epoch]["aggregate"]
+        if "visual_routing" in agg and "text_routing" in agg:
+            visual_e0 = agg["visual_routing"].get("expert_0", 50)
+            text_e0 = agg["text_routing"].get("expert_0", 50)
+            divergence_values.append(abs(visual_e0 - text_e0))
+        else:
+            divergence_values.append(None)
+
+    valid_epochs = [
+        e
+        for i, e in enumerate(epochs)
+        if train_loss[i] is not None and divergence_values[i] is not None
+    ]
+    valid_train_loss = [value for value in train_loss if value is not None]
+    valid_val_loss = [value for value in val_loss if value is not None]
+    valid_divergence = [d for d in divergence_values if d is not None]
+    return valid_epochs, valid_train_loss, valid_val_loss, valid_divergence
+
+
 def plot_loss_and_specialization(all_metrics, output_dir, metrics_json_path, selected_epochs=None):
     """
     Dual-axis plot showing training/validation loss and specialisation divergence.
@@ -416,42 +457,9 @@ def plot_loss_and_specialization(all_metrics, output_dir, metrics_json_path, sel
         training_metrics = json.load(f)
 
     # Extract loss values for selected epochs
-    train_loss = []
-    val_loss = []
-    divergence_values = []
-
-    for epoch in epochs:
-        # Find corresponding epoch in training metrics
-        if epoch in training_metrics["epoch"]:
-            idx = training_metrics["epoch"].index(epoch)
-            train_loss.append(training_metrics["train_loss"][idx])
-            val_loss.append(training_metrics["val_loss"][idx])
-        else:
-            train_loss.append(None)
-            val_loss.append(None)
-
-        # Compute specialisation divergence
-        metrics = all_metrics[epoch]
-        agg = metrics["aggregate"]
-
-        if "visual_routing" in agg and "text_routing" in agg:
-            visual_e0 = agg["visual_routing"].get("expert_0", 50)
-            text_e0 = agg["text_routing"].get("expert_0", 50)
-            divergence = abs(visual_e0 - text_e0)
-            divergence_values.append(divergence)
-        else:
-            divergence_values.append(None)
-
-    # Filter out None values for plotting
-    valid_epochs = [
-        e
-        for i, e in enumerate(epochs)
-        if train_loss[i] is not None and divergence_values[i] is not None
-    ]
-    valid_train_loss = [value for value in train_loss if value is not None]
-    valid_val_loss = [value for value in val_loss if value is not None]
-    valid_divergence = [d for d in divergence_values if d is not None]
-
+    valid_epochs, valid_train_loss, valid_val_loss, valid_divergence = _loss_and_divergence(
+        all_metrics, training_metrics, epochs
+    )
     if not valid_epochs:
         logger.warning("   Warning: No valid data for loss_and_specialization plot")
         return

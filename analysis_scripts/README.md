@@ -129,16 +129,19 @@ those files were split and a test now enforces the limit.
   `print`, no hardcoded config path, no CUDA default, no bare `strict=False`, no
   failure reported at INFO) and not for behaviour. Treat their outputs as
   un-regression-tested.
-- **Duplication across the analysers.** `extract_concept_samples` is
-  implemented three times (in `cross_concept_similarity_matrix.py`,
-  `cross_modality_purity.py` and `layer_clustering_analysis.py`) and
-  `compute_metrics` twice (`pope_utils.py` and, separately,
-  `compare_priming_strategies.py`). Consolidating them is safe only once the
-  point above is fixed.
-- **Long functions.** Nineteen functions here exceed 120 lines, the largest
-  being `generate_captions` (273) and `generate_pope_answers` (243). The
-  training scripts have a test enforcing that limit; these do not, for the same
-  reason.
+- **Long functions.** Sixteen functions here still exceed 120 lines, the
+  largest being `generate_captions` (273) and `generate_pope_answers` (243).
+  Every one is in code the demo cannot reach, so a refactor of it cannot be
+  verified by anything; they are listed in
+  `tests/test_analysis_lib.py::KNOWN_OVERSIZED_FUNCTIONS` and a test stops the
+  list growing. The five that *were* reachable have been split, each verified
+  by byte-comparing the demo's output before and after.
+- **A known scoring defect in `pope_utils.extract_yes_no_answer`.** The
+  affirmative phrase list is scanned before the descriptive-pattern list, so a
+  caption of the form "The image features a …" scores **yes** even when the
+  queried object is absent. Stage 3 collapsed into producing exactly those
+  captions, so this plausibly inflates its POPE yes-rate. Pinned by a test and
+  left uncorrected: changing it would change published numbers.
 - **Duplication across `train_stage_*.py`** — the five stage scripts total
   ~2,500 lines against ~1,000 in `_lib`. The shared runtime, FSDP wrapper,
   backbones, dataloaders, checkpoint guard and loss are extracted; the forward

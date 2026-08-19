@@ -22,6 +22,111 @@ logger = logging.getLogger(__name__)
 set_publication_rcparams()
 
 
+def _plot_load_single_epoch(ax, all_metrics, epochs, selected_layers, x_positions):
+    """One epoch: overlapping bars, with a legend naming just the two experts."""
+    epoch = epochs[0]
+    metrics = all_metrics[epoch]
+    expert_0_loads = []
+    expert_1_loads = []
+    for layer_idx in selected_layers:
+        layer_data = metrics["per_layer"][layer_idx]
+        load_dist = layer_data["expert_load_distribution"]
+        expert_0_loads.append(load_dist.get("expert_0", 0))
+        expert_1_loads.append(load_dist.get("expert_1", 0))
+
+    # Overlapping bars: draw Expert 1 (behind) then Expert 0 (front).
+    # Make front bar slightly narrower so the behind bar remains visible.
+    width_back = 0.62
+    width_front = 0.48
+    ax.bar(
+        x_positions,
+        expert_1_loads,
+        width_back,
+        label="Expert 1",
+        color="#ff7f0e",
+        alpha=0.75,
+        hatch="//",
+        edgecolor="k",
+        linewidth=0.6,
+        zorder=2,
+    )
+    ax.bar(
+        x_positions,
+        expert_0_loads,
+        width_front,
+        label="Expert 0",
+        color="#1f77b4",
+        alpha=0.8,
+        edgecolor="k",
+        linewidth=0.8,
+        zorder=3,
+    )
+
+    # Compact, vertically stacked legend for single-epoch view (inside axes)
+    # Use representative patches to ensure compact layout
+    p0 = mpatches.Patch(facecolor="#1f77b4", edgecolor="k", label="Expert 0", alpha=0.8)
+    p1 = mpatches.Patch(
+        facecolor="#ff7f0e", edgecolor="k", hatch="//", label="Expert 1", alpha=0.75
+    )
+    ax.legend(
+        handles=[p0, p1],
+        loc="upper right",
+        bbox_to_anchor=(0.98, 0.95),
+        ncol=1,
+        fontsize=10,
+        frameon=True,
+        framealpha=0.9,
+        handlelength=1.6,
+        handletextpad=0.6,
+        borderaxespad=0.5,
+    )
+
+
+def _plot_load_multi_epoch(ax, all_metrics, epochs, selected_layers, x_positions):
+    """Several epochs: grouped bars coloured by epoch, one handle per expert."""
+    width = 0.35 / max(1, len(epochs))
+    colors = plt.cm.viridis(np.linspace(0, 1, len(epochs)))
+    handles = []
+    for epoch_idx, (epoch, color) in enumerate(zip(epochs, colors, strict=True)):
+        metrics = all_metrics[epoch]
+        expert_0_loads = []
+        expert_1_loads = []
+
+        for layer_idx in selected_layers:
+            layer_data = metrics["per_layer"][layer_idx]
+            load_dist = layer_data["expert_load_distribution"]
+            expert_0_loads.append(load_dist.get("expert_0", 0))
+            expert_1_loads.append(load_dist.get("expert_1", 0))
+
+        # Offset bars for each epoch
+        offset = width * (epoch_idx - len(epochs) / 2 + 0.5)
+        ax.bar(x_positions + offset, expert_0_loads, width, color=color, alpha=0.7)
+        ax.bar(x_positions + offset, expert_1_loads, width, color=color, alpha=0.4, hatch="//")
+        # Keep only a single handle per expert to avoid a huge legend
+        if epoch_idx == 0:
+            handles.append(mpatches.Patch(color=color, label="Expert 0", alpha=0.7))
+            handles.append(mpatches.Patch(color=color, label="Expert 1", alpha=0.4))
+
+    # Deduplicate labels and present a compact legend
+    # Use a small font and single column to keep legend compact
+    if handles:
+        # Use vertical stacked legend and only two items (Expert 0 / Expert 1)
+        # Construct two representative patches with standard colours and place
+        # the legend inside the axes (upper-right) as a single column.
+        p0 = mpatches.Patch(color="#1f77b4", label="Expert 0", alpha=0.7)
+        p1 = mpatches.Patch(color="#ff7f0e", label="Expert 1", alpha=0.7, hatch="//")
+        ax.legend(
+            handles=[p0, p1],
+            loc="upper right",
+            bbox_to_anchor=(0.98, 0.95),
+            ncol=1,
+            fontsize=9,
+            handlelength=1.6,
+            frameon=True,
+            framealpha=0.9,
+        )
+
+
 def plot_expert_load_distribution(
     all_metrics, output_dir, selected_layers=None, selected_epochs=None
 ):
@@ -46,109 +151,9 @@ def plot_expert_load_distribution(
     x_positions = np.arange(len(selected_layers))
 
     if len(epochs) == 1:
-        epoch = epochs[0]
-        metrics = all_metrics[epoch]
-        expert_0_loads = []
-        expert_1_loads = []
-        for layer_idx in selected_layers:
-            layer_data = metrics["per_layer"][layer_idx]
-            load_dist = layer_data["expert_load_distribution"]
-            expert_0_loads.append(load_dist.get("expert_0", 0))
-            expert_1_loads.append(load_dist.get("expert_1", 0))
-
-        # Overlapping bars: draw Expert 1 (behind) then Expert 0 (front).
-        # Make front bar slightly narrower so the behind bar remains visible.
-        width_back = 0.62
-        width_front = 0.48
-        bar_back = ax.bar(
-            x_positions,
-            expert_1_loads,
-            width_back,
-            label="Expert 1",
-            color="#ff7f0e",
-            alpha=0.75,
-            hatch="//",
-            edgecolor="k",
-            linewidth=0.6,
-            zorder=2,
-        )
-        bar_front = ax.bar(
-            x_positions,
-            expert_0_loads,
-            width_front,
-            label="Expert 0",
-            color="#1f77b4",
-            alpha=0.8,
-            edgecolor="k",
-            linewidth=0.8,
-            zorder=3,
-        )
-
-        # Compact, vertically stacked legend for single-epoch view (inside axes)
-        # Use representative patches to ensure compact layout
-        p0 = mpatches.Patch(facecolor="#1f77b4", edgecolor="k", label="Expert 0", alpha=0.8)
-        p1 = mpatches.Patch(
-            facecolor="#ff7f0e", edgecolor="k", hatch="//", label="Expert 1", alpha=0.75
-        )
-        ax.legend(
-            handles=[p0, p1],
-            loc="upper right",
-            bbox_to_anchor=(0.98, 0.95),
-            ncol=1,
-            fontsize=10,
-            frameon=True,
-            framealpha=0.9,
-            handlelength=1.6,
-            handletextpad=0.6,
-            borderaxespad=0.5,
-        )
-
+        _plot_load_single_epoch(ax, all_metrics, epochs, selected_layers, x_positions)
     else:
-        # Multi-epoch plotting -- keep behaviour but produce compact deduped legend
-        width = 0.35 / max(1, len(epochs))
-        colors = plt.cm.viridis(np.linspace(0, 1, len(epochs)))
-        handles = []
-        labels = []
-        for epoch_idx, (epoch, color) in enumerate(zip(epochs, colors, strict=True)):
-            metrics = all_metrics[epoch]
-            expert_0_loads = []
-            expert_1_loads = []
-
-            for layer_idx in selected_layers:
-                layer_data = metrics["per_layer"][layer_idx]
-                load_dist = layer_data["expert_load_distribution"]
-                expert_0_loads.append(load_dist.get("expert_0", 0))
-                expert_1_loads.append(load_dist.get("expert_1", 0))
-
-            # Offset bars for each epoch
-            offset = width * (epoch_idx - len(epochs) / 2 + 0.5)
-            h0 = ax.bar(x_positions + offset, expert_0_loads, width, color=color, alpha=0.7)
-            h1 = ax.bar(
-                x_positions + offset, expert_1_loads, width, color=color, alpha=0.4, hatch="//"
-            )
-            # Keep only a single handle per expert to avoid a huge legend
-            if epoch_idx == 0:
-                handles.append(mpatches.Patch(color=color, label="Expert 0", alpha=0.7))
-                handles.append(mpatches.Patch(color=color, label="Expert 1", alpha=0.4))
-
-        # Deduplicate labels and present a compact legend
-        # Use a small font and single column to keep legend compact
-        if handles:
-            # Use vertical stacked legend and only two items (Expert 0 / Expert 1)
-            # Construct two representative patches with standard colours and place
-            # the legend inside the axes (upper-right) as a single column.
-            p0 = mpatches.Patch(color="#1f77b4", label="Expert 0", alpha=0.7)
-            p1 = mpatches.Patch(color="#ff7f0e", label="Expert 1", alpha=0.7, hatch="//")
-            ax.legend(
-                handles=[p0, p1],
-                loc="upper right",
-                bbox_to_anchor=(0.98, 0.95),
-                ncol=1,
-                fontsize=9,
-                handlelength=1.6,
-                frameon=True,
-                framealpha=0.9,
-            )
+        _plot_load_multi_epoch(ax, all_metrics, epochs, selected_layers, x_positions)
 
     ax.set_xlabel("Layer")
     ax.set_ylabel("Expert Load (%)")
@@ -253,7 +258,8 @@ def plot_high_confidence_fraction(
     ax.set_xlabel("Layer")
     ax.set_ylabel("High Confidence Fraction")
     ax.set_title(
-        "High Confidence Routing Fraction Across Layers\n(Fraction of Decisions with >70% Confidence)"
+        "High Confidence Routing Fraction Across Layers\n(Fraction of Decisions with >70% "
+        "Confidence)"
     )
     ax.legend(loc="best")
     ax.set_xticks(selected_layers)

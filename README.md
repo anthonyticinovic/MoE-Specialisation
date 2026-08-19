@@ -281,8 +281,8 @@ CI runs exactly this list on every push: the lint, the type check, the test
 suite, and the demo. The demo is included deliberately — the unit suite can stay
 green while the pipeline itself is broken.
 
-ruff and mypy are strict on the maintained core (`models/`, `data/`, `tests/`);
-the research scripts (`training_scripts/`, `analysis_scripts/`) are held to
+ruff and mypy are strict on the maintained core (`models/`, `data/`, `tests/`).
+The research scripts (`training_scripts/`, `analysis_scripts/`) are held to
 formatting plus the correctness rules that catch undefined names
 (`F821`/`F811`/`F822`), unstrict `zip()` (`B905`) and bare `except:` (`E722`).
 A missing import once left two training scripts unrunnable on `main` for months,
@@ -290,6 +290,11 @@ and the narrower lint scope was why nothing noticed. The other two are on the
 list for the same reason: an unstrict `zip()` truncates to the shorter sequence
 in silence, and a bare `except:` swallows `KeyboardInterrupt` alongside whatever
 it meant to catch.
+
+The research scripts used to be exempt from four more rules — long lines, unused
+variables, unused loop variables and mutable default arguments. They no longer
+are: every one passes repo-wide, so the exemption is gone. It had been hiding a
+mutable default argument and nine dead computations.
 
 The suite covers four levels, deliberately:
 

@@ -7,134 +7,135 @@ were previously duplicated across the 02/02b/03 scripts.
 """
 
 import re
+from dataclasses import dataclass
+
+# The phrase ladders below are scanned in the order they appear in
+# `extract_yes_no_answer`. That order is load-bearing and pinned by
+# `tests/test_analysis_lib.py::TestExtractYesNoAnswer` — see in particular the
+# test recording that "the image features a ..." is scored "yes" by
+# STRONG_AFFIRMATIVE before DESCRIPTIVE can call it unclear.
+_SCAN_WINDOW = 80  # characters of the answer the phrase scans look at
+
+STRONG_NEGATIVE = (
+    "there is no",
+    "there are no",
+    "there isn't",
+    "there aren't",
+    "not visible",
+    "cannot see",
+    "no visible",
+    "absence of",
+    "no sign of",
+    "does not show",
+    "does not feature",
+)
+
+STRONG_AFFIRMATIVE = (
+    "yes,",
+    "yes there",
+    "yes it",
+    "there is a",
+    "there are",
+    "shows a",
+    "features a",
+    "depicts a",
+    "contains a",
+    "includes a",
+    "has a",
+    "with a",
+    "shows the",
+    "features the",
+)
+
+DESCRIPTIVE = (
+    "the image features",
+    "the image shows",
+    "the image depicts",
+    "the scene features",
+    "the scene shows",
+)
+
+
+def _leading_answer(text: str) -> str | None:
+    """A bare "yes"/"no" at the very start, the common Stage 2 shape."""
+    if text.startswith("yes"):
+        return "yes"
+    if text.startswith("no"):
+        return "no"
+
+    words = text.split()
+    if words:
+        first = words[0].strip(".,!?")
+        if first in ("yes", "no"):
+            return first
+    return None
+
+
+def _phrase_answer(text: str) -> str | None:
+    """An explicit negation or affirmation in the opening of the answer."""
+    window = text[:_SCAN_WINDOW]
+    if any(phrase in window for phrase in STRONG_NEGATIVE):
+        return "no"
+    if any(phrase in window for phrase in STRONG_AFFIRMATIVE):
+        return "yes"
+    return None
+
+
+def _object_answer(text: str, question: str) -> str | None:
+    """Whether the object the question asked about is described in the answer.
+
+    Stage 3 answers in prose, so a caption that never names the queried object
+    must not read as "yes". Returns "unclear" rather than "no" when the object
+    is absent: not mentioning something is weak evidence it is not there.
+    """
+    match = re.search(r"is there (?:a |an )?(\w+)", question.lower())
+    if not match:
+        return None
+
+    obj = match.group(1)
+    window = text[:_SCAN_WINDOW]
+
+    if obj not in window:
+        return "unclear"
+    if f"the {obj}" in window:
+        return "yes"
+    if any(f"{obj} {preposition}" in window for preposition in ("is", "in", "on", "at")):
+        return "yes"
+    return None
 
 
 def extract_yes_no_answer(text: str, question: str = None) -> str:
-    """
-    Extract yes/no answer from model output.
-    Handles both concise answers (Stage 2) and elaborate answers (Stage 3).
+    """Reduce a model's free-form output to 'yes', 'no' or 'unclear'.
+
+    Handles both the concise answers Stage 2 produces and the prose Stage 3
+    produces. The checks are tried in a fixed order — a leading yes/no, then
+    explicit phrases, then (given the question) whether the queried object is
+    described — and anything reaching the end is 'unclear' rather than guessed.
 
     Args:
-        text: Generated text from model
-        question: Optional - the original question, used to check if queried object is mentioned
+        text: Generated text from the model.
+        question: The original question. Without it the object check is skipped
+            and generic descriptions fall through to 'unclear'.
 
     Returns:
         'yes', 'no', or 'unclear'
     """
     text_lower = text.lower().strip()
 
-    # Direct matches (most common for Stage 2)
-    if text_lower.startswith("yes"):
-        return "yes"
-    if text_lower.startswith("no"):
-        return "no"
+    answer = _leading_answer(text_lower) or _phrase_answer(text_lower)
+    if answer:
+        return answer
 
-    # Check first few words
-    words = text_lower.split()
-    if len(words) > 0:
-        first_word = words[0].strip(".,!?")
-        if first_word == "yes":
-            return "yes"
-        if first_word == "no":
-            return "no"
-
-    # Strong negative indicators (explicit negation)
-    strong_negative_phrases = [
-        "there is no",
-        "there are no",
-        "there isn't",
-        "there aren't",
-        "not visible",
-        "cannot see",
-        "no visible",
-        "absence of",
-        "no sign of",
-        "does not show",
-        "does not feature",
-    ]
-    for phrase in strong_negative_phrases:
-        if phrase in text_lower[:80]:
-            return "no"
-
-    # Strong affirmative indicators (explicit affirmation)
-    strong_affirmative_phrases = [
-        "yes,",
-        "yes there",
-        "yes it",
-        "there is a",
-        "there are",
-        "shows a",
-        "features a",
-        "depicts a",
-        "contains a",
-        "includes a",
-        "has a",
-        "with a",
-        "shows the",
-        "features the",
-    ]
-    for phrase in strong_affirmative_phrases:
-        if phrase in text_lower[:80]:
-            return "yes"
-
-    # For Stage 3: Check if the queried object is actually mentioned in the response
-    # This prevents treating generic captions as "yes" answers
     if question:
-        # Extract object from question: "Is there a/an X in the image?"
-        match = re.search(r"is there (?:a |an )?(\w+)", question.lower())
-        if match:
-            queried_object = match.group(1)
-            object_mentioned = queried_object in text_lower[:80]
+        answer = _object_answer(text_lower, question)
+        if answer:
+            return answer
 
-            if object_mentioned:
-                # Object is mentioned - check if it's in a descriptive context (likely yes)
-                # vs. a negative context
-                # If definite article precedes object, it's describing it (yes)
-                if f"the {queried_object}" in text_lower[:80]:
-                    return "yes"
-                # If possessive or descriptive phrase
-                if any(
-                    p in text_lower[:80]
-                    for p in [
-                        f"{queried_object} is",
-                        f"{queried_object} in",
-                        f"{queried_object} on",
-                        f"{queried_object} at",
-                    ]
-                ):
-                    return "yes"
-            else:
-                # Object NOT mentioned but we have descriptive text
-                # Could be describing something else in the image (maybe no, maybe unclear)
-                # If it's a generic truncated description, mark as unclear
-                if len(text_lower) < 20 or text_lower.endswith(
-                    (",", "and", "or", "with", "in", "a")
-                ):
-                    # Truncated or incomplete - unclear
-                    return "unclear"
-                # If it describes other objects, tentatively say no
-                # But this is weak evidence
-                return "unclear"
-
-    # Fallback: If no strong indicators and no question context, check generic patterns
-    # Descriptive patterns WITHOUT object mention are unclear (could be anything)
-    descriptive_patterns = [
-        "the image features",
-        "the image shows",
-        "the image depicts",
-        "the scene features",
-        "the scene shows",
-    ]
-    for pattern in descriptive_patterns:
-        if pattern in text_lower[:50]:
-            # Generic description without clear answer - unclear
-            return "unclear"
-
-    # Definite article at start suggests describing something, but we don't know what
-    if text_lower.startswith("the ") and len(words) > 2:
-        # Could be describing the queried object or something else
+    # No strong indicator: a generic description tells us nothing either way.
+    if any(pattern in text_lower[:50] for pattern in DESCRIPTIVE):
         return "unclear"
-
+    if text_lower.startswith("the ") and len(text_lower.split()) > 2:
+        return "unclear"
     return "unclear"
 
 
@@ -228,51 +229,83 @@ def extract_yes_no_answer_primed(text: str, question: str = None) -> str:
     return "unclear"
 
 
-def compute_metrics(answers: list[dict]) -> dict:
+@dataclass
+class ConfusionCounts:
+    """The four outcomes of a yes/no benchmark, plus the answers we could not read.
+
+    Counting these is the only part of POPE scoring that can be got wrong in a
+    way the numbers hide, so it happens once. Both metric presentations —
+    `compute_metrics` here and `compute_priming_metrics` in
+    `compare_priming_strategies` — derive from this rather than recounting.
     """
-    Compute POPE evaluation metrics.
 
-    Metrics:
-    - Accuracy: Overall correctness
-    - Precision: Of predicted yes, how many are truly yes?
-    - Recall: Of true yes, how many are predicted yes?
-    - F1: Harmonic mean of precision and recall
-    - Yes ratio: Proportion of yes answers (measures over-generation/hallucination)
+    true_positive: int = 0
+    false_positive: int = 0
+    true_negative: int = 0
+    false_negative: int = 0
+    unclear: int = 0
 
-    Args:
-        answers: List of dicts with 'answer' (ground truth) and 'predicted_answer'
+    @property
+    def answerable(self) -> int:
+        """Everything but the unreadable answers."""
+        return self.true_positive + self.false_positive + self.true_negative + self.false_negative
 
-    Returns:
-        Dict with metrics
+    @property
+    def total(self) -> int:
+        return self.answerable + self.unclear
+
+    @property
+    def correct(self) -> int:
+        return self.true_positive + self.true_negative
+
+    @property
+    def predicted_yes(self) -> int:
+        return self.true_positive + self.false_positive
+
+    @property
+    def predicted_no(self) -> int:
+        return self.true_negative + self.false_negative
+
+
+def confusion_counts(answers: list[dict]) -> ConfusionCounts:
+    """Tally predictions against ground truth.
+
+    Both fields are lower-cased before comparison. One of the two copies this
+    replaces did not, so a model answering "Yes" scored zero against a "yes"
+    ground truth without anything looking wrong.
     """
-    # Count outcomes
-    true_positive = 0  # Predicted yes, actually yes
-    false_positive = 0  # Predicted yes, actually no (hallucination!)
-    true_negative = 0  # Predicted no, actually no
-    false_negative = 0  # Predicted no, actually yes
-    unclear = 0
-
+    counts = ConfusionCounts()
     for item in answers:
-        gt = item["answer"].lower()
-        pred = item["predicted_answer"].lower()
+        truth = str(item["answer"]).strip().lower()
+        predicted = str(item["predicted_answer"]).strip().lower()
 
-        if pred == "unclear":
-            unclear += 1
-            continue
+        if predicted not in ("yes", "no"):
+            counts.unclear += 1
+        elif truth == "yes":
+            if predicted == "yes":
+                counts.true_positive += 1
+            else:
+                counts.false_negative += 1
+        else:
+            if predicted == "yes":
+                counts.false_positive += 1
+            else:
+                counts.true_negative += 1
+    return counts
 
-        if gt == "yes" and pred == "yes":
-            true_positive += 1
-        elif gt == "no" and pred == "yes":
-            false_positive += 1
-        elif gt == "no" and pred == "no":
-            true_negative += 1
-        elif gt == "yes" and pred == "no":
-            false_negative += 1
 
-    # Compute metrics
-    total = true_positive + false_positive + true_negative + false_negative
+def compute_metrics(answers: list[dict]) -> dict:
+    """POPE metrics as fractions in [0, 1].
 
-    if total == 0:
+    - Accuracy: overall correctness
+    - Precision: of predicted yes, how many are truly yes?
+    - Recall: of true yes, how many are predicted yes?
+    - F1: harmonic mean of precision and recall
+    - Yes ratio: proportion of yes answers (measures over-generation)
+    """
+    counts = confusion_counts(answers)
+
+    if counts.answerable == 0:
         return {
             "accuracy": 0.0,
             "precision": 0.0,
@@ -280,35 +313,29 @@ def compute_metrics(answers: list[dict]) -> dict:
             "f1": 0.0,
             "yes_ratio": 0.0,
             "num_samples": len(answers),
-            "num_unclear": unclear,
+            "num_unclear": counts.unclear,
         }
 
-    accuracy = (true_positive + true_negative) / total
-
-    precision = (
-        true_positive / (true_positive + false_positive)
-        if (true_positive + false_positive) > 0
-        else 0.0
-    )
-    recall = (
-        true_positive / (true_positive + false_negative)
-        if (true_positive + false_negative) > 0
-        else 0.0
-    )
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-
-    yes_ratio = (true_positive + false_positive) / total
+    accuracy = counts.correct / counts.answerable
+    precision = _ratio(counts.true_positive, counts.predicted_yes)
+    recall = _ratio(counts.true_positive, counts.true_positive + counts.false_negative)
+    f1 = _ratio(2 * precision * recall, precision + recall)
 
     return {
         "accuracy": accuracy,
         "precision": precision,
         "recall": recall,
         "f1": f1,
-        "yes_ratio": yes_ratio,
-        "true_positive": true_positive,
-        "false_positive": false_positive,
-        "true_negative": true_negative,
-        "false_negative": false_negative,
+        "yes_ratio": counts.predicted_yes / counts.answerable,
+        "true_positive": counts.true_positive,
+        "false_positive": counts.false_positive,
+        "true_negative": counts.true_negative,
+        "false_negative": counts.false_negative,
         "num_samples": len(answers),
-        "num_unclear": unclear,
+        "num_unclear": counts.unclear,
     }
+
+
+def _ratio(numerator: float, denominator: float) -> float:
+    """Guarded division — every POPE metric is undefined on an empty class."""
+    return numerator / denominator if denominator > 0 else 0.0

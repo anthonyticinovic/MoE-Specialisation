@@ -93,7 +93,8 @@ def create_comparison_table(
 
         lines.append("-" * 100)
         lines.append(
-            f"Hallucinations (FP): {s2['false_positive']:>7d}        {s3['false_positive']:>7d}        {s3['false_positive'] - s2['false_positive']:>+7d}"
+            f"Hallucinations (FP): {s2['false_positive']:>7d}        {s3['false_positive']:>7d}   "
+            f"     {s3['false_positive'] - s2['false_positive']:>+7d}"
         )
 
     lines.append("=" * 100)
@@ -125,7 +126,8 @@ def create_comparison_table(
             f"• {difficulty.capitalize()} - F1 Score: {f1_winner} wins by {f1_margin:.2f}%"
         )
         lines.append(
-            f"• {difficulty.capitalize()} - Hallucinations: Stage 3 has {abs(halluc_change)} {halluc_direction} ({halluc_change:+d})"
+            f"• {difficulty.capitalize()} - Hallucinations: Stage 3 has {abs(halluc_change)} "
+            f"{halluc_direction} ({halluc_change:+d})"
         )
 
     lines.append("=" * 100)

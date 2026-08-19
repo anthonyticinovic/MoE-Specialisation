@@ -10,88 +10,40 @@ import json
 import logging
 from pathlib import Path
 
+from analysis_scripts.pope_evaluation.pope_utils import confusion_counts
 from models.utils.common import setup_logging
 
 logger = logging.getLogger(__name__)
 
 
-def compute_metrics(results):
-    """Compute POPE metrics from results"""
-    correct = 0
-    total = 0
-    yes_count = 0
-    no_count = 0
-    unclear_count = 0
+def compute_priming_metrics(results):
+    """POPE metrics as percentages, plus specificity and the answer breakdown.
 
-    true_positives = 0
-    false_positives = 0
-    true_negatives = 0
-    false_negatives = 0
+    A different presentation from ``pope_utils.compute_metrics`` — percentages
+    rather than fractions, and an extra specificity column — which is why both
+    exist. The *counting* is shared, so the two can no longer disagree about
+    what a correct answer is: this copy used to compare the raw strings without
+    lower-casing them, scoring a model that answered "Yes" as always wrong.
+    """
+    counts = confusion_counts(results)
 
-    for item in results:
-        pred = item["predicted_answer"]
-        true_answer = item["answer"]
+    def pct(numerator, denominator):
+        return (numerator / denominator * 100) if denominator > 0 else 0
 
-        total += 1
-
-        if pred == "unclear":
-            unclear_count += 1
-            continue
-
-        if pred == "yes":
-            yes_count += 1
-        elif pred == "no":
-            no_count += 1
-
-        if pred == true_answer:
-            correct += 1
-            if pred == "yes":
-                true_positives += 1
-            else:
-                true_negatives += 1
-        else:
-            if pred == "yes":
-                false_positives += 1
-            else:
-                false_negatives += 1
-
-    # Calculate metrics
-    answerable = total - unclear_count
-    accuracy = (correct / answerable * 100) if answerable > 0 else 0
-    unclear_pct = (unclear_count / total * 100) if total > 0 else 0
-
-    precision = (
-        (true_positives / (true_positives + false_positives) * 100)
-        if (true_positives + false_positives) > 0
-        else 0
-    )
-    recall = (
-        (true_positives / (true_positives + false_negatives) * 100)
-        if (true_positives + false_negatives) > 0
-        else 0
-    )
-    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0
-
-    specificity = (
-        (true_negatives / (true_negatives + false_positives) * 100)
-        if (true_negatives + false_positives) > 0
-        else 0
-    )
-
-    yes_pct = (yes_count / answerable * 100) if answerable > 0 else 0
-    no_pct = (no_count / answerable * 100) if answerable > 0 else 0
+    precision = pct(counts.true_positive, counts.predicted_yes)
+    recall = pct(counts.true_positive, counts.true_positive + counts.false_negative)
 
     return {
-        "accuracy": accuracy,
+        "accuracy": pct(counts.correct, counts.answerable),
         "precision": precision,
         "recall": recall,
-        "specificity": specificity,
-        "f1": f1,
-        "yes_pct": yes_pct,
-        "no_pct": no_pct,
-        "unclear_pct": unclear_pct,
-        "answerable": answerable,
-        "total": total,
+        "specificity": pct(counts.true_negative, counts.true_negative + counts.false_positive),
+        "f1": (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0,
+        "yes_pct": pct(counts.predicted_yes, counts.answerable),
+        "no_pct": pct(counts.predicted_no, counts.answerable),
+        "unclear_pct": pct(counts.unclear, counts.total),
+        "answerable": counts.answerable,
+        "total": counts.total,
     }
 
 
@@ -146,7 +98,7 @@ def main():
             with open(answer_file) as f:
                 results = json.load(f)
 
-            metrics = compute_metrics(results)
+            metrics = compute_priming_metrics(results)
             all_results[strategy][difficulty] = metrics
 
     # Print comparison table
@@ -161,7 +113,8 @@ def main():
         logger.info(f"{'=' * 80}")
         logger.info("")
         logger.info(
-            f"{'Strategy':<20} {'Accuracy':<10} {'Yes%':<10} {'No%':<10} {'Unclear%':<10} {'F1':<10}"
+            f"{'Strategy':<20} {'Accuracy':<10} {'Yes%':<10} {'No%':<10} {'Unclear%':<10} "
+            f"{'F1':<10}"
         )
         logger.info("-" * 80)
 
@@ -172,7 +125,8 @@ def main():
 
             m = all_results[strategy][difficulty]
             logger.info(
-                f"{strategy:<20} {m['accuracy']:>9.1f}% {m['yes_pct']:>9.1f}% {m['no_pct']:>9.1f}% {m['unclear_pct']:>9.1f}% {m['f1']:>9.1f}"
+                f"{strategy:<20} {m['accuracy']:>9.1f}% {m['yes_pct']:>9.1f}% "
+                f"{m['no_pct']:>9.1f}% {m['unclear_pct']:>9.1f}% {m['f1']:>9.1f}"
             )
 
         logger.info("")
@@ -207,7 +161,8 @@ def main():
     for strategy in strategies:
         if strategy in avg_accuracies:
             logger.info(
-                f"{strategy:<20} {avg_accuracies[strategy]:>14.1f}% {avg_unclear[strategy]:>14.1f}% {avg_no_pct[strategy]:>9.1f}%"
+                f"{strategy:<20} {avg_accuracies[strategy]:>14.1f}% "
+                f"{avg_unclear[strategy]:>14.1f}% {avg_no_pct[strategy]:>9.1f}%"
             )
 
     logger.info("")

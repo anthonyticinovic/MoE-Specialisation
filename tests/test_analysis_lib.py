@@ -319,3 +319,302 @@ def test_no_source_file_is_oversized(path):
         f"{path.relative_to(REPO)} is {count} lines. Split it along a seam that "
         "already exists — extraction vs metrics, analysis vs plotting, setup vs loop."
     )
+
+
+class TestExtractConceptSamples:
+    """The COCO concept sampler, which used to exist in three copies.
+
+    Two were identical (one an override of the other); the third also handled
+    compound concepts. The compound-aware one is what survived, so single-word
+    behaviour has to be shown unchanged and compound behaviour shown to work.
+    """
+
+    @staticmethod
+    def _annotations(tmp_path, captions):
+        payload = {
+            "images": [{"id": i, "file_name": f"{i:012d}.jpg"} for i in range(len(captions))],
+            "annotations": [
+                {"id": i, "image_id": i, "caption": caption} for i, caption in enumerate(captions)
+            ],
+        }
+        path = tmp_path / "captions.json"
+        path.write_text(json.dumps(payload))
+        return str(path)
+
+    def _run(self, tmp_path, captions, concepts, per_concept=10):
+        from analysis_scripts._lib import extract_concept_samples
+
+        return extract_concept_samples(self._annotations(tmp_path, captions), concepts, per_concept)
+
+    def test_single_word_concepts_match_whole_words(self, tmp_path):
+        samples = self._run(
+            tmp_path, ["a cat on a mat", "a dog outside", "a catapult launches"], ["cat", "dog"]
+        )
+        assert [s["caption"] for s in samples["cat"]] == ["a cat on a mat"]
+        assert [s["caption"] for s in samples["dog"]] == ["a dog outside"]
+
+    def test_ambiguous_captions_are_skipped(self, tmp_path):
+        """A caption naming two concepts would appear on both sides of a
+        comparison, so it belongs to neither."""
+        samples = self._run(tmp_path, ["a cat and a dog", "just a cat"], ["cat", "dog"])
+        assert len(samples["cat"]) == 1
+        assert samples["dog"] == []
+
+    def test_compound_concepts_match_all_parts_in_any_order(self, tmp_path):
+        """`red_apple` matches a caption with both words.
+
+        Two of the three old copies compared `"red_apple"` against the caption's
+        words directly. No caption contains an underscore, so they returned an
+        empty set for every compound concept without saying why.
+        """
+        samples = self._run(
+            tmp_path,
+            ["a red apple on a table", "an apple that is red", "a green apple", "a red car"],
+            ["red_apple"],
+        )
+        assert len(samples["red_apple"]) == 2
+
+    def test_the_per_concept_cap_is_respected(self, tmp_path):
+        samples = self._run(tmp_path, [f"a cat number {i}" for i in range(10)], ["cat"], 3)
+        assert len(samples["cat"]) == 3
+
+    def test_every_sample_carries_the_keys_the_analyses_read(self, tmp_path):
+        samples = self._run(tmp_path, ["a cat"], ["cat"])
+        assert set(samples["cat"][0]) == {"image_id", "caption", "image_path", "concept"}
+
+    def test_under_sampling_is_warned_about(self, tmp_path, caplog):
+        """The analyses weight concepts equally, so an unbalanced set skews them."""
+        with caplog.at_level("WARNING"):
+            self._run(tmp_path, ["a cat"], ["cat", "dog"], per_concept=5)
+        assert "Under-sampled" in caplog.text
+
+
+class TestPopeMetrics:
+    """POPE scoring, which existed twice under one name.
+
+    `pope_utils.compute_metrics` returns fractions; the copy in
+    `compare_priming_strategies` returned percentages with an extra specificity
+    column. Both are wanted, so the *counting* is now shared and only the
+    presentation differs — which is what stops them disagreeing about what a
+    correct answer is.
+    """
+
+    ANSWERS = [
+        {"answer": "yes", "predicted_answer": "yes"},  # true positive
+        {"answer": "yes", "predicted_answer": "no"},  # false negative
+        {"answer": "no", "predicted_answer": "yes"},  # false positive
+        {"answer": "no", "predicted_answer": "no"},  # true negative
+        {"answer": "no", "predicted_answer": "unclear"},  # unreadable
+    ]
+
+    def _counts(self):
+        from analysis_scripts.pope_evaluation.pope_utils import confusion_counts
+
+        return confusion_counts(self.ANSWERS)
+
+    def test_each_outcome_is_counted_once(self):
+        counts = self._counts()
+        assert (counts.true_positive, counts.false_positive) == (1, 1)
+        assert (counts.true_negative, counts.false_negative) == (1, 1)
+        assert counts.unclear == 1
+
+    def test_unreadable_answers_are_excluded_from_the_denominator(self):
+        """Scoring an unreadable answer as wrong would understate accuracy."""
+        counts = self._counts()
+        assert counts.answerable == 4
+        assert counts.total == 5
+
+    def test_case_and_whitespace_do_not_change_the_score(self):
+        """The `compare_priming_strategies` copy compared raw strings.
+
+        A model answering "Yes" scored zero against a "yes" ground truth, and
+        nothing about the output looked wrong.
+        """
+        from analysis_scripts.pope_evaluation.pope_utils import confusion_counts
+
+        mixed = [
+            {"answer": "yes", "predicted_answer": " Yes "},
+            {"answer": "no", "predicted_answer": "NO"},
+        ]
+        counts = confusion_counts(mixed)
+        assert (counts.true_positive, counts.true_negative) == (1, 1)
+        assert counts.false_positive == counts.false_negative == 0
+
+    def test_the_two_presentations_agree_up_to_a_factor_of_100(self):
+        import importlib
+
+        from analysis_scripts.pope_evaluation.pope_utils import compute_metrics
+
+        priming = importlib.import_module(
+            "analysis_scripts.pope_evaluation.compare_priming_strategies"
+        )
+        fractions = compute_metrics(self.ANSWERS)
+        percentages = priming.compute_priming_metrics(self.ANSWERS)
+
+        for key in ("accuracy", "precision", "recall", "f1"):
+            assert fractions[key] * 100 == pytest.approx(percentages[key]), key
+
+    def test_an_empty_run_scores_zero_rather_than_dividing_by_zero(self):
+        from analysis_scripts.pope_evaluation.pope_utils import compute_metrics
+
+        metrics = compute_metrics([{"answer": "no", "predicted_answer": "unclear"}])
+        assert metrics["accuracy"] == 0.0
+        assert metrics["num_unclear"] == 1
+
+
+class TestExtractYesNoAnswer:
+    """Characterisation tests for the POPE answer extractor.
+
+    A 126-line ladder of string heuristics turning free-form model output into
+    yes/no/unclear. Every POPE number depends on it and nothing tested it. These
+    pin the behaviour as it stands so the ladder can be reorganised safely —
+    they document what it does, not what it ought to do.
+    """
+
+    @staticmethod
+    def _extract(text, question=None):
+        from analysis_scripts.pope_evaluation.pope_utils import extract_yes_no_answer
+
+        return extract_yes_no_answer(text, question)
+
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            ("Yes", "yes"),
+            ("yes, there is a dog", "yes"),
+            ("No", "no"),
+            ("No.", "no"),
+            ("  YES  ", "yes"),
+            ("There is no dog in the image", "no"),
+            ("There are no cats here", "no"),
+            ("The object is not visible", "no"),
+            ("I cannot see any dog", "no"),
+            ("There is a dog on the grass", "yes"),
+            ("The image shows a dog", "yes"),
+            ("It contains a bicycle", "yes"),
+            # Note the ordering effect documented below: this is "yes".
+            ("The image features a sunny day", "yes"),
+            ("Maybe", "unclear"),
+            ("", "unclear"),
+        ],
+    )
+    def test_direct_and_phrase_matches(self, text, expected):
+        assert self._extract(text) == expected
+
+    def test_a_question_lets_it_check_the_queried_object(self):
+        """Stage 3 answers in prose, so a generic caption must not read as yes."""
+        question = "Is there a dog in the image?"
+        assert self._extract("The dog is running across the field", question) == "yes"
+
+    def test_a_caption_about_something_else_is_unclear_not_no(self):
+        """Weak evidence is reported as weak rather than guessed at."""
+        question = "Is there a dog in the image?"
+        assert self._extract("A person stands beside a bright red bicycle", question) == "unclear"
+
+    def test_a_truncated_answer_is_unclear(self):
+        question = "Is there a dog in the image?"
+        assert self._extract("A man and", question) == "unclear"
+
+    @pytest.mark.parametrize(
+        "caption",
+        [
+            "The image features a sunny day",
+            "The image shows a person riding a bicycle",
+            "The image depicts a busy street",
+        ],
+    )
+    def test_a_generic_caption_scores_yes_regardless_of_the_question(self, caption):
+        """**Known defect, pinned rather than fixed.**
+
+        The affirmative phrase list contains "features a", "shows a" and
+        "depicts a", and it is scanned *before* the descriptive-pattern list
+        that exists to mark "the image features ..." unclear. So any caption of
+        that shape counts as "yes" even when the queried object is absent —
+        note the third case answers "Is there a dog?" with a street scene.
+
+        Stage 3 collapsed into producing exactly these generic captions, so this
+        plausibly inflates its POPE yes-rate. Changing the order would change
+        published numbers, so it is recorded here and raised in the improvement
+        plan rather than quietly corrected.
+        """
+        assert self._extract(caption, "Is there a dog in the image?") == "yes"
+
+    def test_a_plural_object_mention_escapes_the_affirmative_list(self):
+        """ "features two dogs" has no "a", so it falls through to the object check."""
+        assert self._extract("The image features two dogs", "Is there a dog in the image?") == (
+            "unclear"
+        )
+
+    def test_only_the_opening_of_a_long_answer_is_examined(self):
+        """The phrase scans are windowed, so a late negation does not count.
+
+        Worth pinning: it is a deliberate limit, and a reorganisation that
+        widened the window would silently change every POPE number.
+        """
+        padding = "x" * 100
+        assert self._extract(f"{padding} there is no dog") == "unclear"
+
+
+# Functions over 120 lines that predate the limit. Every one is in analysis
+# code the demo cannot reach, so a refactor of it cannot be verified by
+# anything — splitting them is deliberately deferred until they are executable
+# (see the analysis-coverage note in analysis_scripts/README.md).
+#
+# The list may shrink. It must never grow: adding an entry means writing a new
+# 120-line function, which is what this test exists to prevent.
+KNOWN_OVERSIZED_FUNCTIONS = {
+    "analysis_scripts/attention_routing_analysis.py::_compute_attention_statistics",
+    "analysis_scripts/attention_routing_plots.py::plot_attention_routing_evolution",
+    "analysis_scripts/attention_routing_plots.py::plot_expert_attention_correlation",
+    "analysis_scripts/compositional_case_study.py::run_analysis",
+    "analysis_scripts/cross_concept_similarity_matrix.py::main",
+    "analysis_scripts/cross_modality_purity.py::_visualize_results",
+    "analysis_scripts/cross_modality_purity.py::run_stage3_alignment_analysis",
+    "analysis_scripts/karpathy_evaluation/04_generate_captions.py::generate_captions",
+    "analysis_scripts/layer_clustering_analysis.py::collect_representations",
+    "analysis_scripts/layer_clustering_analysis.py::main",
+    "analysis_scripts/layer_clustering_plots.py::plot_clustering_analysis",
+    "analysis_scripts/llava_evaluation/01_llava_wild_eval.py::main",
+    "analysis_scripts/pope_evaluation/01_generate_pope_questions.py::generate_pope_questions_for_image",
+    "analysis_scripts/pope_evaluation/02_generate_pope_answers.py::generate_answers_primed",
+    "analysis_scripts/pope_evaluation/02_generate_pope_answers.py::generate_pope_answers",
+    "analysis_scripts/pope_evaluation/compare_priming_strategies.py::main",
+}
+MAX_FUNCTION_LINES = 120
+
+
+def _oversized_functions() -> set[str]:
+    found = set()
+    for path in SOURCE_FILES:
+        for node in ast.walk(ast.parse(path.read_text())):
+            if (
+                isinstance(node, ast.FunctionDef)
+                and node.end_lineno - node.lineno > MAX_FUNCTION_LINES
+            ):
+                found.add(f"{path.relative_to(REPO).as_posix()}::{node.name}")
+    return found
+
+
+def test_no_new_function_exceeds_the_line_limit():
+    """A ratchet, not a clean bill of health.
+
+    The training scripts have enforced this limit since their refactor; this
+    extends it to everything else without pretending the backlog is gone. New
+    offenders fail immediately; the known ones are listed above with the reason
+    they are still there.
+    """
+    new = _oversized_functions() - KNOWN_OVERSIZED_FUNCTIONS
+    assert not new, (
+        f"{len(new)} new function(s) over {MAX_FUNCTION_LINES} lines: {sorted(new)}. "
+        "Split it rather than adding it to KNOWN_OVERSIZED_FUNCTIONS."
+    )
+
+
+def test_the_oversized_list_has_no_stale_entries():
+    """Splitting one of them must also remove it from the list.
+
+    Otherwise the backlog looks larger than it is and the next person cannot
+    tell which entries are real.
+    """
+    stale = KNOWN_OVERSIZED_FUNCTIONS - _oversized_functions()
+    assert not stale, f"no longer oversized, remove from the list: {sorted(stale)}"

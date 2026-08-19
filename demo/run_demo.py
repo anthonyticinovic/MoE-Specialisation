@@ -119,6 +119,28 @@ def main() -> int:
     logs_dir = output_root / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
 
+    _fill_in_runtime_commands(output_root, args)
+
+    # The scripts read paths from MOE_CONFIG; everything else mirrors a normal
+    # local run. HF_HUB_OFFLINE guarantees the demo never reaches the network.
+    env = {
+        **os.environ,
+        "MOE_CONFIG": str(config_path),
+        "PYTHONPATH": str(REPO_ROOT),
+        "HF_HUB_OFFLINE": "1",
+        "TOKENIZERS_PARALLELISM": "false",
+    }
+
+    results = _run_stages(args.stages, env, logs_dir)
+    return _report(output_root, results, args.stages)
+
+
+def _fill_in_runtime_commands(output_root: Path, args: argparse.Namespace) -> None:
+    """Fill in the stages whose command lines depend on where the run writes.
+
+    Stage 0 and the two analysis steps take paths that only exist once the
+    output root is known, so their entries in STAGES start empty.
+    """
     fixtures = output_root / "fixtures"
     STAGES["0"] = (
         "Stage 0 — build MoE model",
@@ -172,29 +194,28 @@ def main() -> int:
         ],
     )
 
-    # The scripts read paths from MOE_CONFIG; everything else mirrors a normal
-    # local run. HF_HUB_OFFLINE guarantees the demo never reaches the network.
-    env = {
-        **os.environ,
-        "MOE_CONFIG": str(config_path),
-        "PYTHONPATH": str(REPO_ROOT),
-        "HF_HUB_OFFLINE": "1",
-        "TOKENIZERS_PARALLELISM": "false",
-    }
 
+def _run_stages(
+    stages: list[str], env: dict[str, str], logs_dir: Path
+) -> list[tuple[str, bool, float]]:
+    """Run each stage in order, stopping at the first failure."""
     results: list[tuple[str, bool, float]] = []
-    for stage in args.stages:
+    for stage in stages:
         label, command = STAGES[stage]
         ok, elapsed = _run(label, command, env, logs_dir / f"stage_{stage}.log")
         results.append((label, ok, elapsed))
         if not ok:
             logger.error("\nPipeline stopped at %s.", label)
             break
+    return results
 
-    report_path, check_results = report.write_report(output_root, results, args.stages)
+
+def _report(output_root: Path, results: list[tuple[str, bool, float]], stages: list[str]) -> int:
+    """Write the report, print the summary, and return the process exit code."""
+    report_path, check_results = report.write_report(output_root, results, stages)
     total = sum(elapsed for _, _, elapsed in results)
 
-    stages_ok = all(ok for _, ok, _ in results) and len(results) == len(args.stages)
+    stages_ok = all(ok for _, ok, _ in results) and len(results) == len(stages)
     failed_checks = [check for check in check_results if not check.passed]
 
     logger.info("\n%s", "─" * 58)

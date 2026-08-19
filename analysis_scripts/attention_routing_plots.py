@@ -149,7 +149,8 @@ def plot_expert_attention_correlation(
     Plots mean text→vision attention for Expert 0 vs Expert 1 across all layers.
 
     Args:
-        layer_token_data: Dict mapping layer_idx -> {'expert0_attentions': [...], 'expert1_attentions': [...]}
+        layer_token_data: Dict mapping layer_idx -> {'expert0_attentions': [...],
+            'expert1_attentions': [...]}
         output_dir: Directory to save plot
     """
     logger.info("\nGenerating expert-attention correlation plot (token-level)...")

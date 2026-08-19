@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 class RepresentationExtractionMixin:
     def _prepare_vision_input(self, concept: str) -> torch.Tensor:
-        """Generate synthetic image or load from file path and convert to visual tokens via vision connector.
+        """Generate or load an image and project it to visual tokens.
 
         Args:
             concept: Concept to generate image for, or file path to image

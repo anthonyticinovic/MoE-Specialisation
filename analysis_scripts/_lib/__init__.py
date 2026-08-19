@@ -4,6 +4,7 @@ Consolidates config loading, model loading, representation maths, plotting
 helpers and I/O that were previously copy-pasted across the analysis scripts.
 """
 
+from analysis_scripts._lib.coco_samples import extract_concept_samples
 from analysis_scripts._lib.config import (
     get_paths,
     load_analysis_config,
@@ -33,6 +34,7 @@ __all__ = [
     "LoadedModels",
     "SyntheticImageGenerator",
     "compute_cosine_similarity_matrix",
+    "extract_concept_samples",
     "format_time",
     "get_paths",
     "load_analysis_config",

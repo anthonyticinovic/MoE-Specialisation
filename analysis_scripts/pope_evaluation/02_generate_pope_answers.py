@@ -139,11 +139,15 @@ def generate_pope_answers(
                     question_text = question_data["question"]
 
                     # Format prompt for yes/no question
-                    # For Stage 3 (instruction-tuned): Use strong, explicit anti-hallucination prompt
+                    # For Stage 3 (instruction-tuned): Use strong, explicit
+                    # anti-hallucination prompt
                     # For Stage 2 (caption-only): Simple prompting
                     if is_stage3:
                         # Strong anti-hallucination prompt with explicit constraints
-                        prompt = f"{question_text}\nAnswer only 'yes' or 'no'. Do not generate descriptions."
+                        prompt = (
+                            f"{question_text}\nAnswer only 'yes' or 'no'. "
+                            "Do not generate descriptions."
+                        )
                     else:
                         prompt = f"{question_text} Answer:"
 
@@ -183,7 +187,7 @@ def generate_pope_answers(
                     # Generate answer tokens autoregressively
                     generated_ids = input_ids[0].tolist()
 
-                    for step in range(max_new_tokens):
+                    for _step in range(max_new_tokens):
                         # Forward pass
                         outputs = model.llm(
                             inputs_embeds=combined_embeddings,
@@ -428,7 +432,7 @@ def generate_answers_primed(
                     # Generate answer tokens autoregressively
                     generated_ids = input_ids[0].tolist()
 
-                    for step in range(max_new_tokens):
+                    for _step in range(max_new_tokens):
                         # Forward pass
                         outputs = model.llm(
                             inputs_embeds=combined_embeddings,

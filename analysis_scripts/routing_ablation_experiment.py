@@ -139,6 +139,115 @@ def compute_loss_single_example(
         return outputs.loss.item()
 
 
+def _build_val_loader(config, processor, tokenizer, data_path, image_dir, annotations_file):
+    """The COCO validation split the ablation scores.
+
+    By convention ``data_path`` is a COCO root holding ``val2017/`` and
+    ``annotations/``, defaulting to the parent of the training ``image_dir``.
+    ``image_dir``/``annotations_file`` override that convention outright, which
+    is what lets the demo point this at its own fixtures.
+    """
+    from torch.utils.data import DataLoader
+
+    from data.COCO_loader import COCO_Loader
+
+    if data_path is None:
+        data_path = str(Path(config["paths"]["image_dir"]).parent)
+    coco_root = Path(data_path)
+    image_dir = image_dir or str(coco_root / "val2017")
+    annotations_file = annotations_file or str(coco_root / "annotations" / "captions_val2017.json")
+
+    logger.info(f"Loading data from {image_dir}...")
+    val_dataset = COCO_Loader(
+        image_dir=image_dir,
+        annotations_file=annotations_file,
+        clip_processor=processor,
+        tokenizer=tokenizer,
+        subset_fraction=1.0,
+        split="val",
+    )
+    return DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0)
+
+
+def _score_both_routings(models, val_loader, num_samples, device):
+    """Loss for every sample under normal and then flipped routing.
+
+    Both are measured on the *same* sample before moving on, so the pairing the
+    demo's per-sample invariant relies on cannot drift.
+    """
+    clip_model, vision_connector, llm = models
+    normal_losses, flipped_losses = [], []
+
+    logger.info(f"\nEvaluating {num_samples} samples...")
+    logger.info("  Normal routing: vision → Expert 0, text → Expert 1")
+    logger.info("  Flipped routing: vision → Expert 1, text → Expert 0")
+    logger.info("")
+
+    for i, batch in enumerate(tqdm(val_loader, total=num_samples)):
+        if i >= num_samples:
+            break
+        # COCO_Loader returns (image_processed, input_ids, attention_mask)
+        pixel_values, input_ids, _ = batch
+
+        for vision_expert, text_expert, into in (
+            (0, 1, normal_losses),  # the trained configuration
+            (1, 0, flipped_losses),  # the ablation
+        ):
+            into.append(
+                compute_loss_single_example(
+                    clip_model,
+                    vision_connector,
+                    llm,
+                    pixel_values,
+                    input_ids,
+                    vision_expert_id=vision_expert,
+                    text_expert_id=text_expert,
+                    device=device,
+                )
+            )
+
+    return normal_losses, flipped_losses
+
+
+def _summarise(normal_losses, flipped_losses, num_samples):
+    """Turn the two loss lists into the results dict, and report the verdict."""
+    normal_mean, normal_std = np.mean(normal_losses), np.std(normal_losses)
+    flipped_mean, flipped_std = np.mean(flipped_losses), np.std(flipped_losses)
+    delta = flipped_mean - normal_mean
+    delta_percent = (delta / normal_mean) * 100
+
+    logger.info("\n" + "=" * 80)
+    logger.info("RESULTS")
+    logger.info("=" * 80)
+    logger.info("\nNormal Routing (vision=0, text=1):")
+    logger.info(f"  Mean Loss: {normal_mean:.4f} ± {normal_std:.4f}")
+    logger.info("\nFlipped Routing (vision=1, text=0):")
+    logger.info(f"  Mean Loss: {flipped_mean:.4f} ± {flipped_std:.4f}")
+    logger.info(f"\nΔ Loss (Flipped - Normal): {delta:+.4f} ({delta_percent:+.1f}%)")
+
+    if delta > 0:
+        logger.info(f"\nVALIDATION: Flipped routing has {delta_percent:.1f}% higher loss!")
+        logger.info("   This confirms that expert specialisation is meaningful.")
+    else:
+        logger.warning("\n UNEXPECTED: Flipped routing has lower loss!")
+        logger.info("   This suggests experts may not be specialised as expected.")
+
+    return {
+        "num_samples": num_samples,
+        "normal_routing": {
+            "mean": float(normal_mean),
+            "std": float(normal_std),
+            "losses": [float(loss) for loss in normal_losses],
+        },
+        "flipped_routing": {
+            "mean": float(flipped_mean),
+            "std": float(flipped_std),
+            "losses": [float(loss) for loss in flipped_losses],
+        },
+        "delta": {"absolute": float(delta), "percent": float(delta_percent)},
+    }
+
+
 def run_routing_ablation(
     checkpoint_path,
     data_path,
@@ -174,136 +283,28 @@ def run_routing_ablation(
     logger.info(f"Device: {device}")
     logger.info("")
 
-    # Load model
     clip_model, vision_connector, llm, tokenizer, processor = load_stage2_model(
         checkpoint_path, config, device
     )
-
-    # Put models in eval mode
     clip_model.eval()
     vision_connector.eval()
     llm.eval()
 
-    # Load data. By convention data_path is a COCO root holding val2017/ and
-    # annotations/, defaulting to the parent of the training image_dir.
-    # image_dir/annotations_file override that convention outright, which is
-    # what lets the demo point this at its own fixtures.
-    if data_path is None:
-        data_path = str(Path(config["paths"]["image_dir"]).parent)
-    coco_root = Path(data_path)
-    image_dir = image_dir or str(coco_root / "val2017")
-    annotations_file = annotations_file or str(coco_root / "annotations" / "captions_val2017.json")
-    logger.info(f"Loading data from {image_dir}...")
-    from torch.utils.data import DataLoader
-
-    from data.COCO_loader import COCO_Loader
-
-    val_dataset = COCO_Loader(
-        image_dir=image_dir,
-        annotations_file=annotations_file,
-        clip_processor=processor,
-        tokenizer=tokenizer,
-        subset_fraction=1.0,
-        split="val",
+    val_loader = _build_val_loader(
+        config, processor, tokenizer, data_path, image_dir, annotations_file
     )
-
-    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0)
-
-    # Collect losses
-    normal_losses = []  # vision=0, text=1 (trained configuration)
-    flipped_losses = []  # vision=1, text=0 (ablation)
-
-    logger.info(f"\nEvaluating {num_samples} samples...")
-    logger.info("  Normal routing: vision → Expert 0, text → Expert 1")
-    logger.info("  Flipped routing: vision → Expert 1, text → Expert 0")
-    logger.info("")
-
-    for i, batch in enumerate(tqdm(val_loader, total=num_samples)):
-        if i >= num_samples:
-            break
-
-        # COCO_Loader returns (image_processed, input_ids, attention_mask)
-        pixel_values, input_ids, attention_mask = batch
-
-        # Normal routing (vision=0, text=1)
-        loss_normal = compute_loss_single_example(
-            clip_model,
-            vision_connector,
-            llm,
-            pixel_values,
-            input_ids,
-            vision_expert_id=0,
-            text_expert_id=1,
-            device=device,
-        )
-        normal_losses.append(loss_normal)
-
-        # Flipped routing (vision=1, text=0)
-        loss_flipped = compute_loss_single_example(
-            clip_model,
-            vision_connector,
-            llm,
-            pixel_values,
-            input_ids,
-            vision_expert_id=1,
-            text_expert_id=0,
-            device=device,
-        )
-        flipped_losses.append(loss_flipped)
-
-    # Compute statistics
-    normal_mean = np.mean(normal_losses)
-    normal_std = np.std(normal_losses)
-    flipped_mean = np.mean(flipped_losses)
-    flipped_std = np.std(flipped_losses)
-
-    delta = flipped_mean - normal_mean
-    delta_percent = (delta / normal_mean) * 100
-
-    # Results
-    logger.info("\n" + "=" * 80)
-    logger.info("RESULTS")
-    logger.info("=" * 80)
-    logger.info("\nNormal Routing (vision=0, text=1):")
-    logger.info(f"  Mean Loss: {normal_mean:.4f} ± {normal_std:.4f}")
-    logger.info("\nFlipped Routing (vision=1, text=0):")
-    logger.info(f"  Mean Loss: {flipped_mean:.4f} ± {flipped_std:.4f}")
-    logger.info(f"\nΔ Loss (Flipped - Normal): {delta:+.4f} ({delta_percent:+.1f}%)")
-
-    if delta > 0:
-        logger.info(f"\nVALIDATION: Flipped routing has {delta_percent:.1f}% higher loss!")
-        logger.info("   This confirms that expert specialisation is meaningful.")
-    else:
-        logger.warning("\n UNEXPECTED: Flipped routing has lower loss!")
-        logger.info("   This suggests experts may not be specialised as expected.")
-
-    # Save results
-    results = {
-        "num_samples": num_samples,
-        "normal_routing": {
-            "mean": float(normal_mean),
-            "std": float(normal_std),
-            "losses": [float(loss) for loss in normal_losses],
-        },
-        "flipped_routing": {
-            "mean": float(flipped_mean),
-            "std": float(flipped_std),
-            "losses": [float(loss) for loss in flipped_losses],
-        },
-        "delta": {"absolute": float(delta), "percent": float(delta_percent)},
-    }
+    normal_losses, flipped_losses = _score_both_routings(
+        (clip_model, vision_connector, llm), val_loader, num_samples, device
+    )
+    results = _summarise(normal_losses, flipped_losses, num_samples)
 
     output_dir = Path(output_dir or "results/routing_ablation")
     output_dir.mkdir(parents=True, exist_ok=True)
-
     with open(output_dir / "routing_ablation_results.json", "w") as f:
         json.dump(results, f, indent=2)
 
     logger.info(f"\nResults saved to: {output_dir / 'routing_ablation_results.json'}")
-
-    # Create visualisation
     create_visualization(normal_losses, flipped_losses, output_dir)
-
     return results
 
 

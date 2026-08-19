@@ -529,7 +529,7 @@ def main():
     )
 
     # Analyse attention and routing across all layers
-    layer_metrics = analyzer.analyze_attention_routing_across_layers(
+    analyzer.analyze_attention_routing_across_layers(
         samples=samples,
         image_dir=config["data"]["image_dir"],
         num_vision_tokens=config["analysis"]["num_vision_tokens"],

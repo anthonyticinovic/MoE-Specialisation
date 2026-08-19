@@ -169,7 +169,8 @@ def generate_captions(
                     # Get visual tokens for this image
                     visual_tokens = visual_soft_tokens[batch_idx : batch_idx + 1]  # (1, 257, 4096)
 
-                    # For Stage 3 (LLaVA-trained), add a question prompt to match training distribution
+                    # For Stage 3 (LLaVA-trained), add a question prompt to
+                    # match training distribution
                     # For Stage 2 (COCO-trained), just use BOS
                     if is_stage3:
                         # Prompt options (ranked by COCO-likeness):
@@ -222,7 +223,7 @@ def generate_captions(
                     period_tokens = tokenizer.encode(".", add_special_tokens=False)
                     period_id = period_tokens[0] if period_tokens else None
 
-                    for step in range(max_length - 1):
+                    for _step in range(max_length - 1):
                         # Forward pass
                         outputs = model.llm(
                             inputs_embeds=combined_embeddings,
@@ -247,7 +248,8 @@ def generate_captions(
                         # Early stopping: stop after first sentence (period token)
                         # This produces cleaner, more COCO-like captions
                         if period_id is not None and next_token.item() == period_id:
-                            # Check if we have at least a few words (avoid stopping on abbreviations)
+                            # Check if we have at least a few words
+                            # (avoid stopping on abbreviations)
                             if len(generated_ids) >= 8:  # At least ~6-7 words
                                 break
 

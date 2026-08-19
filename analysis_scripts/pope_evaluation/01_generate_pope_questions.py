@@ -94,7 +94,7 @@ def build_cooccurrence_matrix(
     """
     cooccurrence = {obj: Counter() for obj in all_objects}
 
-    for image_id, objects_in_image in image_objects.items():
+    for objects_in_image in image_objects.values():
         objects_list = list(objects_in_image)
         # For each pair of objects in the same image
         for i, obj1 in enumerate(objects_list):
@@ -279,7 +279,8 @@ def generate_pope_dataset(
     logger.info("\nGenerating POPE questions...")
     logger.info(f"   Num images: {num_images}")
     logger.info(
-        f"   Questions per image: {questions_per_image} positive + {questions_per_image} negative = {questions_per_image * 2} per difficulty"
+        f"   Questions per image: {questions_per_image} positive + {questions_per_image} negative "
+        f"= {questions_per_image * 2} per difficulty"
     )
     logger.info(
         f"   Total questions: {num_images * questions_per_image * 2 * 3} across 3 difficulties"
@@ -332,7 +333,8 @@ def generate_pope_dataset(
         num_yes = sum(1 for q in all_questions[difficulty] if q["answer"] == "yes")
         num_no = sum(1 for q in all_questions[difficulty] if q["answer"] == "no")
         logger.info(
-            f"   {difficulty.capitalize():12s}: {len(all_questions[difficulty])} questions ({num_yes} yes, {num_no} no)"
+            f"   {difficulty.capitalize():12s}: {len(all_questions[difficulty])} questions "
+            f"({num_yes} yes, {num_no} no)"
         )
 
     return all_questions

@@ -19,6 +19,7 @@ import numpy as np
 from analysis_scripts import cross_modality_purity_plots as cmp_plots
 from analysis_scripts._lib import (
     SyntheticImageGenerator,
+    extract_concept_samples,
     load_stage2_models,
     load_stage3_models,
     load_training_config,
@@ -93,80 +94,13 @@ class CrossModalityPurityAnalyzer(RepresentationExtractionMixin, PurityMetricsMi
     def extract_concept_samples(
         self, annotations_file: str, concepts: list[str], samples_per_concept: int, seed: int = 42
     ) -> dict[str, list[dict]]:
+        """Balanced concept sampling — see ``_lib.coco_samples``.
+
+        Kept as a method because subclasses and callers reach it through
+        ``self``; the implementation is shared so the three copies that used to
+        exist cannot drift apart again.
         """
-        Extract balanced samples from COCO annotations for specified concepts.
-
-        Args:
-            annotations_file: Path to COCO annotations JSON
-            concepts: List of concept keywords (e.g., ["cat", "dog", "car"])
-            samples_per_concept: Target number of samples per concept
-            seed: Random seed for reproducibility
-
-        Returns:
-            Dict mapping concept -> list of sample dicts with keys:
-                - 'image_id': COCO image ID
-                - 'caption': Image caption
-                - 'image_path': Relative path to image file
-        """
-        logger.info("Extracting concept samples from COCO annotations...")
-        logger.info(f"   Concepts: {concepts}")
-        logger.info(f"   Target: {samples_per_concept} samples per concept")
-
-        # Load COCO annotations
-        with open(annotations_file) as f:
-            coco_data = json.load(f)
-
-        # Build image_id -> image_path mapping
-        image_id_to_path = {}
-        for img in coco_data["images"]:
-            image_id_to_path[img["id"]] = img["file_name"]
-
-        # Set random seed
-        np.random.seed(seed)
-
-        # Extract samples for each concept
-        concept_samples = {concept: [] for concept in concepts}
-
-        for annotation in coco_data["annotations"]:
-            caption = annotation["caption"].lower()
-            image_id = annotation["image_id"]
-
-            # Check which concepts appear in this caption
-            matching_concepts = [c for c in concepts if c.lower() in caption.split()]
-
-            # Skip if multiple specified concepts appear (ambiguous)
-            if len(matching_concepts) > 1:
-                continue
-
-            # Skip if no concepts match
-            if len(matching_concepts) == 0:
-                continue
-
-            # Add to the matching concept's sample list
-            concept = matching_concepts[0]
-            if len(concept_samples[concept]) < samples_per_concept:
-                concept_samples[concept].append(
-                    {
-                        "image_id": image_id,
-                        "caption": annotation["caption"],
-                        "image_path": image_id_to_path[image_id],
-                        "concept": concept,
-                    }
-                )
-
-        # Print statistics
-        logger.info("\n   Extracted samples:")
-        for concept, samples in concept_samples.items():
-            logger.info(f"      {concept}: {len(samples)} samples")
-
-        # Warn if any concept is under-sampled
-        for concept, samples in concept_samples.items():
-            if len(samples) < samples_per_concept:
-                logger.warning(
-                    f"    Warning: Only found {len(samples)} samples for '{concept}' (target: {samples_per_concept})"
-                )
-
-        return concept_samples
+        return extract_concept_samples(annotations_file, concepts, samples_per_concept, seed)
 
     def run_comprehensive_analysis(
         self,
@@ -186,7 +120,8 @@ class CrossModalityPurityAnalyzer(RepresentationExtractionMixin, PurityMetricsMi
             Dictionary containing all analysis results
         """
         logger.info(
-            f"\nRunning comprehensive analysis on {len(concepts)} concepts across {len(layers)} layers..."
+            f"\nRunning comprehensive analysis on {len(concepts)} concepts across {len(layers)} "
+            f"layers..."
         )
 
         os.makedirs(output_dir, exist_ok=True)
@@ -254,7 +189,8 @@ class CrossModalityPurityAnalyzer(RepresentationExtractionMixin, PurityMetricsMi
                     }
 
                     logger.info(
-                        f"(cos_cls={cosine_sim:.3f}, cos_mp={cosine_sim_mp:.3f}, euc_cls={euclidean_dist:.2f}, euc_mp={euclidean_dist_mp:.2f})"
+                        f"(cos_cls={cosine_sim:.3f}, cos_mp={cosine_sim_mp:.3f}, "
+                        f"euc_cls={euclidean_dist:.2f}, euc_mp={euclidean_dist_mp:.2f})"
                     )
 
                 except Exception as e:
@@ -618,7 +554,8 @@ def main():
         type=str,
         default=None,
         metavar="CONFIG_PATH",
-        help="Run Stage 3 layer-by-layer alignment analysis (provide config path, e.g., configs/stage3_alignment.json)",
+        help="Run Stage 3 layer-by-layer alignment analysis (provide a config path, "
+        "e.g. configs/stage3_alignment.json)",
     )
 
     args = parser.parse_args()
@@ -632,7 +569,7 @@ def main():
         logger.info("=" * 80)
 
         analyzer = CrossModalityPurityAnalyzer(config_path=args.config, device=args.device)
-        results = analyzer.run_stage3_alignment_analysis(config_path=args.stage3_alignment)
+        analyzer.run_stage3_alignment_analysis(config_path=args.stage3_alignment)
 
         return  # Exit after Stage 3 analysis
 
@@ -646,7 +583,8 @@ def main():
     if args.all_layers:
         layers = [-1] + list(range(32))
         logger.info(
-            f"Using --all-layers: analysing layers {layers[0]} to {layers[-1]} ({len(layers)} total layers)"
+            f"Using --all-layers: analysing layers {layers[0]} to {layers[-1]} ({len(layers)} "
+            f"total layers)"
         )
     else:
         layers = args.layers
@@ -664,7 +602,7 @@ def main():
     analyzer.load_models()
 
     # Run comprehensive analysis
-    results = analyzer.run_comprehensive_analysis(
+    analyzer.run_comprehensive_analysis(
         concepts=args.concepts, layers=layers, output_dir=args.output_dir
     )
 

@@ -101,7 +101,7 @@ def generate_conversational_response(
         # Generate response autoregressively
         generated_ids = input_ids[0].tolist()
 
-        for step in range(max_new_tokens):
+        for _step in range(max_new_tokens):
             outputs = model.llm(
                 inputs_embeds=combined_embeddings, attention_mask=attention_mask, use_cache=False
             )

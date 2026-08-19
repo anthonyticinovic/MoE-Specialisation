@@ -76,7 +76,8 @@ def extract_test_set_retrieval(data: dict, output_path: str):
             "image_id": img_idx,
             "coco_id": img["cocoid"],
             "filename": img["filename"],
-            "filepath": f"{img['filepath']}/{img['filename']}",  # e.g., 'val2014/COCO_val2014_000000391895.jpg'
+            # e.g. 'val2014/COCO_val2014_000000391895.jpg'
+            "filepath": f"{img['filepath']}/{img['filename']}",
         }
         retrieval_data["images"].append(image_entry)
 
@@ -119,7 +120,8 @@ def extract_test_set_captioning(data: dict, images_output: str, references_outpu
             "image_id": img_idx,
             "coco_id": img["cocoid"],
             "filename": img["filename"],
-            "filepath": f"{img['filepath']}/{img['filename']}",  # e.g., 'val2014/COCO_val2014_000000391895.jpg'
+            # e.g. 'val2014/COCO_val2014_000000391895.jpg'
+            "filepath": f"{img['filepath']}/{img['filename']}",
         }
         images_data.append(entry)
 

@@ -198,11 +198,13 @@ class SimilarityMatrixPlotsMixin:
         if ccs_results["color_coherence_score"] is not None:
             logger.info(f"   Color Coherence Score: {ccs_results['color_coherence_score']:.3f}")
             logger.info(
-                f"      • Same color, diff object: {ccs_results['same_color_diff_object_mean']:.3f} "
+                f"      • Same color, diff object: "
+                f"{ccs_results['same_color_diff_object_mean']:.3f} "
                 f"(n={ccs_results['same_color_diff_object_count']} pairs)"
             )
             logger.info(
-                f"      • Diff color, same object: {ccs_results['diff_color_same_object_mean']:.3f} "
+                f"      • Diff color, same object: "
+                f"{ccs_results['diff_color_same_object_mean']:.3f} "
                 f"(n={ccs_results['diff_color_same_object_count']} pairs)"
             )
 

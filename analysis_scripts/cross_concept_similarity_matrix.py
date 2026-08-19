@@ -3,7 +3,8 @@ Cross-Concept Similarity Matrix Analysis for MoE Vision-Language Models
 
 This script computes 2N×2N similarity matrices comparing N image-text pairs at specified layers.
 
-Stage 2 Mode: Uses expert routing to force images through vision expert and text through text expert.
+Stage 2 Mode: Uses expert routing to force images through the vision expert and
+text through the text expert.
 Stage 3 Mode: Uses learned soft routing from end-to-end trained model (representation alignment).
 
 Usage:
@@ -33,7 +34,6 @@ Config file format (JSON):
 """
 
 import argparse
-import json
 import logging
 import os
 
@@ -42,6 +42,7 @@ import torch
 
 from analysis_scripts._lib import (
     compute_cosine_similarity_matrix,
+    extract_concept_samples,
     load_analysis_config,
     load_stage2_models,
     load_stage3_models,
@@ -81,7 +82,8 @@ class CrossConceptSimilarityAnalyzer(SimilarityMatrixPlotsMixin):
             config_path: Path to training configuration
             device: Device to run on (cuda/cpu)
             mode: "stage2" or "stage3"
-            stage2_checkpoint: Path to Stage 2 checkpoint (optional, defaults to best from training_config)
+            stage2_checkpoint: Path to Stage 2 checkpoint (optional; defaults to
+                the best from training_config)
             stage3_checkpoint: Path to Stage 3 portable checkpoint (required if mode="stage3")
             temperature: Routing temperature for Stage 3 (lower = more deterministic)
         """
@@ -155,95 +157,13 @@ class CrossConceptSimilarityAnalyzer(SimilarityMatrixPlotsMixin):
     def extract_concept_samples(
         self, annotations_file: str, concepts: list[str], samples_per_concept: int, seed: int = 42
     ) -> dict[str, list[dict]]:
+        """Balanced concept sampling — see ``_lib.coco_samples``.
+
+        Kept as a method because subclasses and callers reach it through
+        ``self``; the implementation is shared so the three copies that used to
+        exist cannot drift apart again.
         """
-        Extract balanced samples from COCO annotations for specified concepts.
-
-        Args:
-            annotations_file: Path to COCO annotations JSON
-            concepts: List of concept keywords (e.g., ["cat", "dog", "car"])
-            samples_per_concept: Target number of samples per concept
-            seed: Random seed for reproducibility
-
-        Returns:
-            Dict mapping concept -> list of sample dicts with keys:
-                - 'image_id': COCO image ID
-                - 'caption': Image caption
-                - 'image_path': Relative path to image file
-        """
-        logger.info("\nExtracting concept samples from COCO annotations...")
-        logger.info(f"   Concepts: {concepts}")
-        logger.info(f"   Target: {samples_per_concept} samples per concept")
-
-        # Load COCO annotations
-        with open(annotations_file) as f:
-            coco_data = json.load(f)
-
-        # Build image_id -> image_path mapping
-        image_id_to_path = {}
-        for img in coco_data["images"]:
-            image_id_to_path[img["id"]] = img["file_name"]
-
-        # Set random seed
-        np.random.seed(seed)
-
-        # Extract samples for each concept
-        concept_samples = {concept: [] for concept in concepts}
-
-        for annotation in coco_data["annotations"]:
-            caption = annotation["caption"].lower()
-            image_id = annotation["image_id"]
-            words = set(caption.split())
-
-            # Check which concepts appear in this caption
-            # Support both single words (e.g., "cat") and compound concepts (e.g., "red_apple")
-            matching_concepts = []
-            for concept in concepts:
-                concept_lower = concept.lower()
-
-                # Check if it's a compound concept (contains underscore)
-                if "_" in concept_lower:
-                    # For compound concepts like "red_apple", check if all parts are present
-                    parts = concept_lower.split("_")
-                    if all(part in words for part in parts):
-                        matching_concepts.append(concept)
-                else:
-                    # For single-word concepts, check if word is in caption
-                    if concept_lower in words:
-                        matching_concepts.append(concept)
-
-            # Skip if multiple specified concepts appear (ambiguous)
-            if len(matching_concepts) > 1:
-                continue
-
-            # Skip if no concepts match
-            if len(matching_concepts) == 0:
-                continue
-
-            # Add to the matching concept's sample list
-            concept = matching_concepts[0]
-            if len(concept_samples[concept]) < samples_per_concept:
-                concept_samples[concept].append(
-                    {
-                        "image_id": image_id,
-                        "caption": annotation["caption"],
-                        "image_path": image_id_to_path[image_id],
-                        "concept": concept,
-                    }
-                )
-
-        # Print statistics
-        logger.info("\n   Extracted samples:")
-        for concept, samples in concept_samples.items():
-            logger.info(f"      {concept}: {len(samples)} samples")
-
-        # Warn if any concept is under-sampled
-        for concept, samples in concept_samples.items():
-            if len(samples) < samples_per_concept:
-                logger.warning(
-                    f"    Warning: Only found {len(samples)} samples for '{concept}' (target: {samples_per_concept})"
-                )
-
-        return concept_samples
+        return extract_concept_samples(annotations_file, concepts, samples_per_concept, seed)
 
     def _extract_representation(
         self, concept: str, expert: str, layer: int, modality: str, pooling: str = "mean"
@@ -256,7 +176,8 @@ class CrossConceptSimilarityAnalyzer(SimilarityMatrixPlotsMixin):
 
         Args:
             concept: Image path (for vision) or text string (for text)
-            expert: "vision" or "text" - which expert to route through (Stage 2 only, ignored in Stage 3)
+            expert: "vision" or "text" — which expert to route through
+                (Stage 2 only; ignored in Stage 3)
             layer: Layer index to extract from (0-31)
             modality: "vision" or "text" - type of input
             pooling: "mean" for mean-pooling (default)
@@ -294,20 +215,19 @@ class CrossConceptSimilarityAnalyzer(SimilarityMatrixPlotsMixin):
             Pooled representation as numpy array
         """
         with torch.no_grad():
-            # REUSE: Input preparation from base analyzer (CLIP + connector for vision, tokenizer for text)
+            # REUSE: Input preparation from base analyzer (CLIP + connector for
+            # vision, tokenizer for text)
             if modality == "vision":
                 visual_soft_tokens = self.base_analyzer._prepare_vision_input(concept)
                 inputs_embeds = visual_soft_tokens
                 attention_mask = None  # Vision tokens don't need masking
-                num_content_tokens = 257  # All 257 visual tokens
 
             elif modality == "text":
                 text_embeddings = self.base_analyzer._prepare_text_input(concept)
                 inputs_embeds = text_embeddings
                 # Create attention mask for text (all ones, no padding in single-sample case)
                 attention_mask = torch.ones(text_embeddings.shape[:2], device=self.device)
-                # IMPORTANT: Exclude BOS token (position 0) to match Stage 2 behaviour
-                num_content_tokens = text_embeddings.shape[1]  # Total tokens including BOS
+                # BOS is excluded at the pooling step below, not here.
 
             else:
                 raise ValueError(f"Invalid modality: {modality}")
@@ -447,7 +367,8 @@ class CrossConceptSimilarityAnalyzer(SimilarityMatrixPlotsMixin):
                 representations.append(avg_img_rep)
                 labels.append(f"img:{concept}")
                 logger.info(
-                    f"       Averaged {len(concept_img_reps)} samples: norm={np.linalg.norm(avg_img_rep):.2f}"
+                    f"       Averaged {len(concept_img_reps)} samples: "
+                    f"norm={np.linalg.norm(avg_img_rep):.2f}"
                 )
             else:
                 logger.warning(f"        No valid samples for {concept}, skipping")
@@ -480,7 +401,8 @@ class CrossConceptSimilarityAnalyzer(SimilarityMatrixPlotsMixin):
                 representations.append(avg_txt_rep)
                 labels.append(f"txt:{concept}")
                 logger.info(
-                    f"       Averaged {len(concept_txt_reps)} samples: norm={np.linalg.norm(avg_txt_rep):.2f}"
+                    f"       Averaged {len(concept_txt_reps)} samples: "
+                    f"norm={np.linalg.norm(avg_txt_rep):.2f}"
                 )
             else:
                 logger.warning(f"        No valid samples for {concept}, skipping")
@@ -620,12 +542,14 @@ def main():
         "--mode",
         type=str,
         choices=["stage2", "stage3"],
-        help="Analysis mode: 'stage2' (forced routing) or 'stage3' (learned routing). Overrides config file.",
+        help="Analysis mode: 'stage2' (forced routing) or 'stage3' (learned "
+        "routing). Overrides the config file.",
     )
     parser.add_argument(
         "--stage2-checkpoint",
         type=str,
-        help="Path to Stage 2 checkpoint (optional, defaults to llm_stage2_best.pth from training_config)",
+        help="Path to Stage 2 checkpoint (optional; defaults to "
+        "llm_stage2_best.pth from training_config)",
     )
     parser.add_argument(
         "--stage3-checkpoint",
@@ -694,7 +618,8 @@ def main():
     logger.info(f"   Image directory: {config['image_dir']}")
     if config.get("mode", "stage2") == "stage2":
         logger.info(
-            f"   Stage 2 checkpoint: {config.get('stage2_checkpoint', 'default (from training_config.yaml)')}"
+            "   Stage 2 checkpoint: "
+            f"{config.get('stage2_checkpoint', 'default (from training_config.yaml)')}"
         )
     elif config.get("mode", "stage2") == "stage3":
         logger.info(f"   Stage 3 checkpoint: {config.get('stage3_checkpoint', 'N/A')}")

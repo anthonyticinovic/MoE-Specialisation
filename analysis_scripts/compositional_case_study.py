@@ -29,7 +29,8 @@ Manifest file format (JSON):
     {
       "stimuli": [
         {"id": "red_apple", "image_path": "data/images/red_apple.jpg", "caption": "A red apple"},
-        {"id": "green_apple", "image_path": "data/images/green_apple.jpg", "caption": "A green apple"},
+        {"id": "green_apple", "image_path": "data/images/green_apple.jpg",
+         "caption": "A green apple"},
         ...
       ]
     }

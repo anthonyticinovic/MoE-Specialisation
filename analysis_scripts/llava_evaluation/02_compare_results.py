@@ -146,7 +146,8 @@ def analyze_results(stage2_data, stage3_data):
         f"{'COCO Captions (OOD)':<23} {'CIDEr':<25} {0.76:<12.2f} {0.08:<12.2f} {-0.68:+.2f} "
     )
     logger.info(
-        f"{'LLaVA-Wild (ID)':<23} {'Quality Score':<25} {s2_score:<12.1f} {s3_score:<12.1f} {diff:+.1f} {'' if diff > 0 else ''}"
+        f"{'LLaVA-Wild (ID)':<23} {'Quality Score':<25} {s2_score:<12.1f} {s3_score:<12.1f} "
+        f"{diff:+.1f} {'' if diff > 0 else ''}"
     )
 
     logger.info("\nINTERPRETATION:")
