@@ -118,6 +118,75 @@ class TestLoggingMigration:
         )
 
 
+class TestFailuresAreVisible:
+    """An analysis that fails must say so at a level someone reads.
+
+    `run_comprehensive_analysis` used to wrap five diagnostics in
+    `except Exception` and report each failure with `logger.info`, so a run in
+    which every diagnostic failed still printed "complete" and exited zero. A
+    similar loop swallowed a whole layer. Both are the same shape as the bare
+    `except:` and the `strict=False` before it.
+    """
+
+    @pytest.mark.parametrize("path", ANALYSIS_MODULES, ids=lambda p: p.name)
+    def test_no_error_is_reported_at_info_or_debug(self, path):
+        offenders = []
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not isinstance(node, ast.ExceptHandler):
+                continue
+            for call in ast.walk(node):
+                if (
+                    isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Attribute)
+                    and call.func.attr in ("info", "debug")
+                    and isinstance(call.func.value, ast.Name)
+                    and call.func.value.id == "logger"
+                ):
+                    text = ast.unparse(call).lower()
+                    if any(word in text for word in ("error", "failed", "exception")):
+                        offenders.append(f"line {call.lineno}")
+        assert not offenders, (
+            f"{path.name}: reports a failure at INFO/DEBUG ({offenders}). Use "
+            "logger.error or logger.exception — an error logged as information "
+            "is an error nobody sees."
+        )
+
+    @pytest.mark.parametrize("path", ANALYSIS_MODULES, ids=lambda p: p.name)
+    def test_no_traceback_printed_outside_logging(self, path):
+        """`traceback.print_exc()` writes to stderr, bypassing the handler.
+
+        The logging migration test looks for `print()`; this is a print by
+        another name, and it was the last thing still writing outside the
+        logging system.
+        """
+        source = path.read_text()
+        assert "print_exc" not in source, (
+            f"{path.name}: use logger.exception() so the traceback goes through logging"
+        )
+
+    @pytest.mark.parametrize("path", ANALYSIS_MODULES, ids=lambda p: p.name)
+    def test_no_leftover_debug_scaffolding(self, path):
+        """`DEBUG:`-prefixed messages logged at INFO are someone's debugging run.
+
+        Sixteen of them survived in two analysers — "About to call save_results",
+        "Exception caught, continuing" — printed on every run at INFO.
+        """
+        offenders = [
+            call.lineno
+            for call in ast.walk(ast.parse(path.read_text()))
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "info"
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "logger"
+            and "DEBUG:" in ast.unparse(call)
+        ]
+        assert not offenders, (
+            f"{path.name}: DEBUG: messages logged at INFO on line(s) {offenders}. "
+            "Delete them, or log them at logger.debug."
+        )
+
+
 class TestConfigAndDeviceSeam:
     """The analysis scripts must resolve config and device the same way the
     training scripts do.

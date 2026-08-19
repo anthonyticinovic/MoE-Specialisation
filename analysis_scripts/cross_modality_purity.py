@@ -328,6 +328,7 @@ class CrossModalityPurityAnalyzer(RepresentationExtractionMixin, PurityMetricsMi
             f"\nComputing alignment curves (averaging {samples_per_concept} samples per concept)..."
         )
         alignment_curves = {}
+        failed_concepts: list[str] = []
 
         for idx, concept in enumerate(concepts, 1):
             samples = concept_samples[concept]
@@ -363,22 +364,42 @@ class CrossModalityPurityAnalyzer(RepresentationExtractionMixin, PurityMetricsMi
 
                 alignment_curves[concept] = avg_curve
 
-                # Print key layer similarities
-                emb_sim = avg_curve[-1]
-                final_sim = avg_curve[31]
-                logger.info(f"(emb={emb_sim:.3f}, L0={avg_curve[0]:.3f}, L31={final_sim:.3f})")
+                # Report the embedding, first and last layer. The last index is
+                # taken from the curve rather than hardcoded to 31: a model with
+                # any other depth used to raise IndexError here.
+                last_layer = max(layer for layer in avg_curve if layer >= 0)
+                logger.info(
+                    "  %s: emb=%.3f, L0=%.3f, L%d=%.3f",
+                    concept,
+                    avg_curve[-1],
+                    avg_curve[0],
+                    last_layer,
+                    avg_curve[last_layer],
+                )
 
-            except Exception as e:
-                logger.error(f"Error: {e}")
-                import traceback
-
-                traceback.print_exc()
+            except Exception:
+                # logger.exception records the traceback through logging rather
+                # than printing it to stderr, so it lands in the same stream as
+                # everything else the run reports.
+                logger.exception("Concept %r failed; continuing to the next", concept)
+                failed_concepts.append(concept)
                 continue
 
-        # Save results
+        # A concept that failed is absent from alignment_curves, so the result
+        # file has to say how many — otherwise a half-finished run and a
+        # deliberately-narrow one produce indistinguishable output.
+        if failed_concepts:
+            logger.error(
+                "%d of %d concepts failed and are absent from the results: %s",
+                len(failed_concepts),
+                len(concepts),
+                failed_concepts,
+            )
+
         results = {
             "config": config,
             "alignment_curves": alignment_curves,
+            "failed_concepts": failed_concepts,
             "metadata": {
                 "checkpoint": checkpoint_path,
                 "temperature": temperature,
@@ -465,60 +486,85 @@ class CrossModalityPurityAnalyzer(RepresentationExtractionMixin, PurityMetricsMi
                 "\nGenerating purity matrix and divergence analysis (2 concepts detected)..."
             )
 
-            # CLIP vs Connector comparison (diagnostic analysis)
-            logger.info("\nRunning CLIP vs Connector diagnostic...")
+            # Each diagnostic below is optional — one failing must not lose the
+            # others — but a failure is an error, not a status update. These
+            # used to be logged with logger.info, so a run in which every
+            # diagnostic failed still printed "complete" and exited zero.
+            failures: list[str] = []
 
-            # Mean-pooled comparison
-            try:
+            def attempt(name: str, work):
+                """Run one optional diagnostic; record it if it raises."""
+                logger.info("Running %s...", name)
+                try:
+                    work()
+                except Exception:
+                    logger.exception("%s failed", name)
+                    failures.append(name)
+
+            labels_cls = None
+
+            def clip_connector_mean():
                 clip_matrix, connector_matrix, labels = self.compute_clip_connector_comparison(
                     concepts
                 )
                 cmp_plots.plot_clip_connector_comparison(
                     clip_matrix, connector_matrix, labels, output_dir, pooling="mean"
                 )
-            except Exception as e:
-                logger.info(f"  Error computing mean-pooled CLIP vs connector comparison: {e}")
 
-            # CLS token comparison
-            try:
+            def clip_connector_cls():
+                nonlocal labels_cls
                 clip_matrix_cls, connector_matrix_cls, labels_cls = (
                     self.compute_clip_connector_comparison_cls(concepts)
                 )
                 cmp_plots.plot_clip_connector_comparison(
                     clip_matrix_cls, connector_matrix_cls, labels_cls, output_dir, pooling="cls"
                 )
-            except Exception as e:
-                logger.info(f"  Error computing CLS token CLIP vs connector comparison: {e}")
 
-            # Level 1: Token variance analysis
-            logger.info("\nLevel 1: Analysing token-level variance...")
-            try:
-                variance_results = self.analyze_token_variance(concepts)
-                cmp_plots.plot_token_variance(variance_results, labels_cls, output_dir)
-            except Exception as e:
-                logger.info(f"  Error in token variance analysis: {e}")
+            def token_variance():
+                # labels_cls comes from the CLS diagnostic above. When that one
+                # failed, this used to raise NameError and be swallowed as a
+                # second, unrelated-looking failure.
+                if labels_cls is None:
+                    raise RuntimeError(
+                        "the CLS CLIP-vs-connector diagnostic did not run, so its "
+                        "labels are unavailable"
+                    )
+                cmp_plots.plot_token_variance(
+                    self.analyze_token_variance(concepts), labels_cls, output_dir
+                )
 
-            # Level 2: Position-specific similarity
-            logger.info("\nLevel 2: Analysing position-specific similarity...")
-            try:
-                position_results = self.analyze_position_specific_similarity(concepts)
-                cmp_plots.plot_position_specific_similarity(position_results, output_dir)
-            except Exception as e:
-                logger.info(f"  Error in position-specific analysis: {e}")
+            def position_specific():
+                cmp_plots.plot_position_specific_similarity(
+                    self.analyze_position_specific_similarity(concepts), output_dir
+                )
 
-            # Purity matrices at key layers
-            target_layers = [-1, 0, 15, 31]
+            attempt("CLIP vs connector (mean-pooled)", clip_connector_mean)
+            attempt("CLIP vs connector (CLS token)", clip_connector_cls)
+            attempt("token-level variance", token_variance)
+            attempt("position-specific similarity", position_specific)
+
+            # Purity matrices at the layers the caller asked for. The set used
+            # to be hardcoded to the 7B model's [-1, 0, 15, 31].
+            requested = [layer for layer in layers if layer >= -1]
+            target_layers = [requested[0], requested[len(requested) // 2], requested[-1]]
+            target_layers = sorted(set(target_layers))
             matrices = {}
             for layer in target_layers:
-                if layer in layers:
-                    try:
-                        matrix, labels = self.compute_purity_matrix(concepts, layer, pooling="mean")
-                        matrices[layer] = (matrix, labels)
-                    except Exception as e:
-                        logger.info(f"  Error computing purity matrix for layer {layer}: {e}")
+
+                def purity(layer=layer):
+                    matrices[layer] = self.compute_purity_matrix(concepts, layer, pooling="mean")
+
+                attempt(f"purity matrix at layer {layer}", purity)
 
             if matrices:
                 cmp_plots.plot_purity_matrices(matrices, target_layers, output_dir)
+
+            if failures:
+                logger.error(
+                    "%d of the optional diagnostics failed and produced no output: %s",
+                    len(failures),
+                    failures,
+                )
 
         logger.info("Visualisation complete!")
 

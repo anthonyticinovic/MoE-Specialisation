@@ -545,57 +545,46 @@ class CrossConceptSimilarityAnalyzer(SimilarityMatrixPlotsMixin):
         )
 
         results = {}
+        failed_layers = []
 
-        # Process each layer
-        logger.info(f"\nDEBUG: About to iterate through {len(layers)} layers: {layers}")
         for layer_idx, layer in enumerate(layers):
             logger.info(f"\n{'=' * 80}")
-            logger.info(f"DEBUG: Starting iteration {layer_idx + 1}/{len(layers)}")
             logger.info(f"LAYER {layer} ({layer_idx + 1}/{len(layers)})")
             logger.info(f"{'=' * 80}")
 
             try:
-                # Compute similarity matrix
-                logger.info(f"\nStarting matrix computation for layer {layer}...")
-                logger.info(f"DEBUG: Calling compute_cross_concept_matrix with layer={layer}")
+                logger.info(f"Computing the similarity matrix for layer {layer}...")
                 matrix, labels = self.compute_cross_concept_matrix(
                     concept_samples=concept_samples,
                     image_dir=image_dir,
                     layer=layer,
                     pooling=pooling,
                 )
-                logger.info(f"Matrix computation complete for layer {layer}")
-                logger.info(f"DEBUG: Matrix shape: {matrix.shape}, Labels count: {len(labels)}")
+                logger.info(f"  Matrix {matrix.shape} over {len(labels)} labels")
 
-                # Save results
-                logger.info(f"\nSaving results for layer {layer}...")
-                logger.info("DEBUG: About to call save_results")
                 self.save_results(matrix, labels, output_dir, layer)
-                logger.info(f"Results saved for layer {layer}")
-
-                # Visualise
-                logger.info(f"\nGenerating visualisation for layer {layer}...")
-                logger.info("DEBUG: About to call visualize_matrix")
                 self.visualize_matrix(matrix, labels, output_dir, layer)
-                logger.info(f"Visualisation complete for layer {layer}")
+                logger.info(f"  Results and figure written for layer {layer}")
 
                 results[f"layer_{layer}"] = {"matrix": matrix, "labels": labels}
 
-                logger.info(f"\nLayer {layer} processing complete!")
-                logger.info(
-                    f"DEBUG: Finished iteration {layer_idx + 1}/{len(layers)}, moving to next layer"
-                )
-
-            except Exception as e:
-                logger.error(f"\nERROR processing layer {layer}: {e}")
-                logger.info("   Continuing to next layer...")
-                import traceback
-
-                traceback.print_exc()
-                logger.info("DEBUG: Exception caught, continuing to next layer")
+            except Exception:
+                # One bad layer must not lose the others, but the run has to say
+                # so: `logger.exception` records the traceback through logging
+                # rather than printing it to stderr, and the failures are
+                # counted so a partial result set is visibly partial.
+                logger.exception("Layer %s failed; continuing to the next layer", layer)
+                failed_layers.append(layer)
                 continue
 
-        logger.info(f"\nDEBUG: Completed all {len(layers)} layer iterations")
+        if failed_layers:
+            logger.error(
+                "%d of %d layers failed and are absent from the results: %s",
+                len(failed_layers),
+                len(layers),
+                failed_layers,
+            )
+        results["failed_layers"] = failed_layers
 
         logger.info(f"\n{'=' * 80}")
         logger.info(
@@ -736,7 +725,11 @@ def main():
         seed=config.get("seed", 42),
     )
 
+    # A run that lost layers must not report success. Exiting non-zero is what
+    # makes a partial result set visible to whatever invoked the script.
+    return 1 if results["failed_layers"] else 0
+
 
 if __name__ == "__main__":
     setup_logging()
-    main()
+    raise SystemExit(main())

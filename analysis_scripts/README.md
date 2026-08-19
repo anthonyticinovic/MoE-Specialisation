@@ -46,8 +46,20 @@ Import via `from analysis_scripts._lib import ...`.
 
 ## Top-level scripts
 
-Large analyzers keep their analysis logic in the named file and their plotting
-in a sibling `*_plots.py` / `*_metrics_plots.py` module (imported automatically).
+Large analysers are split across sibling modules, composed back together by
+inheritance so the class each script exposes is unchanged:
+
+| Analyser | Siblings |
+|---|---|
+| `cross_modality_purity.py` | `cross_modality_extraction.py` (hidden states out of the model), `cross_modality_metrics.py` (metrics over them), `cross_modality_purity_plots.py` |
+| `cross_concept_similarity_matrix.py` | `cross_concept_similarity_plots.py` (heatmaps, coherence score, JSON writer) |
+| `layer_clustering_analysis.py` | `layer_clustering_plots.py` |
+| `attention_routing_analysis.py` | `attention_routing_plots.py` |
+| `plot_expert_metrics.py` | `expert_metrics_plots.py` (per-layer), `expert_metrics_evolution_plots.py` (across-epoch + report) |
+
+**Add a method to the sibling that owns the concern, not to the analyser** —
+`layer_clustering_analysis` and `attention_routing_analysis` subclass
+`CrossModalityPurityAnalyzer`, so the composition order is load-bearing.
 
 | Script | What it measures | Example |
 |--------|------------------|---------|
@@ -61,8 +73,8 @@ in a sibling `*_plots.py` / `*_metrics_plots.py` module (imported automatically)
 | `plot_expert_metrics.py` | Plots expert utilisation metrics from Stage 3 training | `python analysis_scripts/plot_expert_metrics.py --metrics_dir <dir>` |
 | `create_stage_comparison.py` | Side-by-side Stage 2 vs Stage 3 similarity heatmaps | `python analysis_scripts/create_stage_comparison.py --stage2-dir <d> --stage3-dir <d> --output-dir <d>` |
 
-`*_plots.py` siblings are not run directly — they are imported by their owning
-script.
+Sibling modules are never run directly — they are imported by the analyser that
+owns them.
 
 ## Evaluation pipelines
 
@@ -83,18 +95,20 @@ Each is a self-contained, ordered pipeline with its own README:
 
 - **Logging**: these scripts use `logging`, like the rest of the repo — every
   entry point calls `setup_logging()` and every module holds a
-  `logging.getLogger(__name__)`. They differ from the core in one respect: the
-  messages are f-strings rather than the core's lazy `%s` arguments. That is
-  deliberate. The report tables here rely on alignment and percentage format
-  specs (`{value:<15.1f}`, `{share:.1%}`) which have no `%`-formatting
-  equivalent, and a module that mixed both styles would be worse than one that
-  picks either. The lazy-formatting argument — avoid work for a message that is
-  never emitted — does not apply to single-run scripts logging at INFO.
-- **File size**: `cross_modality_purity.py`, `cross_concept_similarity_matrix.py`
-  and `expert_metrics_plots.py` remain above the 800-line guideline. They are
-  cohesive analyzers / a pure plotting module; further splitting was judged to
-  risk silently changing un-runnable research outputs for little benefit. Model
-  loading, similarity and plotting were extracted where it was safe to do so.
+  `logging.getLogger(__name__)`. Two message styles are in use, and the split is
+  deliberate:
+  - **f-strings for reporting** (491 calls). The tables here rely on alignment
+    and percentage format specs (`{value:<15.1f}`, `{share:.1%}`) that have no
+    `%`-formatting equivalent, and the lazy-formatting argument — avoid work for
+    a message that is never emitted — does not apply to a single-run script
+    logging at INFO.
+  - **Lazy `%s` on error paths** (16 calls), matching the core. These are
+    `logger.error` and `logger.exception` calls, where the message may carry a
+    large object and where handing the arguments to `logging` keeps the
+    traceback and the message in one record.
+- **File size**: nothing here exceeds 800 lines, and
+  `tests/test_analysis_lib.py::test_no_source_file_is_oversized` fails anything
+  that does. The largest is `cross_concept_similarity_matrix.py` at 742.
 - **Karpathy COCO path**: `01_preprocess_karpathy.py`, `02_extract_embeddings.py`
   and `04_generate_captions.py` take the COCO/Karpathy path as a **required**
   CLI argument (no placeholder default); see the Karpathy README. Everything
@@ -102,20 +116,31 @@ Each is a self-contained, ordered pipeline with its own README:
 
 ## Known limitations (kept honest)
 
-These are real and known. They were left unchanged on purpose: the
-training scripts reproduce the published paper's numerics and are only
-covered by the Stage-1 dry-run oracle, so behavioural edits to Stages 2–3
-were out of scope for the presentation cleanup.
+Real and current, checked against the code on 19 Aug 2026. Two entries that used
+to be here — `torch.cuda._total_entropy` in `train_stage_2.5.py` and the
+inconsistent FSDP `device_id` across stages — are fixed and have been removed;
+a third, about three files exceeding the 800-line guideline, is obsolete since
+those files were split and a test now enforces the limit.
 
-- **`torch.cuda._total_entropy` in `train_stage_2.5.py`** — the entropy bonus
-  is accumulated by attaching state to the `torch.cuda` module. It works for a
-  single-process run but is an anti-pattern; a local accumulator would be
-  cleaner.
-- **Inconsistent FSDP `device_id`** — `train_stage_2.5.py` passes
-  `f"cuda:{rank}"`, `train_stage_3.py` an `int`, `train_dense.py`
-  `torch.cuda.current_device()`. All work on the cluster they were run on but
-  the inconsistency is untidy.
-- **Duplication across `train_stage_*.py`** — ~60–70% of each stage script is
-  shared boilerplate (FSDP setup, checkpoint sync, loops). This was a
-  deliberate trade-off: keeping each stage a standalone, independently
-  reproducible script was prioritised over DRY for a research codebase.
+- **One analysis entry point of twenty is executed by anything.** Every module
+  here imports, and `_lib/model_loading.py` has behavioural tests, but only
+  `routing_ablation_experiment.py` is actually run — by the CPU demo, on every
+  push. The other nineteen are checked for shape (no `print`, no hardcoded
+  config path, no CUDA default, no bare `strict=False`) and not for behaviour.
+  Treat their outputs as un-regression-tested.
+- **Duplication across the analysers.** `extract_concept_samples` is
+  implemented three times (in `cross_concept_similarity_matrix.py`,
+  `cross_modality_purity.py` and `layer_clustering_analysis.py`) and
+  `compute_metrics` twice (`pope_utils.py` and, separately,
+  `compare_priming_strategies.py`). Consolidating them is safe only once the
+  point above is fixed.
+- **Long functions.** Nineteen functions here exceed 120 lines, the largest
+  being `generate_captions` (273) and `generate_pope_answers` (243). The
+  training scripts have a test enforcing that limit; these do not, for the same
+  reason.
+- **Duplication across `train_stage_*.py`** — the five stage scripts total
+  ~2,500 lines against ~1,000 in `_lib`. The shared runtime, FSDP wrapper,
+  backbones, dataloaders, checkpoint guard and loss are extracted; the forward
+  passes deliberately are not, because the `no_grad`/`autocast` boundaries
+  differ per stage in ways a CPU run cannot verify. See
+  [`docs/design.md`](../docs/design.md) §5 for the full argument.

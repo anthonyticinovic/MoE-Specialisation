@@ -257,17 +257,13 @@ class MoEClusteringAnalyzer(CrossModalityPurityAnalyzer):
                             moe_layer._last_router_logits
                         )  # [batch, total_seq_len, num_experts]
 
-                        # Debug: Print shape and sample values for first sample only
+                        # Router shapes for the first sample of the first layer.
+                        # At DEBUG, so a normal run does not carry it.
                         if sample_count == 1 and layer_idx == target_layers[0]:
-                            logger.info(
-                                f"      DEBUG: all_router_logits shape: {all_router_logits.shape}"
-                            )
-                            logger.info(f"      DEBUG: num_vision_tokens: {num_vision_tokens}")
-                            logger.info(
-                                f"      DEBUG: Vision router logits sample (first 3 tokens): {all_router_logits[0, :3, :]}"
-                            )
-                            logger.info(
-                                f"      DEBUG: Text router logits sample (first 3 tokens): {all_router_logits[0, num_vision_tokens : num_vision_tokens + 3, :]}"
+                            logger.debug(
+                                "Router logits %s, %d vision tokens",
+                                tuple(all_router_logits.shape),
+                                num_vision_tokens,
                             )
 
                         vision_router_logits = all_router_logits[
@@ -285,23 +281,15 @@ class MoEClusteringAnalyzer(CrossModalityPurityAnalyzer):
                             text_router_logits[0], dim=-1
                         )  # [text_len, 2]
 
-                        # Debug: Print probability distributions
+                        # How the first sample routed, as a sanity check on the
+                        # modality split. At DEBUG for the same reason.
                         if sample_count == 1 and layer_idx == target_layers[0]:
-                            logger.info(
-                                f"      DEBUG: Vision probs sample (first 3 tokens): {vision_router_probs[:3, :]}"
-                            )
-                            logger.info(
-                                f"      DEBUG: Text probs sample (first 3 tokens): {text_router_probs[:3, :]}"
-                            )
-                            vision_expert0_count = (
-                                (vision_router_probs.argmax(dim=1) == 0).sum().item()
-                            )
-                            text_expert0_count = (text_router_probs.argmax(dim=1) == 0).sum().item()
-                            logger.info(
-                                f"      DEBUG: Vision tokens → Expert 0: {vision_expert0_count}/{len(vision_router_probs)}"
-                            )
-                            logger.info(
-                                f"      DEBUG: Text tokens → Expert 0: {text_expert0_count}/{len(text_router_probs)}"
+                            logger.debug(
+                                "Sample 1 routing to expert 0 — vision %d/%d, text %d/%d",
+                                (vision_router_probs.argmax(dim=1) == 0).sum().item(),
+                                len(vision_router_probs),
+                                (text_router_probs.argmax(dim=1) == 0).sum().item(),
+                                len(text_router_probs),
                             )
 
                         # Extract expert choices with majority voting
