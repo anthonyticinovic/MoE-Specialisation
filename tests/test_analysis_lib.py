@@ -321,6 +321,44 @@ def test_no_source_file_is_oversized(path):
     )
 
 
+class TestDebugLayers:
+    """Which layers debug mode reports on, derived rather than hardcoded.
+
+    This was the literal ``[-1, 0, 15, 31]`` — the 7B's shape — inside a
+    membership test against the layers actually being analysed. On any smaller
+    model nothing matched, so debug mode emitted no per-token output while the
+    log announced that it would. The same hardcoded depth also drove
+    ``--all-layers``, which asked for layers the model did not have.
+    """
+
+    @staticmethod
+    def _selected(layers):
+        from analysis_scripts.cross_modality_metrics import debug_layers
+
+        return debug_layers(layers)
+
+    def test_picks_first_middle_and_last(self):
+        assert self._selected([-1, 0, 8, 16, 24, 31]) == (-1, 16, 31)
+
+    def test_every_choice_is_a_layer_that_will_be_analysed(self):
+        """The defect in one line: the old list named layers nobody analysed."""
+        for layers in ([-1, 0], [0, 1], list(range(32)), [-1, 0, 1, 2]):
+            assert set(self._selected(layers)) <= set(layers)
+
+    def test_works_on_a_two_layer_model(self):
+        """The demo's depth. The old list selected nothing here."""
+        assert self._selected([-1, 0, 1]) == (-1, 0, 1)
+
+    def test_a_single_layer_collapses_to_itself(self):
+        assert self._selected([7]) == (7,)
+
+    def test_no_layers_selects_nothing(self):
+        assert self._selected([]) == ()
+
+    def test_duplicates_and_disorder_do_not_change_the_choice(self):
+        assert self._selected([31, -1, 16, 16, -1]) == self._selected([-1, 16, 31])
+
+
 class TestExtractConceptSamples:
     """The COCO concept sampler, which used to exist in three copies.
 

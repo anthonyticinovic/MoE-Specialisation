@@ -11,12 +11,27 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Sequence
 
 import numpy as np
 import torch
 from PIL import Image
 
 logger = logging.getLogger(__name__)
+
+
+def debug_layers(layers: Sequence[int]) -> tuple[int, ...]:
+    """The layers debug mode emits detailed per-token output for.
+
+    First, middle and last of whatever was requested — the same spread the
+    purity matrices use. This was the literal ``[-1, 0, 15, 31]``, the 7B's
+    shape, so on any other model it selected layers that were not being
+    analysed: debug mode printed nothing while the log said it would.
+    """
+    if not layers:
+        return ()
+    ordered = sorted(set(layers))
+    return tuple(sorted({ordered[0], ordered[len(ordered) // 2], ordered[-1]}))
 
 
 class PurityMetricsMixin:
@@ -138,7 +153,7 @@ class PurityMetricsMixin:
         should_debug = (
             hasattr(self, "_debug_mode")
             and self._debug_mode
-            and layer in [-1, 0, 15, 31]
+            and layer in getattr(self, "_debug_layers", ())
             and not hasattr(self, f"_logged_cosine_{concept}_{layer}_{pooling}")
         )
 

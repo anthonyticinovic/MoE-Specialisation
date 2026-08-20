@@ -95,20 +95,26 @@ Each is a self-contained, ordered pipeline with its own README:
 
 - **Logging**: these scripts use `logging`, like the rest of the repo — every
   entry point calls `setup_logging()` and every module holds a
-  `logging.getLogger(__name__)`. Two message styles are in use, and the split is
-  deliberate:
-  - **f-strings for reporting** (491 calls). The tables here rely on alignment
-    and percentage format specs (`{value:<15.1f}`, `{share:.1%}`) that have no
-    `%`-formatting equivalent, and the lazy-formatting argument — avoid work for
-    a message that is never emitted — does not apply to a single-run script
-    logging at INFO.
-  - **Lazy `%s` on error paths** (16 calls), matching the core. These are
-    `logger.error` and `logger.exception` calls, where the message may carry a
-    large object and where handing the arguments to `logging` keeps the
-    traceback and the message in one record.
+  `logging.getLogger(__name__)`. No `print`, and a test enforces that.
+  Two message styles are in use, split by what the record carries:
+  - **f-strings for reporting**, which is the large majority. These scripts
+    exist to print tables, and the tables rely on alignment and percentage
+    format specs (`{value:<15.1f}`, `{share:.1%}`) that have no `%`-formatting
+    equivalent. The usual argument for lazy formatting — do not build a string
+    for a message that is never emitted — carries little weight in a single-run
+    script logging at INFO.
+  - **Lazy `%` where the argument should not be rendered unless the record is.**
+    Two cases: `logger.error`/`logger.exception` handing an exception object to
+    `logging` so the message and the traceback stay in one record, and the
+    `logger.debug` calls in `layer_clustering_analysis` that dump router tensor
+    shapes, which a normal INFO-level run must not pay for. `_lib` also uses
+    `%` throughout, as the core does.
+
+  Do not read this as a rule the linter enforces — it does not, and a handful of
+  `_lib` reporting calls use `%` simply because that is the core's house style.
 - **File size**: nothing here exceeds 800 lines, and
   `tests/test_analysis_lib.py::test_no_source_file_is_oversized` fails anything
-  that does. The largest is `cross_concept_similarity_matrix.py` at 742.
+  that does.
 - **Karpathy COCO path**: `01_preprocess_karpathy.py`, `02_extract_embeddings.py`
   and `04_generate_captions.py` take the COCO/Karpathy path as a **required**
   CLI argument (no placeholder default); see the Karpathy README. Everything
@@ -116,11 +122,9 @@ Each is a self-contained, ordered pipeline with its own README:
 
 ## Known limitations (kept honest)
 
-Real and current, checked against the code on 19 Aug 2026. Two entries that used
-to be here — `torch.cuda._total_entropy` in `train_stage_2.5.py` and the
-inconsistent FSDP `device_id` across stages — are fixed and have been removed;
-a third, about three files exceeding the 800-line guideline, is obsolete since
-those files were split and a test now enforces the limit.
+Real and current. Each one is either enforced by a test or checkable against the
+code in a minute; entries come off this list when the code changes, not when the
+list is rewritten.
 
 - **Two analysis entry points of twenty are executed by anything.** Every module
   here imports, and `_lib/model_loading.py` has behavioural tests, but only
@@ -129,13 +133,17 @@ those files were split and a test now enforces the limit.
   `print`, no hardcoded config path, no CUDA default, no bare `strict=False`, no
   failure reported at INFO) and not for behaviour. Treat their outputs as
   un-regression-tested.
-- **Long functions.** Sixteen functions here still exceed 120 lines, the
-  largest being `generate_captions` (273) and `generate_pope_answers` (243).
-  Every one is in code the demo cannot reach, so a refactor of it cannot be
-  verified by anything; they are listed in
-  `tests/test_analysis_lib.py::KNOWN_OVERSIZED_FUNCTIONS` and a test stops the
-  list growing. The five that *were* reachable have been split, each verified
-  by byte-comparing the demo's output before and after.
+- **Long functions.** A number of functions here exceed the repo's 120-line
+  limit — the worst are the generation loops in `04_generate_captions.py` and
+  `02_generate_pope_answers.py`, at over 200 lines each. Every one is in code
+  the demo cannot reach, so a refactor of it cannot be verified by anything.
+  The exact set is
+  `tests/test_analysis_lib.py::KNOWN_OVERSIZED_FUNCTIONS` — read it there
+  rather than trusting a count in prose. A ratchet enforces it in both
+  directions: a new offender fails immediately, and splitting one *requires*
+  removing it from the list, so the backlog can never look larger or smaller
+  than it is. The functions that *were* demo-reachable have been split, each
+  verified by byte-comparing the demo's output before and after.
 - **A known scoring defect in `pope_utils.extract_yes_no_answer`.** The
   affirmative phrase list is scanned before the descriptive-pattern list, so a
   caption of the form "The image features a …" scores **yes** even when the

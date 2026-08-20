@@ -14,98 +14,57 @@ See the paper for the full method and results.
 
 ## Run it in 30 seconds (no GPU, no data, no downloads)
 
-The full pipeline — Stage 0 → 1 → 2 → 2.5 → 3, the dense control, and two
-analysis scripts — runs on a laptop CPU against generated fixtures:
+A local skeleton of the whole pipeline - Stage 0 → 1 → 2 → 2.5 → 3, the dense
+control and two analysis scripts - on a laptop CPU:
 
 ```bash
 uv sync --group dev
 make demo
 ```
 
-About 25 seconds. It writes 12 checkpoints, routing metrics, 13 figures, the
-routing-ablation results and a one-page `demo_output/demo_report.md`.
+Under 30 seconds on an M4 Pro. It writes 12 checkpoints, routing metrics, a
+figure per metric, the routing-ablation results and a one-page
+`demo_output/demo_report.md` listing them.
 
-The report leads with **16 executable invariants** — properties that must hold
-for the pipeline to be correct, not just for it to exit zero. Among them: the
-two experts must start bit-identical (Stage 0 copies the base FFN into both) and
-must have diverged after Stage 2; hard routing must dispatch each token to
-exactly the masked expert; Stage 2 must leave every non-expert weight untouched;
-Stage 2.5 must move the gates and *only* the gates; routing entropy must stay
-within `[0, ln N]`; and swapping the two experts at inference must raise the
-loss on **every** sample, which is the paper's specialisation claim reduced to
-something a machine can check. A failing invariant fails the run, so `make
-check` catches a refactor that runs cleanly but behaves wrongly.
+The report opens with 16 executable invariants: properties that must hold for
+the pipeline to be correct. The demo is both a regression test and something a
+reader can inspect quickly.
 
-This runs the **real training scripts**, not a reimplementation: the same
-`train_stage_*.py` files used on the H100 cluster, pointed at a miniature config
-via `MOE_CONFIG`. What differs is only scale and device — a 2-layer/64-hidden
-Mistral, a 4-patch CLIP tower, 24 synthetic images, and CPU fallbacks for FSDP,
-8-bit loading and FlashAttention. Nothing is stubbed. The last two steps drive
-`analysis_scripts/routing_ablation_experiment.py` against the Stage 2 checkpoint
-and `analysis_scripts/plot_expert_metrics.py` against Stage 3's routing metrics
-— both reading only what the run itself produced, so the analysis code is
-covered by the same mechanism.
+It runs the real `train_stage_*.py` files used on the H100 cluster, pointed at a
+miniature config via `MOE_CONFIG`. Only scale and device differ.
 
-It is a smoke test, not a result: a randomly-initialised 2-layer model cannot
-caption anything, and the routing metrics sit near an even split. The point is
-that the pipeline, the checkpoint formats and the routing instrumentation are
-verifiably intact — and that a reader can confirm that themselves without a
-cluster.
-
-`make check` runs the lint, the tests and the demo together; so does CI, on
-every push.
-
-For *why* the code is shaped this way — two experts and not eight, a fixed mask
-before a learned gate, what FSDP forced, and what I would do differently — see
-[`docs/design.md`](docs/design.md).
+`make check` runs lint, tests and the demo. CI runs the same on every push.
 
 ## Overview
 
-This project investigates whether intentional modal (vision/text) expert specialisation can emerge in a Mixture-of-Experts (MoE) language model. This creates a testbed that allows us to investigate the process of expert specialisation, particularly across modalities. We replace every FFN layer in Mistral-7B with two experts, one for visual tokens, one for text tokens, and train the model to caption images.
+Can vision/text expert specialisation be imposed on a Mixture-of-Experts (MoE)
+language model, and does it survive training? We replace every FFN in
+Mistral-7B with two experts, one for visual tokens and one for text, and train
+the model to caption images.
 
 **Key findings:**
-- Explicit modality-based routing (hard routing) successfully specialises experts, but routing collapses without enforcement.
-- Cross-modal concept representations are more jointly structured in the specialised expert latent space than expected. Concepts from different modalities share geometric neighbourhood, suggesting the experts do not produce fully disjoint representations.
-- A learned soft router (Stage 2.5) can recover meaningful routing after expert specialisation, but only at select layers.
+- Hard routing specialises the experts, but routing collapses once the enforcement is removed.
+- Concepts from different modalities share geometric neighbourhoods in the expert latent space, so the experts do not learn disjoint representations.
+- A learned soft router (Stage 2.5) recovers meaningful routing after specialisation, but only at some layers.
 
 ### Captioning performance (COCO Karpathy test split)
 
-Captioning quality is a *diagnostic* here, not the objective. This is an
-interpretability study of routing, not a push for SOTA captioning. The numbers
-are reported in full precisely because they make the routing story concrete:
+Captioning quality is a diagnostic, not the objective. Full numbers:
 
 | Model | Data | B-4 | METEOR | ROUGE-L | CIDEr |
 |---|---|--:|--:|--:|--:|
 | LLaVA-v1.5-7B (full FT, reference) | COCO | **38.2** | 23.5 | **57.3** | **111.4** |
-| Stage 2 — hard routing (ours) | COCO | 31.9 | **33.3** | 55.4 | 76.2 |
-| Stage 3 — soft routing (ours) | COCO → LLaVA-Ins | 4.2 | 12.2 | 29.9 | 8.1 |
+| Stage 2 - hard routing (ours) | COCO | 31.9 | **33.3** | 55.4 | 76.2 |
+| Stage 3 - soft routing (ours) | COCO → LLaVA-Ins | 4.2 | 12.2 | 29.9 | 8.1 |
 
-Stage 2 is competitive with a fully fine-tuned LLaVA reference (and higher
-METEOR) despite only training two FFN experts under a fixed routing mask. The
-sharp Stage 3 drop is **the studied phenomenon, not an unexplained failure**.
-Soft routing collapses after stage 3 training, which is what the interpretability analysis
-in the paper dissects. Baseline from Bucciarelli et al. (2024).
+Stage 2 is competitive with a fully fine-tuned LLaVA reference, and higher on
+METEOR, despite training only two FFN experts under a fixed mask. The Stage 3
+drop is the phenomenon under study: soft routing collapses, and the paper's
+interpretability analysis dissects why. Baseline from Bucciarelli et al. (2024).
 
 ## Architecture
 
-```
-Image ──► CLIP ViT-L/14 ──► VisionLanguageConnector ──► visual soft tokens ───┐
-                              (2-layer MLP, 1024→4096)                        │
-                                                                              ├──► [visual | text] embeddings
-Text  ──────────────────────────────────────────────── text embeddings ───────┘
-                                                                              │
-                                                                              ▼
-                                                                   Mistral-7B + MoE layers
-                                                                              │
-                                                              ┌───────────────┴──────────────────┐
-                                                              │                                  │
-                                                        Expert 0                          Expert 1
-                                                      (vision tokens)                  (text tokens)
-                                                              │                                  │
-                                                              └───────────────┬──────────────────┘
-                                                                              │
-                                                                         next-token logits
-```
+![Model Architecture](docs/MoE_Architecture.png)
 
 The custom `MoELayer` (`models/moe_layer.py`) supports two routing modes:
 
@@ -118,43 +77,36 @@ All stages read paths from `configs/training_config.yaml`. Fill in the `YOUR_PAT
 
 | Stage | Script | What trains | Notes |
 |-------|--------|-------------|-------|
-| **0** | `models/utils/create_moe_model.py` | — | Creates the MoE model from Mistral-7B |
+| **0** | `models/utils/create_moe_model.py` | - | Creates the MoE model from Mistral-7B |
 | **1** | `training_scripts/train_stage_1.py` | VisionLanguageConnector only | CLIP + LLM frozen; 1 GPU |
-| **2** | `training_scripts/train_stage_2.py` | MoE experts (hard routing) | Router frozen; 4× H100 via FSDP |
+| **2** | `training_scripts/train_stage_2.py` | MoE experts (hard routing) | Router frozen; FSDP (run on 4× H100) |
 | **2.5** | `training_scripts/train_stage_2.5.py` | Router/gate only | Experts frozen; introduces soft routing |
 | **3** | `training_scripts/train_stage_3.py` | Self-attn + router + experts | End-to-end; LLaVA-Instruct data |
 | Dense | `training_scripts/train_dense.py` | Standard Mistral FFN | Control baseline |
-
-**Why a "Stage 2.5"?** Stage 2 specialises the experts using a fixed,
-position-derived hard routing mask — there is no learned router. Stage 3 needs
-a *learned* soft router. Jumping straight from a fixed mask to end-to-end soft
-routing collapses routing onto one expert, so Stage 2.5 is a dedicated bridging
-stage that trains only the gate (experts frozen) until soft routing is stable.
 
 ### Requirements & data
 
 This is refactored research code, not a product. Before anything will run:
 
-- **No trained checkpoints are shipped.** Reproducing any result means running
-  the full pipeline (Stages 0→3) yourself. The analysis and evaluation scripts
-  all require a checkpoint you have trained.
-- **No datasets or sample images are shipped.** You must download COCO 2017
-  (train/val + caption & instance annotations) and LLaVA-Instruct-150K, plus
-  local copies of Mistral-7B-v0.3 and CLIP ViT-L/14, then point
+- **No trained checkpoints.** Reproducing a result means running Stages 0→3
+  yourself; every analysis and evaluation script needs a checkpoint you trained.
+  This may change.
+- **No datasets or sample images.** Download COCO 2017 (train/val + caption and
+  instance annotations) and LLaVA-Instruct-150K, plus local copies of
+  Mistral-7B-v0.3 and CLIP ViT-L/14, then point
   `configs/training_config.yaml` at them.
-- **Hardware.** Stage 1 trains on a single GPU; Stages 2–3 use FSDP and need
-  ≥4× A100/H100-class GPUs. The SLURM scripts in [`hpc/`](hpc/README.md) target
-  an H100 cluster: paths and modules are set in `hpc/cluster_env.sh` (or
-  overridden by environment variable), while the `#SBATCH` headers must be
-  edited per cluster.
+- **Hardware.** Stage 1 needs one GPU; Stages 2–3 use FSDP and need ≥2×
+  A100/H100-class. The SLURM scripts in [`hpc/`](hpc/README.md) target an H100
+  cluster: set paths and modules in `hpc/cluster_env.sh` (or by environment
+  variable) and edit the `#SBATCH` headers per cluster.
 - **No published metrics yet.** The Stage 3 metric files behind the paper's
-  routing figures are not in the repository. The regeneration path is in place
-  — see [`paper_metrics/`](paper_metrics/README.md) — but until the JSON is
-  added, `make figures` has nothing to plot.
+  routing figures are not in the repository, so `make figures` has nothing to
+  plot. The regeneration path is in place - see
+  [`paper_metrics/`](paper_metrics/README.md).
 
 ### Setup
 
-Using [uv](https://docs.astral.sh/uv/) (recommended for local development):
+Using [uv](https://docs.astral.sh/uv/), recommended for local development:
 
 ```bash
 git clone https://github.com/anthonyticinovic/MoE-Specialisation.git
@@ -163,15 +115,15 @@ uv sync                       # creates .venv from the pinned uv.lock
 # prefix commands with `uv run`, e.g. uv run python -m models.utils.create_moe_model ...
 ```
 
-On HPC/SLURM (uv may be unavailable on compute nodes):
+On HPC/SLURM, where uv may be unavailable on compute nodes:
 
 ```bash
 pip install -r requirements.txt   # generated export of uv.lock
 ```
 
-Then edit all `YOUR_PATH_HERE` placeholders in `configs/training_config.yaml`.
-`load_config()` validates these on startup and fails fast with a clear message
-if any are left unfilled.
+Then fill in the `YOUR_PATH_HERE` placeholders in
+`configs/training_config.yaml`. `load_config()` validates them on startup and
+fails with a message naming any left unfilled.
 
 ### Running the stages
 
@@ -185,24 +137,23 @@ if any are left unfilled.
 | dense | `torchrun --nproc_per_node=4 training_scripts/train_dense.py` | `dense_checkpoints/` (control baseline) |
 
 `export PYTHONPATH="${PWD}:${PYTHONPATH}"` first, so `trust_remote_code` can
-find the custom model classes. Each stage has a SLURM wrapper —
-`sbatch hpc/training_scripts/train_stage_<n>.sbatch`.
+find the custom model classes. Each stage has a SLURM wrapper -
+`sbatch hpc/training_scripts/train_stage_<n>.sbatch`. Before submitting, set
+your checkout and virtualenv paths in `hpc/cluster_env.sh` (or export
+`MOE_PROJECT_DIR` / `MOE_VENV`) and adapt the `#SBATCH` headers. See
+[`hpc/README.md`](hpc/README.md).
 
-> Stages 2–3 require at least 4× A100/H100 GPUs. Before submitting, set your
-> checkout and virtualenv paths in `hpc/cluster_env.sh` (or export
-> `MOE_PROJECT_DIR` / `MOE_VENV`) and adapt the `#SBATCH` headers. See
-> [`hpc/README.md`](hpc/README.md).
-
-Stage 3's `expert_metrics/` is what [`paper_metrics/`](paper_metrics/README.md)
-expects, so a completed run makes `make figures` work without a GPU thereafter.
-Then run the analyses — see [`docs/running-the-analyses.md`](docs/running-the-analyses.md).
+Stage 3 writes the `expert_metrics/` that
+[`paper_metrics/`](paper_metrics/README.md) expects, so a completed run makes
+`make figures` work without a GPU thereafter. Then run the analyses - see
+[`docs/running-the-analyses.md`](docs/running-the-analyses.md).
 
 ## Analysis Scripts
 
-All analysis scripts live in `analysis_scripts/` and need a checkpoint you have
-trained. They resolve paths through `MOE_CONFIG`, falling back to
-`configs/training_config.yaml`, and pick CUDA or CPU automatically — the same
-mechanism the CPU demo uses to drive them.
+Everything in `analysis_scripts/` needs a checkpoint you have trained. Paths
+resolve through `MOE_CONFIG`, falling back to `configs/training_config.yaml`,
+and the device is CUDA or CPU automatically - the same mechanism the demo uses
+to drive them.
 
 | Script | Question it answers |
 |---|---|
@@ -216,9 +167,9 @@ mechanism the CPU demo uses to drive them.
 | `karpathy_evaluation/` | COCO Karpathy retrieval (R@k) and captioning (CIDEr, BLEU, METEOR, ROUGE) |
 | `llava_evaluation/` | LLaVA-Wild open-ended instruction following |
 
-**The commands for all of these are in
-[`docs/running-the-analyses.md`](docs/running-the-analyses.md)**; each evaluation
-sub-pipeline additionally has its own README with the full loop and expected
+Commands for all of these are in
+[`docs/running-the-analyses.md`](docs/running-the-analyses.md), and each
+evaluation sub-pipeline has its own README with the full loop and expected
 outputs. Output goes to `results/`, which is git-ignored.
 
 ## Repository Structure
@@ -277,33 +228,14 @@ make demo     # the whole pipeline on CPU against synthetic fixtures
 make check    # lint + test + demo
 ```
 
-CI runs exactly this list on every push: the lint, the type check, the test
-suite, and the demo. The demo is included deliberately — the unit suite can stay
-green while the pipeline itself is broken.
-
-**ruff runs the same rule set on every file in the repository**, and
-`per-file-ignores` is empty apart from allowing `assert` in tests. mypy is
-scoped to `models/` and `data/`, minus two model files that subclass untyped
-PyTorch and HuggingFace internals.
-
-The lint used to be scoped: the full rule set on `models/`, `data/` and
-`tests/`, and five correctness rules everywhere else. That scope is how a
-refactor removed an import that was still used and left two training scripts
-unrunnable on `main` for months. Widening it was only possible after the
-research scripts were brought up to the same standard — long lines, unused
-variables, unused loop variables and mutable default arguments were all
-exempted at one point, and the exemption had been hiding a real mutable default
-and nine dead computations. Formatting alone would not have caught them:
-`ruff format` will not split a long comment or string literal.
-
-The suite covers four levels, deliberately:
+The suite covers four levels:
 
 | Level | Where | What it protects |
 |---|---|---|
-| Numerics | `tests/test_training_dry_run.py` | A tiny synthetic model must produce bit-identical loss and grad-norm against a recorded baseline. If those move, a refactor changed training numerics. |
-| Behaviour | `tests/test_training_steps.py`, `tests/test_analysis_model_loading.py`, `tests/test_expert_metrics_pipeline.py` | Each stage runs a real epoch and must change **exactly** the parameters it claims to train, with gradients reaching all of them, and must resume from its own checkpoint. The analysis loaders and the metrics→figures pipeline are then driven against what those stages produced. |
-| Structure | `tests/test_training_scripts_structure.py`, `tests/test_analysis_lib.py` | Every script stays inert on import, reuses `_lib` rather than re-implementing FSDP, and never loads weights with a bare `strict=False`. No analysis script may hardcode the config path or default to CUDA — both would put it back out of the demo's reach. No source file may exceed 800 lines. Also checks the SLURM scripts point at files that exist. |
-| End-to-end | `make demo` | 16 executable invariants over a full CPU pipeline run, including the routing ablation and the figure pipeline. A partial run (`--stages 0 1`) skips the checks whose stages did not run rather than failing them. |
+| Numerics | `tests/test_training_dry_run.py` | A tiny synthetic model must reproduce a recorded loss and grad-norm bit-for-bit. Drift means a refactor changed training numerics. |
+| Behaviour | `tests/test_training_steps.py`, `tests/test_analysis_model_loading.py`, `tests/test_expert_metrics_pipeline.py` | Each stage runs a real epoch, must change exactly the parameters it claims to train with gradients reaching all of them, and must resume from its own checkpoint. The analysis loaders and the metrics→figures pipeline then run against that output. |
+| Structure | `tests/test_training_scripts_structure.py`, `tests/test_analysis_lib.py` | Scripts stay inert on import, reuse `_lib` instead of re-implementing FSDP, and never load weights with a bare `strict=False`. No analysis script hardcodes the config path or defaults to CUDA, either of which would put it out of the demo's reach. No file over 800 lines. SLURM scripts must point at files that exist. |
+| End-to-end | `make demo` | 16 invariants over a full CPU run, including the routing ablation and the figure pipeline. A partial run (`--stages 0 1`) skips checks for stages that did not run. |
 
 ## Citation
 

@@ -25,7 +25,7 @@ from analysis_scripts._lib import (
     load_training_config,
 )
 from analysis_scripts.cross_modality_extraction import RepresentationExtractionMixin
-from analysis_scripts.cross_modality_metrics import PurityMetricsMixin
+from analysis_scripts.cross_modality_metrics import PurityMetricsMixin, debug_layers
 from models.utils.common import get_device, setup_logging
 
 logger = logging.getLogger(__name__)
@@ -128,6 +128,7 @@ class CrossModalityPurityAnalyzer(RepresentationExtractionMixin, PurityMetricsMi
 
         # Setup debug logging to file if in debug mode
         debug_log_path = None
+        self._debug_layers = debug_layers(layers)
         if hasattr(self, "_debug_mode") and self._debug_mode:
             debug_log_path = os.path.join(output_dir, "debug_token_analysis.log")
             logger.info(f"Debug output will be saved to: {debug_log_path}")
@@ -147,7 +148,7 @@ class CrossModalityPurityAnalyzer(RepresentationExtractionMixin, PurityMetricsMi
 
             # Add debug summary for first concept only
             if hasattr(self, "_debug_mode") and self._debug_mode and concept_idx == 0:
-                logger.info("   Debug info will be shown for layers: -1, 0, 15, 31")
+                logger.info(f"   Debug info will be shown for layers: {self._debug_layers}")
 
             results["cosine_similarity"][concept] = {}
             results["euclidean_distance"][concept] = {}
@@ -524,7 +525,8 @@ def main():
     parser.add_argument(
         "--all-layers",
         action="store_true",
-        help="Analyze all layers from -1 to 31 (overrides --layers)",
+        help="Analyse the embeddings plus every transformer layer the loaded "
+        "model has (overrides --layers)",
     )
     parser.add_argument(
         "--output-dir",
@@ -579,27 +581,28 @@ def main():
         logger.info("DEBUG MODE ENABLED")
     logger.info("=" * 80)
 
-    # Handle --all-layers flag
-    if args.all_layers:
-        layers = [-1] + list(range(32))
-        logger.info(
-            f"Using --all-layers: analysing layers {layers[0]} to {layers[-1]} ({len(layers)} "
-            f"total layers)"
-        )
-    else:
-        layers = args.layers
-
     analyzer = CrossModalityPurityAnalyzer(config_path=args.config, device=args.device)
 
-    # Enable debug mode if requested
     if args.debug:
         analyzer._debug_mode = True
-        logger.info(
-            "Debug mode: Will show tokenization + detailed stats for layers [-1, 0, 15, 31]"
-        )
 
     # Load models
     analyzer.load_models()
+
+    # --all-layers is resolved here, after the model is loaded, because it is a
+    # claim about the model rather than a default: it used to expand to
+    # range(32) and so requested layers that do not exist on anything but the
+    # 7B. --layers keeps its 7B-shaped default, which is a default and stays
+    # one.
+    if args.all_layers:
+        depth = analyzer.llm.config.num_hidden_layers
+        layers = [-1] + list(range(depth))
+        logger.info(
+            f"Using --all-layers: analysing the embeddings plus all {depth} transformer "
+            f"layers of the loaded model ({len(layers)} in total)"
+        )
+    else:
+        layers = args.layers
 
     # Run comprehensive analysis
     analyzer.run_comprehensive_analysis(

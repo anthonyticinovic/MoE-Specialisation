@@ -47,7 +47,8 @@ jobs:
       # The demo is the repo's headline artefact and the only check that runs
       # the real training scripts end to end. The unit suite can stay green
       # while the pipeline itself is broken — that is exactly the regression
-      # this step exists to catch. ~20s, CPU-only, no network (HF_HUB_OFFLINE).
+      # this step exists to catch. Under 30s, CPU-only, no network
+      # (HF_HUB_OFFLINE).
       - name: Demo pipeline (CPU, end to end)
         run: uv run python demo/run_demo.py
       - name: Upload demo report on failure

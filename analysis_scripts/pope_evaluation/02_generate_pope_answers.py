@@ -208,7 +208,9 @@ def generate_pope_answers(
                             # Greedy decoding
                             next_token = torch.argmax(next_token_logits, dim=-1)
 
-                        # Stop if EOS or newline (yes/no answers are short)
+                        # Stop at EOS. The comment here used to say "EOS or
+                        # newline"; nothing ever checked for a newline, and the
+                        # answer extractor already handles multi-line output.
                         if next_token.item() == tokenizer.eos_token_id:
                             break
 
@@ -271,6 +273,13 @@ def generate_pope_answers(
     elapsed = time.time() - start_time
 
     logger.info(f"\nGenerated {len(results)} answers in {format_time(elapsed)}")
+    if not results:
+        # An empty question set, or an image directory that matched none of it.
+        # The summary lines below divide by len(results); the sibling captioner
+        # guards the same computation and this one did not.
+        logger.error("No answers were generated — check the question file and --image-dir")
+        return results
+
     logger.info(f"   Average: {elapsed / len(results):.2f}s per question")
     logger.info(f"   Unclear answers: {unclear_count} ({unclear_count / len(results) * 100:.1f}%)")
 

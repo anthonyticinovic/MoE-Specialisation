@@ -47,6 +47,10 @@ training_stage2.5:
   # Stage 2.5 is the only stage with a load-balancing term; Stage 3 and the
   # dense control have no such loss, so the key belongs nowhere else.
   load_balancing_coeff: 0.0
+  # Standard deviation of the fresh router gates. Wider than MoELayer's
+  # construction-time 0.05: a stronger initial modality preference helps the
+  # routers escape the uniform-routing fixed point.
+  router_init_std: 0.1
 
 training_stage3:
   num_epochs: 25

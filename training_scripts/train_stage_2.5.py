@@ -145,7 +145,7 @@ def load_stage2_experts(llm: nn.Module, checkpoint_dir: str, ctx: RunContext) ->
         logger.info("✅ Stage 2 'best' state loaded successfully.")
 
 
-def reinitialise_router_gates(llm: nn.Module, ctx: RunContext) -> None:
+def reinitialise_router_gates(llm: nn.Module, ctx: RunContext, std: float = 0.1) -> None:
     """Reset every gate from scratch after loading the Stage 2 checkpoint.
 
     That checkpoint carries gate tensors that were never trained — Stage 2 uses
@@ -153,18 +153,21 @@ def reinitialise_router_gates(llm: nn.Module, ctx: RunContext) -> None:
     collapses routing onto a single expert. This is a deliberate design choice,
     not a workaround for a load bug.
 
-    std=0.1 rather than the 0.05 default in MoELayer: a slightly wider init
-    gives each gate a stronger initial modality preference, which empirically
-    helps the routers escape the uniform-routing fixed point.
+    ``std`` defaults to 0.1, wider than ``MoELayer``'s construction-time 0.05:
+    a wider init gives each gate a stronger initial modality preference, which
+    empirically helps the routers escape the uniform-routing fixed point.
+    Override it with ``training_stage2.5.router_init_std``.
+
+    The per-layer work is ``MoELayer.initialize_gate``. This function used to
+    inline its own copy, which is how the two came to disagree on the standard
+    deviation and how the copy in the model file ended up called by nothing.
     """
     if ctx.is_main:
-        logger.info("--- Re-initialising router gates before soft routing ---")
+        logger.info("--- Re-initialising router gates before soft routing (std=%s) ---", std)
 
     for layer in unwrap_model(llm).model.layers:
         if hasattr(layer.mlp, "gate"):
-            new_gate = nn.Linear(layer.mlp.d_model, layer.mlp.num_experts, bias=False)
-            nn.init.normal_(new_gate.weight, std=0.1)
-            layer.mlp.gate = new_gate.to(ctx.device)
+            layer.mlp.initialize_gate(std=std, device=ctx.device)
             layer.mlp.gate.weight.requires_grad = True
 
 
@@ -547,7 +550,7 @@ def build_setup(
     # Stage 2.5 shards without parameter offloading.
     llm = wrap_with_fsdp(llm, ctx, offload_params=None)
     load_stage2_experts(llm, stage2_checkpoint_dir, ctx)
-    reinitialise_router_gates(llm, ctx)
+    reinitialise_router_gates(llm, ctx, std=train_params.get("router_init_std", 0.1))
 
     # Gradient checkpointing is intentionally left disabled: combined with FSDP
     # and the MoE layer's per-rank dummy expert pass it produced unstable

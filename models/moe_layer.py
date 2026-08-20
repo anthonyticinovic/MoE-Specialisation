@@ -53,15 +53,26 @@ class MoELayer(nn.Module):
 
         self.router_dropout = nn.Dropout(0.1)
 
-    def initialize_gate(self) -> None:
-        """Re-initialise gate weights from scratch.
+    def initialize_gate(self, std: float = 0.05, device: torch.device | str | None = None) -> None:
+        """Re-initialise the gate from scratch, onto ``device`` if given.
 
         Called at the start of Stage 2.5: after Stage 2 the experts are
-        specialised but the gate has never been trained, so it is reset to a
-        fresh small-variance state to break symmetry before soft routing begins.
+        specialised but the gate still holds its Stage 0 initialisation,
+        because Stage 2 trains under a hard mask and never touches it.
+        Discarding it breaks symmetry deliberately rather than by accident.
+
+        ``device`` matters more than it looks. A bare ``nn.Linear`` is built on
+        the CPU, so re-initialising a model that already lives on an
+        accelerator and forgetting to move the replacement strands one
+        parameter and fails on the next forward. Stage 2.5 carried its own copy
+        of this method for that reason until the two were merged.
+
+        ``std`` is the caller's: 0.05 is the construction-time default, and
+        Stage 2.5 passes a wider one — see ``training_stage2.5.router_init_std``.
         """
-        self.gate = nn.Linear(self.d_model, self.num_experts, bias=False)
-        nn.init.normal_(self.gate.weight, std=0.05)
+        gate = nn.Linear(self.d_model, self.num_experts, bias=False)
+        nn.init.normal_(gate.weight, std=std)
+        self.gate = gate if device is None else gate.to(device)
 
     def forward(self, hidden_states: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
         """Route ``hidden_states`` through the experts for the active mode.
@@ -140,10 +151,19 @@ class MoELayer(nn.Module):
         hard_onehot = torch.zeros_like(router_probs).scatter_(1, hard_idx, 1.0)
         router_onehot = hard_onehot - router_probs.detach() + router_probs
 
+        # Dispatch on the argmax, not on ``router_onehot == 1``. The round trip
+        # ``hard_onehot - p + p`` lands back on 1.0 for any input you are
+        # likely to see, but IEEE-754 does not promise it, and a token whose
+        # entry missed would match *neither* expert: no error, no NaN, just a
+        # token that silently contributed nothing. The integer comparison
+        # cannot miss. The weights below still come from ``router_onehot``, so
+        # the straight-through gradient path is unchanged.
+        selection = hard_idx.squeeze(-1)
+
         final_hidden_states = torch.zeros_like(hidden_flat)
 
         for expert_idx, expert in enumerate(self.experts):
-            token_indices = torch.where(router_onehot[:, expert_idx] == 1)[0]
+            token_indices = torch.where(selection == expert_idx)[0]
 
             if token_indices.numel() > 0:
                 tokens_for_expert = hidden_flat[token_indices]
